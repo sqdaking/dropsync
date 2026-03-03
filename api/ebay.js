@@ -71,17 +71,54 @@ module.exports = async (req, res) => {
       };
 
       try {
-        const htmlRes = await fetch(url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-          },
-        });
-        const html = await htmlRes.text();
+        // Rotate user agents to avoid Amazon bot detection
+        const USER_AGENTS = [
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Safari/605.1.15',
+          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        ];
+        const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+
+        // Try fetching with retries
+        let html = '';
+        let lastErr = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            if (attempt > 0) await new Promise(r => setTimeout(r, 1500 * attempt));
+            const htmlRes = await fetch(url, {
+              headers: {
+                'User-Agent': ua,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Upgrade-Insecure-Requests': '1',
+                'DNT': '1',
+              },
+              redirect: 'follow',
+            });
+            if (htmlRes.status === 503 || htmlRes.status === 429) {
+              lastErr = ;
+              continue;
+            }
+            html = await htmlRes.text();
+            // Check if Amazon served a CAPTCHA page
+            if (html.includes('Type the characters you see') || html.includes('Enter the characters you see') || html.includes('robot check')) {
+              lastErr = 'Amazon CAPTCHA detected — try again in a few minutes';
+              html = '';
+              continue;
+            }
+            break; // success
+          } catch(e) { lastErr = e.message; }
+        }
+        if (!html) return res.json({ success: false, error: lastErr || 'Failed to fetch page', product });
 
         // ── AMAZON ──────────────────────────────────────────────────────
         if (url.includes('amazon.com')) {
