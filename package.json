@@ -1,10 +1,4 @@
-{ "name": "dropsync", "version": "1.0.0" }
-```
-3. Save it as `package.json` inside the `dropsync` folder (not inside `api`)
-
-Now it looks like:
-```
-dropsync/
-  api/
-    ebay.js
-  package.json
+{
+  "name": "dropsync",
+  "version": "1.0.0"
+}
