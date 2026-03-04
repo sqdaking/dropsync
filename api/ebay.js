@@ -740,9 +740,8 @@ module.exports = async (req, res) => {
         // ── CLOTHING ────────────────────────────────────────────────────
         if      (/\b(men.?s jean|boy.?s jean|denim pant|slim fit jean|skinny jean|straight leg jean|relaxed fit jean|bootcut)\b/.test(tx)) CAT(11554,'Men Jeans');
         else if (/\b(women.?s jean|girl.?s jean|ladies jean|jegging)\b/.test(tx)) CAT(11555,'Women Jeans');
-        else if (/\b(yoga pant|yoga legging|legging|athletic pant|workout pant|jogger|sweatpant|trackpant|lounge pant)\b/.test(tx)) CAT(185100,'Athletic Bottoms');
-        else if (/\b(men.?s pant|men.?s trouser|dress pant|chino|khaki|cargo pant|slack)\b/.test(tx)) CAT(57989,'Men Pants');
-        else if (/\b(women.?s pant|women.?s trouser|palazzo|culottes|wide leg pant)\b/.test(tx)) CAT(63862,'Women Pants');
+        else if (/\b(yoga pant|yoga legging|legging|athletic pant|workout pant|jogger|sweatpant|trackpant|lounge pant|capri pant|cargo pant|cargo capri|palazzo|culottes|wide leg pant|women.?s pant|women.?s trouser|ladies pant)\b/.test(tx)) CAT(63862,'Women Pants');
+        else if (/\b(men.?s pant|men.?s trouser|dress pant|chino|khaki|cargo short|slack)\b/.test(tx)) CAT(57989,'Men Pants');
         else if (/\b(men.?s short|board short|cargo short|swim trunk|swim short)\b/.test(tx)) CAT(15689,'Men Shorts');
         else if (/\b(women.?s short|biker short|high waist short)\b/.test(tx)) CAT(11555,'Women Shorts');
         else if (/\b(hoodie|sweatshirt|pullover|crewneck sweat)\b/.test(tx)) CAT(155183,'Hoodies Sweatshirts');
@@ -1019,7 +1018,16 @@ module.exports = async (req, res) => {
       // Use cleaned variations for combos
       product.variations = cleanVariations;
 
-      // Only the first variation group drives price — strip prices from all others
+      // Ensure Brand is always set — required by most eBay categories
+      if (!product.aspects) product.aspects = {};
+      if (!product.aspects['Brand'] || !product.aspects['Brand'].length) {
+        // Try to extract brand from title (first capitalized word before space/comma)
+        const brandFromTitle = product.brand
+          || (product.title||'').match(/^([A-Z][a-zA-Z0-9&]+(?:\s+[A-Z][a-zA-Z0-9&]+)?)/)?.[1]
+          || 'Unbranded';
+        product.aspects['Brand'] = [brandFromTitle];
+      }
+
       product.variations.forEach((vg, gi) => {
         if (gi > 0) vg.values.forEach(v => { delete v.price; delete v.sourcePrice; });
       });
