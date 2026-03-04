@@ -796,6 +796,11 @@ module.exports = async (req, res) => {
       // Use cleaned variations for combos
       product.variations = cleanVariations;
 
+      // Only the first variation group drives price — strip prices from all others
+      product.variations.forEach((vg, gi) => {
+        if (gi > 0) vg.values.forEach(v => { delete v.price; delete v.sourcePrice; });
+      });
+
       // Cap at 100 combos to avoid timeout
       let combos = buildCombos(product.variations);
       if (combos.length > 100) {
@@ -814,11 +819,12 @@ module.exports = async (req, res) => {
         let varSku = `${varSkuBase}${seg.join('').slice(0,16)}`;
         if (usedSkus.has(varSku)) varSku = `${varSkuBase}${String(idx).padStart(4,'0')}`;
         usedSkus.add(varSku);
-        // Price comes from first variation group that has a price (usually Size)
-        // Stock comes from first variation group that has stock set
-        // This avoids conflicts when multiple dimensions have independent prices
-        const varPrice = combo.find(v => v.price && parseFloat(v.price) > 0)?.price || product.price;
-        const varStock = combo.find(v => v.stock !== undefined)?.stock ?? (parseInt(product.quantity)||10);
+        // Price + qty from LAST variation group value in this combo
+        const lastVg  = product.variations[product.variations.length - 1];
+        const lastVal = combo[combo.length - 1];
+        const lastVv  = lastVg?.values.find(v => v.value === lastVal?.value);
+        const varPrice = (lastVv?.price && parseFloat(lastVv.price) > 0) ? lastVv.price : product.price;
+        const varStock = lastVv?.stock !== undefined ? lastVv.stock : (parseInt(product.quantity)||10);
         const varImages = getVarImages(combo, product.variationImages, product.images);
         const varAspects = { ...(product.aspects||{}) };
         combo.forEach(v => { varAspects[v.name] = [v.value]; });
