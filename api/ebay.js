@@ -1822,6 +1822,70 @@ module.exports = async (req, res) => {
         return res.json({ success: false, error: 'No active listing found on eBay — may already be ended', withdrawn: 0 });
       }
     }
+    // ── AI COLOR MATCHING ────────────────────────────────────────────────
+    if (action === 'matchColors') {
+      const { images, colors } = body;
+      if (!images?.length || !colors?.length) return res.status(400).json({ error: 'Missing images or colors' });
+      const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+      if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
+
+      // Fetch images and convert to base64 (max 12 images to stay within context)
+      const imgSlice = images.slice(0, 12);
+      const b64Images = await Promise.all(imgSlice.map(async (url, i) => {
+        try {
+          const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+          if (!r.ok) return null;
+          const buf = await r.arrayBuffer();
+          const b64 = Buffer.from(buf).toString('base64');
+          const ct  = r.headers.get('content-type') || 'image/jpeg';
+          return { index: i, url, b64, ct: ct.split(';')[0] };
+        } catch { return null; }
+      }));
+      const validImgs = b64Images.filter(Boolean);
+      if (!validImgs.length) return res.status(400).json({ error: 'Could not fetch any images' });
+
+      // Build message for Claude
+      const content2 = [
+        { type: 'text', text: `You are matching product variation colors to images.\n\nColors to match: ${colors.map((c,i)=>`[${i+1}] "${c}"`).join(', ')}\n\nImages are numbered [1] to [${validImgs.length}]. For each color, identify which image number best represents that color.\n\nRespond ONLY with a JSON object like: {"Dark Army Green": 2, "Green": 1, "Khaki": 4}\nUse image numbers (1-based). If unsure, pick the closest. Every color must get an image number.` },
+        ...validImgs.map(img => ({
+          type: 'image',
+          source: { type: 'base64', media_type: img.ct, data: img.b64 }
+        }))
+      ];
+
+      const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-opus-4-5',
+          max_tokens: 500,
+          messages: [{ role: 'user', content: content2 }],
+        }),
+      });
+      const aiData = await aiRes.json();
+      const text = aiData.content?.[0]?.text || '';
+      console.log('AI color match response:', text);
+
+      try {
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) throw new Error('No JSON in response');
+        const mapping = JSON.parse(jsonMatch[0]);
+        // Convert image indices (1-based) to URLs
+        const urlMapping = {};
+        for (const [color, imgIdx] of Object.entries(mapping)) {
+          const img = validImgs[parseInt(imgIdx) - 1];
+          if (img) urlMapping[color] = img.url;
+        }
+        return res.json({ success: true, mapping: urlMapping });
+      } catch (e) {
+        return res.json({ success: false, error: 'Could not parse AI response: ' + e.message, raw: text });
+      }
+    }
+
     if (action === 'listings') {
       const token = req.query.access_token || body.access_token;
       const r = await fetch(`${EBAY_API}/sell/inventory/v1/offer?limit=100`, { headers: { Authorization:`Bearer ${token}` } });
