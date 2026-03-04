@@ -729,7 +729,8 @@ module.exports = async (req, res) => {
       if (!access_token || !product) return res.status(400).json({ error: 'Missing fields' });
 
       // SKU must be alphanumeric + hyphens only, max 50 chars
-      const groupSku = `DS${Date.now()}${Math.random().toString(36).slice(2,6).toUpperCase()}`;
+      const groupSku = `GRP${Date.now()}${Math.random().toString(36).slice(2,6).toUpperCase()}`;
+      const varSkuBase = `ITM${Date.now()}${Math.random().toString(36).slice(2,6).toUpperCase()}`;
       const policies = {
         fulfillmentPolicyId: (body.fulfillmentPolicyId||'').split('?')[0].trim(),
         paymentPolicyId:     (body.paymentPolicyId||'').split('?')[0].trim(),
@@ -815,7 +816,7 @@ module.exports = async (req, res) => {
           const clean = String(v.value||'').replace(/[^a-zA-Z0-9]/g,'').slice(0,8).toUpperCase();
           return clean || 'VAR';
         });
-        const varSku = `${groupSku}${skuSegments.join('')}`;
+        const varSku = `${varSkuBase}${skuSegments.join('').slice(0,20)}`;
         const varPrice = combo.reduce((p,v) => v.price || p, product.price);
         const varStock = combo.reduce((s,v) => v.stock !== undefined ? v.stock : s, parseInt(product.quantity)||10);
         const varImages = getVarImages(combo, product.variationImages, product.images);
@@ -891,8 +892,8 @@ module.exports = async (req, res) => {
       } catch(e) { console.log('location error:', e.message); }
       console.log('merchantLocationKey:', merchantLocationKey);
       const baseOffer = buildOffer(groupSku, product, policies, merchantLocationKey);
-      // For multi-variation listings, sku = inventoryItemGroupKey (don't use inventoryItemGroupKey field)
-      const offerBody = baseOffer; // sku is already set to groupSku by buildOffer
+      delete baseOffer.sku;
+      const offerBody = { ...baseOffer, inventoryItemGroupKey: groupSku };
       console.log('groupSku:', groupSku);
       console.log('offerBody keys:', Object.keys(offerBody));
       console.log('offerBody:', JSON.stringify(offerBody).slice(0, 500));
