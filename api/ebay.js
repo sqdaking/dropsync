@@ -797,6 +797,7 @@ module.exports = async (req, res) => {
         console.log(`Trimmed combos from ${combos.length+outStock.length} to 250 (eBay limit)`);
       }
       const createdSkus = [];
+      let firstSkuError = null;
 
       for (const combo of combos) {
         // Skip only if EXPLICITLY disabled (not just out of stock — eBay wants quantity=0, not skipped)
@@ -822,10 +823,14 @@ module.exports = async (req, res) => {
           }),
         });
         if (invRes.ok) createdSkus.push(varSku);
-        else { const err = await invRes.text(); console.error('varSku failed:', varSku, err); }
+        else {
+          const errText = await invRes.text();
+          console.error('varSku failed:', varSku, errText);
+          if (!firstSkuError) firstSkuError = { sku: varSku, status: invRes.status, body: errText.slice(0, 500) };
+        }
       }
 
-      if (!createdSkus.length) return res.status(400).json({ error: 'No variation SKUs created — check that at least one variant is enabled and the inventory API accepted it. Enable debug logs in Vercel for details.' });
+      if (!createdSkus.length) return res.status(400).json({ error: 'No variation SKUs created', details: firstSkuError });
 
       const groupRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(groupSku)}`, {
         method: 'PUT', headers: authHeader,
