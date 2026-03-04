@@ -246,149 +246,207 @@ module.exports = async (req, res) => {
         }
         if (!html) return res.json({ success: false, error: lastErr || 'Failed to fetch page', product });
 
-        // ── AMAZON ──────────────────────────────────────────────────────
+        // ── AMAZON ─────────────────────────────────────────────────────
         if (url.includes('amazon.com')) {
           product.source = 'amazon';
 
           const fetchPage = async (u) => {
             try {
-              const r = await fetch(u, { headers: { 'User-Agent': ua, 'Accept': 'text/html', 'Accept-Language': 'en-US,en;q=0.9' } });
+              const r = await fetch(u, {
+                headers: { 'User-Agent': ua, 'Accept': 'text/html,application/xhtml+xml', 'Accept-Language': 'en-US,en;q=0.9', 'Cache-Control': 'no-cache' },
+                redirect: 'follow',
+              });
               const h = await r.text();
-              return (h.includes('robot check') || h.includes('Type the characters')) ? '' : h;
+              if (h.includes('robot check') || h.includes('Type the characters') || h.includes('Enter the characters')) return '';
+              return h;
             } catch { return ''; }
           };
 
-          // ── Title / Brand / Base price from landing page
-          const titleM = html.match(/id="productTitle"[^>]*>\s*([\s\S]*?)\s*<\/span>/);
-          if (titleM) product.title = titleM[1].replace(/<[^>]+>/g,'').trim().replace(/\s+/g,' ');
-          const brandM = html.match(/id="bylineInfo"[^>]*>([\s\S]*?)<\/(?:a|span)>/);
-          if (brandM) product.brand = brandM[1].replace(/<[^>]+>/g,'').replace(/Visit the|Store/g,'').trim();
-          for (const pat of [
-            /class="a-price-whole"[^>]*>\s*(\d[\d,]*)<\/span><span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/,
-            /"priceAmount"\s*:\s*([\d.]+)/,
-            /id="priceblock_ourprice"[^>]*>\s*\$?([\d,]+\.?\d*)/,
-            /"buyingPrice"\s*:\s*([\d.]+)/,
-            /class="a-offscreen"[^>]*>\$([\d,]+\.\d{2})/,
-          ]) {
-            const m = html.match(pat);
-            if (m) { product.price = m[2] ? `${m[1].replace(/,/g,'')}.${m[2]}` : m[1].replace(/,/g,''); break; }
-          }
-
-          // ── Fetch parent page (has full variation data)
-          const landingAsin = url.match(/\/dp\/([A-Z0-9]{10})/)?.[1] || '';
-          const parentAsinM = html.match(/parentAsin[=:&"']+([A-Z0-9]{10})/);
-          const parentAsin = parentAsinM?.[1] || null;
-          let workHtml = html;
-          if (parentAsin && parentAsin !== landingAsin) {
-            const ph = await fetchPage(`https://www.amazon.com/dp/${parentAsin}`);
-            if (ph.length > 50000) workHtml = ph;
-          }
-
-          // ── Extract variationValues + dimension order
-          // variationValues: {"size_name":["val1","val2"], "color_name":["RED","BLUE"]}
-          const variationValues = {};
-          const dimOrder = []; // order from "dimensions" array is most reliable
-          const dimOrderM = workHtml.match(/"dimensions"\s*:\s*(\[[^\]]+\])/);
-          if (dimOrderM) {
-            try { JSON.parse(dimOrderM[1]).forEach(d => dimOrder.push(d)); } catch {}
-          }
-          const vvM = workHtml.match(/"variationValues"\s*:\s*(\{[\s\S]*?\})\s*,\s*"\w/);
-          if (vvM) {
-            try {
-              const vv = JSON.parse(vvM[1]);
-              // Use dimOrder if available, else Object.keys
-              const keys = dimOrder.length ? dimOrder : Object.keys(vv);
-              for (const k of keys) if (Array.isArray(vv[k]) && vv[k].length) variationValues[k] = vv[k];
-            } catch {}
-          }
-          if (!dimOrder.length) Object.keys(variationValues).forEach(k => dimOrder.push(k));
-
-          // ── Extract dimensionValuesDisplayData: ASIN -> [dim0val, dim1val, ...]
-          // Use brace-walking to get the full block (regex stops at first "}")
-          const asinDimVals = {};
-          function extractJsonBlock(h, key) {
+          // Walk braces/brackets safely
+          function extractBlock(h, key, opener) {
             const ki = h.indexOf(`"${key}"`);
             if (ki < 0) return null;
-            const bi = h.indexOf('{', ki);
-            if (bi < 0) return null;
+            const bi = h.indexOf(opener, ki);
+            if (bi < 0 || bi - ki > 200) return null;
+            const closer = opener === '{' ? '}' : ']';
             let depth = 0, inStr = false, esc = false;
-            for (let i = bi; i < Math.min(h.length, bi + 200000); i++) {
+            for (let i = bi; i < Math.min(h.length, bi + 400000); i++) {
               const c = h[i];
               if (esc) { esc = false; continue; }
               if (c === '\\') { esc = true; continue; }
               if (c === '"') { inStr = !inStr; continue; }
               if (inStr) continue;
-              if (c === '{') depth++;
-              else if (c === '}') { depth--; if (depth === 0) return h.slice(bi, i + 1); }
+              if (c === opener) depth++;
+              else if (c === closer) { depth--; if (depth === 0) return h.slice(bi, i + 1); }
             }
             return null;
           }
-          const dvddRaw = extractJsonBlock(workHtml, 'dimensionValuesDisplayData') ||
-                          extractJsonBlock(html, 'dimensionValuesDisplayData');
-          if (dvddRaw) {
+
+          // ── Title
+          const titleM = html.match(/id="productTitle"[^>]*>\s*([\s\S]*?)\s*<\/span>/);
+          if (titleM) product.title = titleM[1].replace(/<[^>]+>/g,'').trim().replace(/\s+/g,' ');
+
+          // ── Price
+          for (const pat of [
+            /class="a-price-whole"[^>]*>\s*(\d[\d,]*)<\/span><span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/,
+            /"priceAmount"\s*:\s*([\d.]+)/,
+            /class="a-offscreen"[^>]*>\$([\d,]+\.\d{2})/,
+            /id="priceblock_ourprice"[^>]*>\s*\$?([\d,]+\.?\d*)/,
+            /"buyingPrice"\s*:\s*([\d.]+)/,
+          ]) {
+            const m = html.match(pat);
+            if (m) { product.price = m[2] ? `${m[1].replace(/,/g,'')}.${m[2]}` : m[1].replace(/,/g,''); break; }
+          }
+
+          // ── Find parent ASIN and fetch parent page for full variation data
+          const landingAsin = url.match(/\/dp\/([A-Z0-9]{10})/)?.[1] || '';
+          let parentAsin = null;
+          for (const pat of [
+            /"parentAsin"\s*:\s*"([A-Z0-9]{10})"/,
+            /parentAsin[=:&"' ]+([A-Z0-9]{10})/,
+          ]) {
+            const m = html.match(pat);
+            if (m && m[1] !== landingAsin) { parentAsin = m[1]; break; }
+          }
+          let workHtml = html;
+          if (parentAsin) {
+            const ph = await fetchPage(`https://www.amazon.com/dp/${parentAsin}`);
+            if (ph.length > 20000) workHtml = ph;
+          }
+
+          // ── Extract the twister/variation JSON block ─────────────────
+          // Amazon embeds all variation data in several possible locations
+          let twisterData = null;
+
+          // Method 1: data-a-state script tag (modern Amazon)
+          for (const m of [...workHtml.matchAll(/<script[^>]*data-a-state[^>]*type="a-state"[^>]*>([\s\S]*?)<\/script>/g),
+                           ...html.matchAll(/<script[^>]*data-a-state[^>]*type="a-state"[^>]*>([\s\S]*?)<\/script>/g)]) {
             try {
-              const dvdd = JSON.parse(dvddRaw);
-              for (const [asin, vals] of Object.entries(dvdd)) {
-                if (Array.isArray(vals)) asinDimVals[asin] = vals;
-              }
+              const d = JSON.parse(m[1]);
+              if (d.variationValues || d.dimensionValuesDisplayData) { twisterData = d; break; }
             } catch {}
           }
 
-          // ── Extract per-ASIN prices by fetching individual variant pages
-          // We fetch up to 4 representative ASINs to get real prices
-          const asinPrice = {}; // asin -> price string
-          const asinStock = {}; // asin -> bool
-          const asinList = Object.keys(asinDimVals);
+          // Method 2: P.when("twister-js-init-dpx-data") block
+          if (!twisterData) {
+            for (const searchHtml of [workHtml, html]) {
+              const idx = searchHtml.indexOf('twister-js-init-dpx-data');
+              if (idx < 0) continue;
+              // Find the data object passed to the callback
+              const dataStart = searchHtml.indexOf('return f(', idx);
+              if (dataStart < 0) continue;
+              const objStart = searchHtml.indexOf('{', dataStart);
+              if (objStart < 0) continue;
+              const raw = extractBlock(searchHtml.slice(objStart), '"dimensionValuesDisplayData"', '{') ||
+                          extractBlock(searchHtml.slice(objStart), '"variationValues"', '{');
+              if (raw) {
+                // Try to get the entire outer object
+                let depth = 0, inStr = false, esc = false;
+                let end2 = -1;
+                for (let i = 0; i < Math.min(searchHtml.length - objStart, 200000); i++) {
+                  const c = searchHtml[objStart + i];
+                  if (esc) { esc = false; continue; }
+                  if (c === '\\') { esc = true; continue; }
+                  if (c === '"') { inStr = !inStr; continue; }
+                  if (inStr) continue;
+                  if (c === '{') depth++;
+                  else if (c === '}') { depth--; if (depth === 0) { end2 = objStart + i; break; } }
+                }
+                if (end2 > objStart) {
+                  try { twisterData = JSON.parse(searchHtml.slice(objStart, end2 + 1)); if (twisterData.variationValues || twisterData.dimensionValuesDisplayData) break; else twisterData = null; } catch {}
+                }
+              }
+              if (twisterData) break;
+            }
+          }
 
-          // Try to get prices from HTML first (current selection + any inline data)
-          // Pattern: "B0XXXXXX":"19.99" price map
-          const inlinePrices = [...workHtml.matchAll(/"([A-Z0-9]{10})"\s*:\s*\{\s*"price"\s*:\s*"([\d.]+)"/g)];
-          inlinePrices.forEach(m => { asinPrice[m[1]] = m[2]; });
+          // Method 3: inline variationValues in page JS
+          if (!twisterData) {
+            for (const searchHtml of [workHtml, html]) {
+              const vvBlock = extractBlock(searchHtml, 'variationValues', '{');
+              const dvBlock = extractBlock(searchHtml, 'dimensionValuesDisplayData', '{');
+              if (vvBlock || dvBlock) {
+                twisterData = {};
+                if (vvBlock) { try { twisterData.variationValues = JSON.parse(vvBlock); } catch {} }
+                if (dvBlock) { try { twisterData.dimensionValuesDisplayData = JSON.parse(dvBlock); } catch {} }
+                if (twisterData.variationValues || twisterData.dimensionValuesDisplayData) break;
+                twisterData = null;
+              }
+            }
+          }
 
-          // priceToAsinList fallback: {"19.99":["B0XX","B0YY"]}
-          const p2aM = workHtml.match(/"priceToAsinList"\s*:\s*(\{[\s\S]*?\})\s*,\s*"/);
-          if (p2aM) {
+          console.log('twisterData found:', !!twisterData, twisterData ? Object.keys(twisterData) : 'none');
+
+          // ── Parse variation data from twisterData
+          const variationValues = twisterData?.variationValues || {};
+          const asinDimVals = twisterData?.dimensionValuesDisplayData || {};
+          const dimOrder = [];
+
+          // Get dimension order
+          if (Array.isArray(twisterData?.dimensions)) {
+            twisterData.dimensions.forEach(d => dimOrder.push(d));
+          } else {
+            Object.keys(variationValues).forEach(k => dimOrder.push(k));
+          }
+
+          console.log('dims:', dimOrder, 'vars:', Object.keys(variationValues), 'asins:', Object.keys(asinDimVals).length);
+
+          // ── Per-ASIN prices and stock from the page
+          const asinPrice = {};
+          const asinStock = {};
+
+          // priceToAsinList: {"19.99":["B0XX","B0YY"]}
+          const p2aBlock = extractBlock(workHtml, 'priceToAsinList', '{') || extractBlock(html, 'priceToAsinList', '{');
+          if (p2aBlock) {
             try {
-              const p2a = JSON.parse(p2aM[1]);
+              const p2a = JSON.parse(p2aBlock);
               for (const [price, asins] of Object.entries(p2a))
                 if (Array.isArray(asins)) asins.forEach(a => { if (!asinPrice[a]) asinPrice[a] = price; });
             } catch {}
           }
 
-          // unavailableAsinSet — explicit out of stock list
-          const unavailM = workHtml.match(/"unavailableAsinSet"\s*:\s*(\[[^\]]*\])/);
-          if (unavailM) { try { JSON.parse(unavailM[1]).forEach(a => { asinStock[a] = false; }); } catch {} }
-          // inStockAsinSet — explicit in stock list  
-          const inStockM = workHtml.match(/"inStockAsinSet"\s*:\s*(\[[^\]]*\])/);
-          if (inStockM) { try { JSON.parse(inStockM[1]).forEach(a => { asinStock[a] = true; }); } catch {} }
-          // If neither set exists, leave asinStock empty — defaults to in stock below
+          // Inline price map pattern: "B0XXXXX":{"price":"19.99"}
+          for (const m of (workHtml + html).matchAll(/"([A-Z0-9]{10})"\s*:\s*\{"price"\s*:\s*"([\d.]+)"/g))
+            if (!asinPrice[m[1]]) asinPrice[m[1]] = m[2];
 
-          // Declare image maps BEFORE fetch so the async callbacks can write into them
-          const colorImgMap = {};
+          // Stock sets
+          const unavailBlock = extractBlock(workHtml + html, 'unavailableAsinSet', '[');
+          if (unavailBlock) { try { JSON.parse(unavailBlock).forEach(a => { asinStock[a] = false; }); } catch {} }
+          const inStockBlock = extractBlock(workHtml + html, 'inStockAsinSet', '[');
+          if (inStockBlock) { try { JSON.parse(inStockBlock).forEach(a => { asinStock[a] = true; }); } catch {} }
+
+          // ── Images
           const allImages = [];
+          const colorImgMap = {};
 
-          // Fetch individual ASIN pages for prices + per-color images
-          // Pick one representative ASIN per unique color to get its image
-          const asinToColor = {}; // asin -> color value
+          for (const m of html.matchAll(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/g))
+            if (!allImages.includes(m[1])) allImages.push(m[1]);
+          if (allImages.length < 3) {
+            for (const m of html.matchAll(/"large"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/g))
+              if (!allImages.includes(m[1])) allImages.push(m[1]);
+          }
+
+          // Map color→ASIN→image using asinDimVals
+          const ci = dimOrder.indexOf('color_name');
+          const asinToColor = {};
           for (const [asin, dimVals] of Object.entries(asinDimVals)) {
-            const ci = dimOrder.indexOf('color_name');
-            if (ci >= 0 && dimVals[ci]) asinToColor[asin] = dimVals[ci];
+            if (ci >= 0 && Array.isArray(dimVals) && dimVals[ci]) asinToColor[asin] = dimVals[ci];
           }
-          // One ASIN per color (first found)
+
+          // Fetch one ASIN per color for images (max 6 fetches)
           const colorToAsin = {};
-          for (const [asin, color] of Object.entries(asinToColor)) {
+          for (const [asin, color] of Object.entries(asinToColor))
             if (!colorToAsin[color]) colorToAsin[color] = asin;
-          }
-          // Merge: need prices for all ASINs we don't have yet + one per color for images
-          const needPrice = asinList.filter(a => !asinPrice[a]);
-          const needImage = Object.values(colorToAsin);
-          const toFetch = [...new Set([...needPrice, ...needImage])].slice(0, 8);
+
+          // Also fetch ASINs with missing prices (max 8 total)
+          const needImg = Object.values(colorToAsin).slice(0, 5);
+          const needPrice = Object.keys(asinDimVals).filter(a => !asinPrice[a]).slice(0, 3);
+          const toFetch = [...new Set([...needImg, ...needPrice])].slice(0, 8);
 
           await Promise.all(toFetch.map(async asin => {
             try {
               const h = await fetchPage(`https://www.amazon.com/dp/${asin}`);
               if (!h) return;
-              // Price
               for (const pat of [
                 /class="a-price-whole"[^>]*>\s*(\d[\d,]*)<\/span><span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/,
                 /"priceAmount"\s*:\s*([\d.]+)/,
@@ -397,156 +455,66 @@ module.exports = async (req, res) => {
                 const m = h.match(pat);
                 if (m) { asinPrice[asin] = m[2] ? `${m[1].replace(/,/g,'')}.${m[2]}` : m[1].replace(/,/g,''); break; }
               }
-              // Stock — default to IN STOCK unless we explicitly see unavailable
-              if (h.includes('Currently unavailable') || h.includes('currently unavailable') || h.includes('unavailable') && h.includes('this item') || h.includes('Item under review')) {
-                asinStock[asin] = false;
-              } else {
-                // Any of these signals = in stock
-                asinStock[asin] = true;
-              }
-              // Grab images from this ASIN's page
-              // The 'initial' block always contains this ASIN's color-specific images
-              const hiResOnPage = [...h.matchAll(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/g)]
-                .map(m => m[1]);
-              if (hiResOnPage.length) {
-                const color = asinToColor[asin];
-                if (color && !colorImgMap[color]) colorImgMap[color] = hiResOnPage[0];
-                hiResOnPage.forEach(s => { if (!allImages.includes(s)) allImages.push(s); });
+              asinStock[asin] = !(h.includes('Currently unavailable') || h.includes('currently unavailable'));
+              const color = asinToColor[asin];
+              const img = h.match(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/);
+              if (img) {
+                if (color && !colorImgMap[color]) colorImgMap[color] = img[1];
+                if (!allImages.includes(img[1])) allImages.push(img[1]);
               }
             } catch {}
           }));
 
-          // ── Seed allImages + extractColorImages helper
-          function extractColorImages(h) {
-            const map = {}, all = [];
-            const ki = h.indexOf("'colorImages'");
-            if (ki < 0) return { map, all };
-            const bi = h.indexOf('{', ki);
-            if (bi < 0) return { map, all };
-            // Walk to find end of outer object
-            let depth=0, inStr=false, esc=false, blockEnd=-1;
-            for (let i=bi; i<Math.min(h.length,bi+500000); i++) {
-              const c=h[i];
-              if(esc){esc=false;continue;}
-              if(c==='\\'&&inStr){esc=true;continue;}
-              if(c==="'"){inStr=!inStr;continue;}
-              if(c==='"'){inStr=!inStr;continue;}
-              if(inStr)continue;
-              if(c==='{')depth++;
-              else if(c==='}'){depth--;if(depth===0){blockEnd=i;break;}}
-            }
-            if(blockEnd<0) return { map, all };
-            const block = h.slice(bi, blockEnd+1);
-            // Extract each color key and its image array
-            // Keys look like: 'initial': [...] or 'BLACK': [...]
-            // Use a manual scan since mixed quotes break JSON.parse
-            const keyRe = /'([^']+)'\s*:\s*\[/g;
-            let km;
-            while((km=keyRe.exec(block))!==null){
-              const key=km[1];
-              const arrStart=km.index+km[0].length-1;
-              // Find matching ] 
-              let ad=0,ai=false,ae=false,arrEnd=-1;
-              for(let i=arrStart;i<Math.min(block.length,arrStart+100000);i++){
-                const c=block[i];
-                if(ae){ae=false;continue;}
-                if(c==='\\'&&ai){ae=true;continue;}
-                if(c==='"'){ai=!ai;continue;}
-                if(ai)continue;
-                if(c==='[')ad++;
-                else if(c===']'){ad--;if(ad===0){arrEnd=i;break;}}
-              }
-              if(arrEnd<0)continue;
-              const arrStr=block.slice(arrStart,arrEnd+1);
-              try{
-                const imgs=JSON.parse(arrStr);
-                if(!Array.isArray(imgs)||!imgs.length)continue;
-                // Get best URL: prefer hiRes, then large, then first key of main
-                const getBest=i=>i.hiRes||i.large||(i.main?Object.keys(i.main)[0]:'')||'';
-                if(key==='initial'){
-                  imgs.forEach(i=>{const s=getBest(i);if(s&&!all.includes(s))all.push(s);});
-                } else {
-                  const best=imgs.find(i=>i.hiRes)||imgs.find(i=>i.large)||imgs[0];
-                  const s=best?getBest(best):'';
-                  if(s)map[key]=s;
-                }
-              }catch{}
-            }
-            return { map, all };
-          }
-
-          // Seed allImages from landing page hiRes (initial color images)
-          for (const m of html.matchAll(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/g))
-            if (!allImages.includes(m[1])) allImages.push(m[1]);
           product.images = [...new Set(allImages)].slice(0, 12);
-          // variationImages set after ASIN fetches below (colorImgMap populated there)
-
-          // Landing ASIN image — already have its HTML, map to its color
-          const landingColor = asinToColor[landingAsin];
-          if (landingColor && !colorImgMap[landingColor]) {
-            const landingImg = html.match(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/);
-            if (landingImg) colorImgMap[landingColor] = landingImg[1];
-          }
-          // Also seed allImages from landing page if thin
-          if (allImages.length < 5) {
-            for (const m of html.matchAll(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/g))
-              if (!allImages.includes(m[1])) allImages.push(m[1]);
-          }
-
-          // Finalize images + variationImages after per-ASIN fetches
-          product.images = [...new Set(allImages)].slice(0, 12);
+          // variationImages as nested: { Color: { Red: 'url', Blue: 'url' } }
           if (Object.keys(colorImgMap).length) product.variationImages['Color'] = colorImgMap;
 
-          // ── Build variation groups using dimensionValuesDisplayData
+          // ── Build variation groups
           const dimKeyToLabel = {
             'color_name':'Color','size_name':'Size','style_name':'Style',
             'material_type':'Material','pattern_name':'Pattern',
             'configuration_name':'Configuration','edition_name':'Edition',
-            'item_package_quantity':'Package Quantity','scent_name':'Scent','flavor_name':'Flavor',
+            'scent_name':'Scent','flavor_name':'Flavor','item_package_quantity':'Package Qty',
           };
 
-          for (const [dimKey, values] of Object.entries(variationValues)) {
-            if (!values.length) continue;
+          for (const dimKey of (dimOrder.length ? dimOrder : Object.keys(variationValues))) {
+            const values = variationValues[dimKey];
+            if (!Array.isArray(values) || values.length < 2) continue;
             const di = dimOrder.indexOf(dimKey);
             const label = dimKeyToLabel[dimKey] || dimKey.replace(/_name$/,'').replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
 
             const varValues = values.map(val => {
               const strVal = String(val);
-              // Find all ASINs where this dimension position matches this value
-              const matchAsins = Object.entries(asinDimVals)
-                .filter(([, dimVals]) => di < dimVals.length && dimVals[di] === strVal)
-                .map(([asin]) => asin);
+              const matchAsins = di >= 0
+                ? Object.entries(asinDimVals).filter(([,dv]) => Array.isArray(dv) && dv[di] === strVal).map(([a]) => a)
+                : [];
 
-              // Pick cheapest in-stock price
-              let varPrice = product.price || '0';
+              let varPrice = product.price || '';
               let inStock = true;
-              let varAsin = matchAsins[0] || '';
 
               if (matchAsins.length) {
                 const withPrices = matchAsins.filter(a => asinPrice[a]);
                 const inStockOnes = withPrices.filter(a => asinStock[a] !== false);
                 const use = inStockOnes.length ? inStockOnes : withPrices;
                 if (use.length) {
-                  const cheapest = use.reduce((a,b) => parseFloat(asinPrice[a]) <= parseFloat(asinPrice[b]) ? a : b);
-                  varPrice = asinPrice[cheapest];
-                  varAsin = cheapest;
+                  varPrice = use.reduce((a,b) => parseFloat(asinPrice[a]) <= parseFloat(asinPrice[b]) ? a : b);
+                  varPrice = asinPrice[varPrice];
                 }
-                // Stock: in stock if any matching ASIN is available
                 const hasStockData = matchAsins.some(a => asinStock[a] !== undefined);
-                inStock = hasStockData ? matchAsins.some(a => asinStock[a] !== false) : true;
+                if (hasStockData) inStock = matchAsins.some(a => asinStock[a] !== false);
               }
 
               return {
                 value: strVal,
-                price: varPrice,
-                sourcePrice: varPrice,
+                price: varPrice || product.price || '',
+                sourcePrice: varPrice || product.price || '',
                 stock: inStock ? 10 : 0,
                 inStock,
-                asin: varAsin,
-                image: dimKey === 'color_name' ? (colorImgMap[strVal] || allImages[0] || '') : '',
+                image: dimKey === 'color_name' ? (colorImgMap[strVal] || '') : '',
                 enabled: inStock,
               };
             });
+
             product.variations.push({ name: label, values: varValues });
           }
 
@@ -557,48 +525,42 @@ module.exports = async (req, res) => {
             if (prices.length) product.price = Math.min(...prices).toFixed(2);
           }
 
-          // ── Description — use feature bullets div, not generic list items
+          // ── Description
           const featDiv = html.match(/id="feature-bullets"[^>]*>[\s\S]*?<ul[^>]*>([\s\S]*?)<\/ul>/);
           if (featDiv) {
             const bullets = [...featDiv[1].matchAll(/<span class="a-list-item">([\s\S]*?)<\/span>/g)]
-              .map(m => m[1].replace(/<[^>]+>/g,'').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').trim())
-              .filter(b => b.length > 10 && b.length < 600 && !b.includes('{') && !b.includes('\n\n'))
+              .map(m => m[1].replace(/<[^>]+>/g,'').replace(/&amp;/g,'&').replace(/&#39;/g,"'").trim())
+              .filter(b => b.length > 10 && b.length < 600 && !b.includes('{'))
               .slice(0, 7);
             if (bullets.length) product.description = bullets.join('\n');
           }
-          if (!product.description) {
-            // Fallback: grab any list items that look like product features
-            const bullets = [...html.matchAll(/<span class="a-list-item">([\s\S]*?)<\/span>/g)]
-              .map(m => m[1].replace(/<[^>]+>/g,'').trim())
-              .filter(b => b.length > 30 && b.length < 500 && !b.includes('{') && !b.includes('Kitchen') && !b.includes('Storage &'))
-              .slice(0, 5);
-            if (bullets.length) product.description = bullets.join('\n');
-          }
 
-          // ── Item specifics
-          const specTable = html.match(/id="productDetails_techSpec[^"]*"[^>]*>([\s\S]*?)<\/table>/i) ||
-                            html.match(/id="detailBullets_feature_div"[^>]*>([\s\S]*?)<\/div>/i);
-          if (specTable) {
-            for (const row of [...specTable[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)].slice(0,12)) {
+          // ── Item specifics from product detail table
+          for (const pat of [
+            /id="productDetails_techSpec[^"]*"[^>]*>([\s\S]*?)<\/table>/i,
+            /id="detailBullets_feature_div"[^>]*>([\s\S]*?)<\/div>/i,
+          ]) {
+            const m = html.match(pat);
+            if (!m) continue;
+            for (const row of [...m[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)].slice(0,12)) {
               const cells = [...row[1].matchAll(/<t[hd][^>]*>([\s\S]*?)<\/t[hd]>/g)]
-                .map(m => m[1].replace(/<[^>]+>/g,'').replace(/[\u200f\u200e]/g,'').trim());
-              if (cells.length >= 2 && cells[0] && cells[1] && cells[0].length < 60) product.aspects[cells[0]] = [cells[1]];
+                .map(c => c[1].replace(/<[^>]+>/g,'').replace(/[\u200f\u200e]/g,'').trim());
+              if (cells.length >= 2 && cells[0] && cells[1] && cells[0].length < 60)
+                product.aspects[cells[0]] = [cells[1]];
             }
+            if (Object.keys(product.aspects).length) break;
           }
 
           product._debug = {
-            landingAsin, parentAsin,
+            landingAsin, parentAsin, twisterFound: !!twisterData,
+            dims: dimOrder, varKeys: Object.keys(variationValues),
             asinCount: Object.keys(asinDimVals).length,
             pricesFetched: Object.keys(asinPrice).length,
-            stockData: Object.keys(asinStock).length,
-            images: allImages.length,
-            colorMap: Object.keys(colorImgMap).length,
-            dims: dimOrder,
-            sampleAsinPrices: Object.fromEntries(Object.entries(asinPrice).slice(0, 5)),
+            images: allImages.length, colorMap: Object.keys(colorImgMap).length,
           };
         }
 
-        // ── WALMART ─────────────────────────────────────────────────────
+// ── WALMART ─────────────────────────────────────────────────────
         else if (url.includes('walmart.com')) {
           product.source = 'walmart';
           const nd = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
