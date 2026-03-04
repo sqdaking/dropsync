@@ -92,6 +92,27 @@ module.exports = async (req, res) => {
     // ═══════════════════════════════════════════════════════════
     // SCRAPE — full variation + image + price extraction
     // ═══════════════════════════════════════════════════════════
+    // Snippet action — dumps raw HTML around key Amazon data blocks
+    if (action === 'snippet') {
+      let url = req.query.url || body.url;
+      if (!url) return res.json({ error: 'No URL' });
+      if (url.includes('amazon.com')) {
+        const m = url.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/);
+        if (m) url = `https://www.amazon.com/dp/${m[1]}`;
+      }
+      const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+      const r = await fetch(url, { headers: { 'User-Agent': ua, 'Accept-Language': 'en-US,en;q=0.9', 'Accept': 'text/html' } });
+      const html = await r.text();
+      const snippets = {};
+      // Find 500 chars around each key term
+      for (const key of ['asinVariationValues','asinToDimension','colorImages','priceToAsinList','unavailableAsinSet','inStockAsinSet','variationValues','twister-js-init','dimensionValuesData']) {
+        const idx = html.indexOf(key);
+        if (idx >= 0) snippets[key] = html.slice(Math.max(0,idx-20), idx+500);
+        else snippets[key] = 'NOT FOUND';
+      }
+      return res.json({ snippets, htmlLength: html.length });
+    }
+
     // Debug action — returns raw extracted product data including _debug info
     if (action === 'debug') {
       const url = req.query.url || body.url;
