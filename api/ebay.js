@@ -796,203 +796,167 @@ module.exports = async (req, res) => {
       // Use cleaned variations for combos
       product.variations = cleanVariations;
 
-      // Multi-variation listing — eBay hard limit is 250 variations
+      // Cap at 100 combos to avoid timeout
       let combos = buildCombos(product.variations);
       if (combos.length > 100) {
-        const inStock = combos.filter(c => c.every(v => (v.stock||0) > 0));
+        const inStock  = combos.filter(c => c.every(v => (v.stock||0) > 0));
         const outStock = combos.filter(c => c.some(v => (v.stock||0) === 0));
         combos = [...inStock, ...outStock].slice(0, 100);
-        console.log(`Trimmed combos to 100 (timeout prevention)`);
+        console.log('Trimmed combos to 100');
       }
-      const createdSkus = [];
-      let firstSkuError = null;
-      const usedSkus = new Set();
-      const comboList = [];
 
-      // Build all varSku data first
-      for (const [comboIdx, combo] of combos.entries()) {
+      // ── STEP 1: Build combo metadata & deduplicate SKUs ──────────────
+      const usedSkus  = new Set();
+      const comboList = [];
+      for (const [idx, combo] of combos.entries()) {
         if (combo.every(v => v.enabled === false)) continue;
-        const skuSegments = combo.map(v => {
-          const clean = String(v.value||'').replace(/[^a-zA-Z0-9]/g,'').slice(0,6).toUpperCase();
-          return clean || 'VAR';
-        });
-        let varSku = `${varSkuBase}${skuSegments.join('').slice(0,16)}`;
-        if (usedSkus.has(varSku)) varSku = `${varSkuBase}${String(comboIdx).padStart(4,'0')}`;
+        const seg = combo.map(v => (String(v.value||'').replace(/[^a-zA-Z0-9]/g,'').slice(0,6).toUpperCase()) || 'VAR');
+        let varSku = `${varSkuBase}${seg.join('').slice(0,16)}`;
+        if (usedSkus.has(varSku)) varSku = `${varSkuBase}${String(idx).padStart(4,'0')}`;
         usedSkus.add(varSku);
-        const varPrice = combo.reduce((p,v) => v.price || p, product.price);
-        const varStock = combo.reduce((s,v) => v.stock !== undefined ? v.stock : s, parseInt(product.quantity)||10);
+        const varPrice  = combo.reduce((p,v) => v.price  || p, product.price);
+        const varStock  = combo.reduce((s,v) => v.stock !== undefined ? v.stock : s, parseInt(product.quantity)||10);
         const varImages = getVarImages(combo, product.variationImages, product.images);
         const varAspects = { ...(product.aspects||{}) };
         combo.forEach(v => { varAspects[v.name] = [v.value]; });
-        comboList.push({ varSku, varPrice, varStock, varImages, varAspects, combo });
+        comboList.push({ varSku, varPrice, varStock, varImages, varAspects });
       }
 
-      // Create inventory items in parallel batches of 10
+      // ── STEP 2: Create inventory_item per CHILD variant ─────────────
+      // Each child has its own: stock quantity, images, variant-specific aspects
+      // NO price here — price lives on the offer
+      const createdSkus = [];
       for (let i = 0; i < comboList.length; i += 10) {
-        const batch = comboList.slice(i, i + 10);
-        await Promise.all(batch.map(async ({ varSku, varStock, varImages, varAspects }) => {
-          const invRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(varSku)}`, {
+        await Promise.all(comboList.slice(i, i+10).map(async ({ varSku, varStock, varImages, varAspects }) => {
+          const r = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(varSku)}`, {
             method: 'PUT', headers: authHeader,
             body: JSON.stringify({
               availability: { shipToLocationAvailability: { quantity: Math.max(0, parseInt(varStock)||0) } },
               condition: product.condition || 'NEW',
-              product: { title: product.title.slice(0,80), description: product.description||product.title, imageUrls: varImages.slice(0,12), aspects: varAspects },
+              product: {
+                title:     product.title.slice(0,80),
+                imageUrls: varImages.slice(0,12),
+                aspects:   varAspects,
+              },
             }),
           });
-          if (invRes.ok) {
-            createdSkus.push(varSku);
-            if (createdSkus.length === 1) console.log('first varSku ok:', varSku);
-          } else {
-            const errText = await invRes.text();
-            console.error('varSku failed:', varSku, errText.slice(0,200));
-            if (!firstSkuError) firstSkuError = { sku: varSku, status: invRes.status, body: errText.slice(0,500) };
-          }
+          if (r.ok) { createdSkus.push(varSku); if (createdSkus.length===1) console.log('first varSku ok:', varSku); }
+          else console.error('varSku failed:', varSku, (await r.text()).slice(0,200));
         }));
       }
+      if (!createdSkus.length) return res.status(400).json({ error: 'No variant inventory items created' });
 
-      if (!createdSkus.length) return res.status(400).json({ error: 'No variation SKUs created', details: firstSkuError });
-
+      // ── STEP 3: Create inventory_item_group (PARENT) ─────────────────
+      // Parent has: title, description, group images, common aspects, variantSKUs, variesBy
+      // NO price, NO quantity on parent
       const groupRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(groupSku)}`, {
         method: 'PUT', headers: authHeader,
         body: JSON.stringify({
           inventoryItemGroupKey: groupSku,
-          title: product.title.slice(0,80),
+          title:       product.title.slice(0,80),
           description: product.description || product.title,
-          imageUrls: (product.images||[]).slice(0,12),
-          aspects: product.aspects || {},
+          imageUrls:   (product.images||[]).slice(0,12),
+          aspects:     product.aspects || {},
           variantSKUs: createdSkus,
           variesBy: {
-            aspectsImageVariesBy: Object.keys(product.variationImages||{}),
+            aspectsImageVariesBy: Object.keys(product.variationImages||{}).slice(0,1),
             specifications: product.variations.map(vg => ({
-              name: vg.name,
-              values: vg.values.filter(v=>v.enabled!==false).map(v=>v.value)
+              name:   vg.name,
+              values: vg.values.filter(v=>v.enabled!==false).map(v=>v.value),
             })),
           },
         }),
       });
-      if (!groupRes.ok) {
-        const groupErr = await groupRes.text();
-        console.log('groupRes failed:', groupRes.status, groupErr.slice(0,300));
-        return res.status(400).json({ error: 'Group failed', details: groupErr });
-      }
+      if (!groupRes.ok) return res.status(400).json({ error: 'Group failed', details: await groupRes.text() });
       console.log('groupRes ok:', groupRes.status);
 
-      // Get merchant location key
+      // ── STEP 4: Get/create merchant location ─────────────────────────
       let merchantLocationKey = 'MainWarehouse';
       try {
-        const locRes = await fetch(`${EBAY_API}/sell/inventory/v1/location`, { headers: authHeader });
+        const locRes  = await fetch(`${EBAY_API}/sell/inventory/v1/location`, { headers: authHeader });
         const locData = await locRes.json();
         if (locData.locations?.length) {
           merchantLocationKey = locData.locations[0].merchantLocationKey;
         } else {
-          const createRes = await fetch(`${EBAY_API}/sell/inventory/v1/location/MainWarehouse`, {
+          await fetch(`${EBAY_API}/sell/inventory/v1/location/MainWarehouse`, {
             method: 'POST', headers: authHeader,
             body: JSON.stringify({
-              location: { address: { addressLine1: '1 Main St', city: 'San Jose', stateOrProvince: 'CA', postalCode: '95125', country: 'US' } },
-              locationTypes: ['WAREHOUSE'], name: 'Main Warehouse', merchantLocationStatus: 'ENABLED'
-            })
+              location: { address: { addressLine1:'1 Main St', city:'San Jose', stateOrProvince:'CA', postalCode:'95125', country:'US' } },
+              locationTypes: ['WAREHOUSE'], name: 'Main Warehouse', merchantLocationStatus: 'ENABLED',
+            }),
           });
-          merchantLocationKey = createRes.ok ? 'MainWarehouse' : 'MainWarehouse';
         }
       } catch(e) { console.log('location error:', e.message); }
       console.log('merchantLocationKey:', merchantLocationKey);
 
-      // Return policy — create clean one via API
+      // ── STEP 5: Get/create return policy ─────────────────────────────
       let validReturnPolicyId = policies.returnPolicyId;
       try {
         const rpList = await fetch(`${EBAY_API}/sell/account/v1/return_policy?marketplace_id=EBAY_US`, { headers: authHeader });
-        const rpListData = await rpList.json();
-        const existing = (rpListData.returnPolicies||[]).find(p => p.name === 'DropSync Auto Policy');
+        const rpData = await rpList.json();
+        const existing = (rpData.returnPolicies||[]).find(p => p.name === 'DropSync Auto Policy');
         if (existing) {
           validReturnPolicyId = existing.returnPolicyId;
-          console.log('reusing DropSync policy:', validReturnPolicyId);
         } else {
-        const rpCreate = await fetch(`${EBAY_API}/sell/account/v1/return_policy`, {
-          method: 'POST', headers: authHeader,
-          body: JSON.stringify({
-            name: 'DropSync Auto Policy',
-            marketplaceId: 'EBAY_US',
-            categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
-            returnsAccepted: false,
-          })
-        });
-        const rpNew = await rpCreate.json();
-        console.log('DropSync policy:', JSON.stringify(rpNew).slice(0,400));
-        if (rpNew.returnPolicyId) validReturnPolicyId = rpNew.returnPolicyId;
+          const rpNew = await fetch(`${EBAY_API}/sell/account/v1/return_policy`, {
+            method: 'POST', headers: authHeader,
+            body: JSON.stringify({
+              name: 'DropSync Auto Policy', marketplaceId: 'EBAY_US',
+              categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
+              returnsAccepted: false,
+            }),
+          });
+          const rpNewData = await rpNew.json();
+          if (rpNewData.returnPolicyId) validReturnPolicyId = rpNewData.returnPolicyId;
         }
       } catch(e) { console.log('return policy error:', e.message); }
 
-      // Delete any stale offers from previous attempts before creating new ones
-      for (let i = 0; i < createdSkus.length; i += 25) {
-        const batch = createdSkus.slice(i, i + 25);
-        // Get existing offers for these SKUs
-        for (const sku of batch) {
-          try {
-            const existing = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers: authHeader });
-            const existingData = await existing.json();
-            if (existingData.offers?.length) {
-              await Promise.all(existingData.offers.map(o =>
-                fetch(`${EBAY_API}/sell/inventory/v1/offer/${o.offerId}`, { method: 'DELETE', headers: authHeader })
-              ));
-            }
-          } catch(e) {}
-        }
-      }
-      console.log('cleaned up old offers');
+      // ── STEP 6: bulkCreateOffer — one per CHILD variant ──────────────
+      // Each child offer has: sku, price, availableQuantity, policies
+      // Description lives on the GROUP — do NOT set listingDescription on child offers
       const listingPolicies = {};
       if (policies.fulfillmentPolicyId) listingPolicies.fulfillmentPolicyId = policies.fulfillmentPolicyId;
       if (policies.paymentPolicyId)     listingPolicies.paymentPolicyId     = policies.paymentPolicyId;
       if (validReturnPolicyId)          listingPolicies.returnPolicyId      = validReturnPolicyId;
 
-      const offerBase = {
-        marketplaceId: 'EBAY_US',
-        format: 'FIXED_PRICE',
-        listingDuration: 'GTC',
-        categoryId: product.categoryId || '9355',
-        merchantLocationKey,
-        listingDescription: product.description || product.title,
-        listingPolicies,
-      };
-      const offerIds = [];
-      const offerRequests = createdSkus.map((varSku) => ({
-        ...offerBase,
-        sku: varSku,
-        // Price and quantity live on the inventory_item, not the offer for multi-variation
-      }));
+      const offerRequests = createdSkus.map((varSku, i) => {
+        const c = comboList[i] || comboList[comboList.findIndex(x => x.varSku === varSku)];
+        return {
+          sku:             varSku,
+          marketplaceId:  'EBAY_US',
+          format:         'FIXED_PRICE',
+          listingDuration:'GTC',
+          categoryId:      product.categoryId || '9355',
+          merchantLocationKey,
+          listingPolicies,
+          pricingSummary:  { price: { value: String(parseFloat(c?.varPrice||product.price||0).toFixed(2)), currency:'USD' } },
+          availableQuantity: Math.max(0, parseInt(c?.varStock||product.quantity)||0),
+        };
+      });
 
-      // Batch into groups of 25
+      const offerIds = [];
       for (let i = 0; i < offerRequests.length; i += 25) {
-        const batch = offerRequests.slice(i, i + 25);
-        if (i === 0) console.log('first offer request:', JSON.stringify(batch[0]).slice(0,400));
-        const bulkRes = await fetch(`${EBAY_API}/sell/inventory/v1/bulk_create_offer`, {
+        const bulkRes  = await fetch(`${EBAY_API}/sell/inventory/v1/bulk_create_offer`, {
           method: 'POST', headers: authHeader,
-          body: JSON.stringify({ requests: batch })
+          body: JSON.stringify({ requests: offerRequests.slice(i, i+25) }),
         });
         const bulkData = await bulkRes.json();
-        console.log(`bulk_create_offer batch ${i/25+1}: status ${bulkRes.status}, responses: ${bulkData.responses?.length}`);
-        if (bulkData.responses) {
-          bulkData.responses.forEach((r, idx) => {
-            if (r.offerId) offerIds.push(r.offerId);
-            else console.log(`offer[${idx}] failed:`, JSON.stringify(r).slice(0,300));
-            if (r.warnings?.length) console.log(`offer[${idx}] warnings:`, JSON.stringify(r.warnings).slice(0,200));
-          });
-          if (i === 0) console.log('first offer response:', JSON.stringify(bulkData.responses[0]).slice(0,400));
-        }
+        console.log(`offer batch ${i/25+1}: ${bulkRes.status}, ${bulkData.responses?.length} responses`);
+        (bulkData.responses||[]).forEach(r => {
+          if (r.offerId) offerIds.push(r.offerId);
+          else console.log('offer failed:', JSON.stringify(r).slice(0,300));
+        });
       }
       console.log(`Created ${offerIds.length}/${createdSkus.length} offers`);
-      if (!offerIds.length) return res.status(400).json({ error: 'No offers created — check category ID and policies' });
+      if (!offerIds.length) return res.status(400).json({ error: 'No offers created' });
 
-      // Step 4: publishOfferByInventoryItemGroup
+      // ── STEP 7: publish_by_inventory_item_group ───────────────────────
       const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/publish_by_inventory_item_group`, {
         method: 'POST', headers: authHeader,
-        body: JSON.stringify({
-          inventoryItemGroupKey: groupSku,
-          marketplaceId: 'EBAY_US',
-          pricingSummary: { price: { value: String(parseFloat(product.price||0).toFixed(2)), currency: 'USD' } },
-        })
+        body: JSON.stringify({ inventoryItemGroupKey: groupSku, marketplaceId: 'EBAY_US' }),
       });
       const pubData = await pubRes.json();
-      console.log('publishByGroup status:', pubRes.status, JSON.stringify(pubData).slice(0,500));
+      console.log('publishByGroup:', pubRes.status, JSON.stringify(pubData).slice(0,500));
       if (!pubRes.ok) return res.status(400).json({ error: 'Publish failed', details: pubData });
       return res.json({ success:true, sku:groupSku, listingId:pubData.listingId, variationsCreated:offerIds.length });
     }
