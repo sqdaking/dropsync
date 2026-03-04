@@ -872,12 +872,11 @@ module.exports = async (req, res) => {
       }
       console.log('groupRes ok:', groupRes.status);
 
-      // Get real merchant location key from eBay account
-      let merchantLocationKey = 'default';
+      // Get merchant location key
+      let merchantLocationKey = 'MainWarehouse';
       try {
         const locRes = await fetch(`${EBAY_API}/sell/inventory/v1/location`, { headers: authHeader });
         const locData = await locRes.json();
-        console.log('locations:', JSON.stringify(locData).slice(0,300));
         if (locData.locations?.length) {
           merchantLocationKey = locData.locations[0].merchantLocationKey;
         } else {
@@ -888,34 +887,63 @@ module.exports = async (req, res) => {
               locationTypes: ['WAREHOUSE'], name: 'Main Warehouse', merchantLocationStatus: 'ENABLED'
             })
           });
-          console.log('location create status:', createRes.status);
-          merchantLocationKey = createRes.ok ? 'MainWarehouse' : 'default';
+          merchantLocationKey = createRes.ok ? 'MainWarehouse' : 'MainWarehouse';
         }
       } catch(e) { console.log('location error:', e.message); }
       console.log('merchantLocationKey:', merchantLocationKey);
 
-      // publishByInventoryItemGroup — no createOffer step needed for multi-variation
-      const pubBody = {
-        inventoryItemGroupKey: groupSku,
+      // Step 3: createOffer for each varSku
+      // All offers share same listing-level settings, only sku/price/qty differ
+      const offerIds = [];
+      const offerBase = {
         marketplaceId: 'EBAY_US',
-        merchantLocationKey,
-        pricingSummary: { price: { value: String(parseFloat(product.price||0).toFixed(2)), currency: 'USD' } },
+        format: 'FIXED_PRICE',
         listingDuration: 'GTC',
         categoryId: product.categoryId || '9355',
-        format: 'FIXED_PRICE',
+        merchantLocationKey,
+        listingDescription: product.description || product.title,
       };
-      if (policies.fulfillmentPolicyId) pubBody.fulfillmentPolicyId = policies.fulfillmentPolicyId;
-      if (policies.paymentPolicyId)     pubBody.paymentPolicyId     = policies.paymentPolicyId;
-      if (policies.returnPolicyId)      pubBody.returnPolicyId      = policies.returnPolicyId;
+      if (policies.fulfillmentPolicyId) offerBase.fulfillmentPolicyId = policies.fulfillmentPolicyId;
+      if (policies.paymentPolicyId)     offerBase.paymentPolicyId     = policies.paymentPolicyId;
+      if (policies.returnPolicyId)      offerBase.returnPolicyId      = policies.returnPolicyId;
 
-      console.log('pubBody:', JSON.stringify(pubBody).slice(0,500));
+      for (const varSku of createdSkus) {
+        // Find the combo for this varSku to get price
+        const comboIdx = createdSkus.indexOf(varSku);
+        const combo = combos[comboIdx];
+        const varPrice = combo ? combo.reduce((p,v) => v.price || p, product.price) : product.price;
+        const varStock = combo ? combo.reduce((s,v) => v.stock !== undefined ? v.stock : s, parseInt(product.quantity)||10) : 10;
+
+        const offerBody = {
+          ...offerBase,
+          sku: varSku,
+          pricingSummary: { price: { value: String(parseFloat(varPrice||product.price||0).toFixed(2)), currency: 'USD' } },
+          availableQuantity: Math.max(0, parseInt(varStock)||0),
+        };
+
+        const offerRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, {
+          method: 'POST', headers: authHeader, body: JSON.stringify(offerBody)
+        });
+        const offerData = await offerRes.json();
+        if (offerRes.ok && offerData.offerId) {
+          offerIds.push(offerData.offerId);
+        } else {
+          console.log('offer failed for sku:', varSku, JSON.stringify(offerData).slice(0,300));
+        }
+      }
+      console.log(`Created ${offerIds.length}/${createdSkus.length} offers`);
+
+      if (!offerIds.length) return res.status(400).json({ error: 'No offers created — check category ID and policies' });
+
+      // Step 4: publishOfferByInventoryItemGroup
       const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/publishbyinventoryitemgroup`, {
-        method: 'POST', headers: authHeader, body: JSON.stringify(pubBody)
+        method: 'POST', headers: authHeader,
+        body: JSON.stringify({ inventoryItemGroupKey: groupSku, marketplaceId: 'EBAY_US' })
       });
       const pubData = await pubRes.json();
       console.log('publishByGroup status:', pubRes.status, JSON.stringify(pubData).slice(0,500));
       if (!pubRes.ok) return res.status(400).json({ error: 'Publish failed', details: pubData });
-      return res.json({ success:true, sku:groupSku, listingId:pubData.listingId, variationsCreated:createdSkus.length });
+      return res.json({ success:true, sku:groupSku, listingId:pubData.listingId, variationsCreated:offerIds.length });
     }
 
     if (action === 'policies') {
