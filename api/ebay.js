@@ -102,8 +102,46 @@ module.exports = async (req, res) => {
     }
 
     if (action === 'scrape' || action === 'debug') {
-      const url = body.url || req.query.url;
+      let url = body.url || req.query.url;
       if (!url) return res.status(400).json({ error: 'No URL' });
+
+      // ── Normalize any Amazon URL to clean dp/ASIN page ──────────────
+      if (url.includes('amazon.com')) {
+        // Extract ASIN from any Amazon URL format:
+        // - /dp/B0XXXXXX
+        // - /gp/product/B0XXXXXX
+        // - /sspa/click?...dp/B0XXXXXX
+        // - ?asin=B0XXXXXX
+        // - sr_1_2...B0XXXXXX in path
+        let asin = null;
+
+        // Try /dp/ASIN or /gp/product/ASIN
+        const dpMatch = url.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/);
+        if (dpMatch) asin = dpMatch[1];
+
+        // Try asin= query param
+        if (!asin) {
+          const asinParam = url.match(/[?&]asin=([A-Z0-9]{10})/i);
+          if (asinParam) asin = asinParam[1];
+        }
+
+        // Try any 10-char ASIN-like string in the URL
+        if (!asin) {
+          const anyAsin = url.match(/\/([A-Z0-9]{10})(?:\/|\?|$)/);
+          if (anyAsin) asin = anyAsin[1];
+        }
+
+        if (asin) {
+          url = `https://www.amazon.com/dp/${asin}`;
+          console.log('Normalized Amazon URL to:', url);
+        }
+      }
+
+      // Normalize Walmart URLs too
+      if (url.includes('walmart.com')) {
+        const wmMatch = url.match(/\/ip\/(?:[^/]+\/)?(\d{6,})/);
+        if (wmMatch) url = `https://www.walmart.com/ip/${wmMatch[1]}`;
+      }
 
       const product = {
         url, source: '', title: '', price: '', images: [],
