@@ -829,6 +829,10 @@ function buildOffer(sku, product) {
   if (process.env.EBAY_FULFILLMENT_POLICY_ID) p.fulfillmentPolicyId = process.env.EBAY_FULFILLMENT_POLICY_ID;
   if (process.env.EBAY_PAYMENT_POLICY_ID)     p.paymentPolicyId     = process.env.EBAY_PAYMENT_POLICY_ID;
   if (process.env.EBAY_RETURN_POLICY_ID)      p.returnPolicyId      = process.env.EBAY_RETURN_POLICY_ID;
+  // Source rules from frontend override env vars
+  if (body.fulfillmentPolicyId) p.fulfillmentPolicyId = body.fulfillmentPolicyId;
+  if (body.paymentPolicyId)     p.paymentPolicyId     = body.paymentPolicyId;
+  if (body.returnPolicyId)      p.returnPolicyId      = body.returnPolicyId;
   return p;
 }
 
