@@ -1161,7 +1161,7 @@ module.exports = async (req, res) => {
               condition: product.condition || 'NEW',
               product: {
                 title:     product.title.slice(0,80),
-                imageUrls: varImages.slice(0,12),
+                imageUrls: varImages.slice(0,1), // one image per child variant
                 aspects:   varAspects,
               },
             }),
@@ -1171,6 +1171,11 @@ module.exports = async (req, res) => {
         }));
       }
       if (!createdSkus.length) return res.status(400).json({ error: 'No variant inventory items created' });
+
+      // ── Collect all unique child images for the group (no cap — one per child)
+      const allChildImages = [...new Set(comboList.map(c => c.varImages[0]).filter(Boolean))];
+      // Use all child images for the group, falling back to product images if needed
+      const groupImageUrls = allChildImages.length ? allChildImages : (product.images||[]);
 
       // ── STEP 3: Create inventory_item_group (PARENT) ─────────────────
       // Normalize variesBy aspect names to match eBay's expected names
@@ -1196,7 +1201,7 @@ module.exports = async (req, res) => {
           inventoryItemGroupKey: groupSku,
           title:       product.title.slice(0,80),
           description: product.description || product.title,
-          imageUrls:   (product.images||[]).slice(0,12),
+          imageUrls:   groupImageUrls,
           aspects:     product.aspects || {},
           variantSKUs: createdSkus,
           variesBy: {
@@ -1322,7 +1327,7 @@ module.exports = async (req, res) => {
               inventoryItemGroupKey: groupSku,
               title: product.title.slice(0,80),
               description: product.description || product.title,
-              imageUrls: (product.images||[]).slice(0,12),
+              imageUrls: groupImageUrls,
               aspects: product.aspects,
               variantSKUs: createdSkus,
               variesBy: {
@@ -1343,7 +1348,7 @@ module.exports = async (req, res) => {
                 body: JSON.stringify({
                   availability: { shipToLocationAvailability: { quantity: Math.max(0, parseInt(varStock)||0) } },
                   condition: product.condition || 'NEW',
-                  product: { title: product.title.slice(0,80), imageUrls: varImages.slice(0,12), aspects: varAspects },
+                  product: { title: product.title.slice(0,80), imageUrls: varImages.slice(0,1), aspects: varAspects }, // one image per child
                 }),
               });
             }));
@@ -1749,12 +1754,11 @@ module.exports = async (req, res) => {
         }
       }
 
-      // Strategy 3: Trading API EndItem (most reliable fallback — works regardless of how listing was created)
+      // Strategy 3: Trading API EndItem using OAuth IAF token — most reliable fallback
       if (withdrawn === 0 && ebayListingId) {
         log2(`trying Trading API EndItem for listingId ${ebayListingId}`);
         const tradingXml = `<?xml version="1.0" encoding="utf-8"?>
 <EndItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <RequesterCredentials><eBayAuthToken>${access_token}</eBayAuthToken></RequesterCredentials>
   <ItemID>${ebayListingId}</ItemID>
   <EndingReason>NotAvailable</EndingReason>
 </EndItemRequest>`;
@@ -1765,6 +1769,7 @@ module.exports = async (req, res) => {
             'X-EBAY-API-COMPATIBILITY-LEVEL': '967',
             'X-EBAY-API-CALL-NAME': 'EndItem',
             'X-EBAY-API-SITEID': '0',
+            'X-EBAY-API-IAF-TOKEN': access_token,  // OAuth bearer token (modern Trading API auth)
           },
           body: tradingXml,
         });
@@ -1775,12 +1780,35 @@ module.exports = async (req, res) => {
         } else {
           const errCode = tradingText.match(/<ErrorCode>(.*?)<\/ErrorCode>/)?.[1] || '';
           const errMsg  = tradingText.match(/<ShortMessage>(.*?)<\/ShortMessage>/)?.[1] || 'Unknown';
-          // Error 291 = item already ended — still consider it success
+          // 291 = item already ended — still a success from our perspective
           if (errCode === '291' || errMsg.toLowerCase().includes('ended') || errMsg.toLowerCase().includes('not active')) {
             withdrawn = 1;
           } else {
             errors.push(`Trading API: ${errMsg} (code ${errCode})`);
           }
+        }
+      }
+
+      // Strategy 4: delete all child inventory items + group directly
+      // If all else fails, remove the inventory records — this also ends the listing
+      if (withdrawn === 0 && ebaySku) {
+        log2(`trying inventory delete for group ${ebaySku}`);
+        // Delete the group
+        const delGrp = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, {
+          method: 'DELETE', headers: authHeader,
+        });
+        log2(`delete group: ${delGrp.status}`);
+        if (delGrp.ok || delGrp.status === 204 || delGrp.status === 404) {
+          // 404 means it was already gone — still treat as success
+          withdrawn = 1;
+        } else {
+          // Try deleting the single inventory item (non-variation listing)
+          const delItem = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(ebaySku)}`, {
+            method: 'DELETE', headers: authHeader,
+          });
+          log2(`delete item: ${delItem.status}`);
+          if (delItem.ok || delItem.status === 204 || delItem.status === 404) withdrawn = 1;
+          else errors.push(`delete: ${delItem.status}`);
         }
       }
 
