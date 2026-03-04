@@ -943,7 +943,7 @@ module.exports = async (req, res) => {
       if (!offerIds.length) return res.status(400).json({ error: 'No offers created — check category ID and policies' });
 
       // Step 4: publishOfferByInventoryItemGroup
-      const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/publishbyinventoryitemgroup`, {
+      const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/publish_by_inventory_item_group`, {
         method: 'POST', headers: authHeader,
         body: JSON.stringify({ inventoryItemGroupKey: groupSku, marketplaceId: 'EBAY_US' })
       });
