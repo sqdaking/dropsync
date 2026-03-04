@@ -937,6 +937,11 @@ module.exports = async (req, res) => {
         }
       }
       console.log('cleaned up old offers');
+      const listingPolicies = {};
+      if (policies.fulfillmentPolicyId) listingPolicies.fulfillmentPolicyId = policies.fulfillmentPolicyId;
+      if (policies.paymentPolicyId)     listingPolicies.paymentPolicyId     = policies.paymentPolicyId;
+      if (validReturnPolicyId)          listingPolicies.returnPolicyId      = validReturnPolicyId;
+
       const offerBase = {
         marketplaceId: 'EBAY_US',
         format: 'FIXED_PRICE',
@@ -944,10 +949,8 @@ module.exports = async (req, res) => {
         categoryId: product.categoryId || '9355',
         merchantLocationKey,
         listingDescription: product.description || product.title,
+        listingPolicies,
       };
-      if (policies.fulfillmentPolicyId) offerBase.fulfillmentPolicyId = policies.fulfillmentPolicyId;
-      if (policies.paymentPolicyId)     offerBase.paymentPolicyId     = policies.paymentPolicyId;
-      if (validReturnPolicyId)          offerBase.returnPolicyId      = validReturnPolicyId;
 
       const offerIds = [];
       const offerRequests = createdSkus.map((varSku, i) => {
@@ -1037,13 +1040,14 @@ module.exports = async (req, res) => {
 
 function buildOffer(sku, product, policies = {}, merchantLocationKey = 'default') {
   const p = { sku, marketplaceId:'EBAY_US', format:'FIXED_PRICE', listingDuration:'GTC', pricingSummary:{ price:{ value:String(parseFloat(product.price||0).toFixed(2)), currency:'USD' } }, categoryId:product.categoryId||'9355', merchantLocationKey };
-  if (process.env.EBAY_FULFILLMENT_POLICY_ID) p.fulfillmentPolicyId = process.env.EBAY_FULFILLMENT_POLICY_ID;
-  if (process.env.EBAY_PAYMENT_POLICY_ID)     p.paymentPolicyId     = process.env.EBAY_PAYMENT_POLICY_ID;
-  if (process.env.EBAY_RETURN_POLICY_ID)      p.returnPolicyId      = process.env.EBAY_RETURN_POLICY_ID;
-  // Source rules from frontend override env vars
-  if (policies.fulfillmentPolicyId) p.fulfillmentPolicyId = policies.fulfillmentPolicyId;
-  if (policies.paymentPolicyId)     p.paymentPolicyId     = policies.paymentPolicyId;
-  if (policies.returnPolicyId)      p.returnPolicyId      = policies.returnPolicyId;
+  const lp = {};
+  if (process.env.EBAY_FULFILLMENT_POLICY_ID) lp.fulfillmentPolicyId = process.env.EBAY_FULFILLMENT_POLICY_ID;
+  if (process.env.EBAY_PAYMENT_POLICY_ID)     lp.paymentPolicyId     = process.env.EBAY_PAYMENT_POLICY_ID;
+  if (process.env.EBAY_RETURN_POLICY_ID)      lp.returnPolicyId      = process.env.EBAY_RETURN_POLICY_ID;
+  if (policies.fulfillmentPolicyId) lp.fulfillmentPolicyId = policies.fulfillmentPolicyId;
+  if (policies.paymentPolicyId)     lp.paymentPolicyId     = policies.paymentPolicyId;
+  if (policies.returnPolicyId)      lp.returnPolicyId      = policies.returnPolicyId;
+  if (Object.keys(lp).length) p.listingPolicies = lp;
   return p;
 }
 
