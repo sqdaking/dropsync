@@ -881,14 +881,11 @@ module.exports = async (req, res) => {
         if (locData.locations?.length) {
           merchantLocationKey = locData.locations[0].merchantLocationKey;
         } else {
-          // Try to create a default location — returns 204 No Content on success
           const createRes = await fetch(`${EBAY_API}/sell/inventory/v1/location/MainWarehouse`, {
             method: 'POST', headers: authHeader,
             body: JSON.stringify({
               location: { address: { addressLine1: '1 Main St', city: 'San Jose', stateOrProvince: 'CA', postalCode: '95125', country: 'US' } },
-              locationTypes: ['WAREHOUSE'],
-              name: 'Main Warehouse',
-              merchantLocationStatus: 'ENABLED'
+              locationTypes: ['WAREHOUSE'], name: 'Main Warehouse', merchantLocationStatus: 'ENABLED'
             })
           });
           console.log('location create status:', createRes.status);
@@ -896,22 +893,29 @@ module.exports = async (req, res) => {
         }
       } catch(e) { console.log('location error:', e.message); }
       console.log('merchantLocationKey:', merchantLocationKey);
-      const baseOffer = buildOffer(groupSku, product, policies, merchantLocationKey);
-      delete baseOffer.sku;
-      const offerBody = { ...baseOffer, inventoryItemGroupKey: groupSku };
-      console.log('groupSku:', groupSku);
-      console.log('offerBody keys:', Object.keys(offerBody));
-      console.log('offerBody:', JSON.stringify(offerBody).slice(0, 500));
-      const offerRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, { method:'POST', headers:authHeader, body:JSON.stringify(offerBody) });
-      const offerRaw = await offerRes.json();
-      console.log('offerRes status:', offerRes.status);
-      console.log('offerData:', JSON.stringify(offerRaw).slice(0, 500));
-      if (!offerRes.ok) return res.status(400).json({ error: 'Offer failed', details: offerRaw });
-      const offerData = offerRaw;
 
-      const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerData.offerId}/publish`, { method:'POST', headers:authHeader });
+      // publishByInventoryItemGroup — no createOffer step needed for multi-variation
+      const pubBody = {
+        inventoryItemGroupKey: groupSku,
+        marketplaceId: 'EBAY_US',
+        merchantLocationKey,
+        pricingSummary: { price: { value: String(parseFloat(product.price||0).toFixed(2)), currency: 'USD' } },
+        listingDuration: 'GTC',
+        categoryId: product.categoryId || '9355',
+        format: 'FIXED_PRICE',
+      };
+      if (policies.fulfillmentPolicyId) pubBody.fulfillmentPolicyId = policies.fulfillmentPolicyId;
+      if (policies.paymentPolicyId)     pubBody.paymentPolicyId     = policies.paymentPolicyId;
+      if (policies.returnPolicyId)      pubBody.returnPolicyId      = policies.returnPolicyId;
+
+      console.log('pubBody:', JSON.stringify(pubBody).slice(0,500));
+      const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/publishbyinventoryitemgroup`, {
+        method: 'POST', headers: authHeader, body: JSON.stringify(pubBody)
+      });
       const pubData = await pubRes.json();
-      return res.json({ success:true, sku:groupSku, offerId:offerData.offerId, listingId:pubData.listingId, variationsCreated:createdSkus.length });
+      console.log('publishByGroup status:', pubRes.status, JSON.stringify(pubData).slice(0,500));
+      if (!pubRes.ok) return res.status(400).json({ error: 'Publish failed', details: pubData });
+      return res.json({ success:true, sku:groupSku, listingId:pubData.listingId, variationsCreated:createdSkus.length });
     }
 
     if (action === 'policies') {
