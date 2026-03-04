@@ -715,6 +715,42 @@ module.exports = async (req, res) => {
           }
         }
 
+        // ── Top-level stock detection ────────────────────────────────────
+        // Check the page HTML for clear out-of-stock signals
+        if (url.includes('amazon.com')) {
+          const htmlLower = html.toLowerCase();
+          const outOfStockSignals = [
+            'currently unavailable',
+            'this item is currently unavailable',
+            'unavailable - we don\'t know when or if this item will be back in stock',
+            'item under review',
+            'we don\'t know when or if this item will be back in stock',
+            '"availability":"OUT_OF_STOCK"',
+            '"availability": "OUT_OF_STOCK"',
+            '"availability":"unavailable"',
+            '"outofstock"',
+          ];
+          const isOOS = outOfStockSignals.some(s => htmlLower.includes(s.toLowerCase()));
+          const hasAddToCart = html.includes('add-to-cart-button') || html.includes('addToCart') || html.includes('Add to Cart');
+
+          if (isOOS && !hasAddToCart) {
+            product.inStock = false;
+            product.quantity = 0;
+          } else {
+            // Also check from variation stock data if available
+            const allVarValues = (product.variations||[]).flatMap(vg => vg.values||[]);
+            if (allVarValues.length > 0) {
+              const anyInStock = allVarValues.some(v => v.enabled !== false && (v.stock === undefined || v.stock > 0));
+              product.inStock = anyInStock;
+              product.quantity = anyInStock ? 10 : 0;
+            } else {
+              product.inStock = true;
+              product.quantity = 10;
+            }
+          }
+          console.log(`stock: inStock=${product.inStock} oos=${isOOS} addToCart=${hasAddToCart}`);
+        }
+
         return res.json({ success: true, product });
       } catch (e) {
         return res.json({ success: false, error: e.message, product });
@@ -1390,7 +1426,20 @@ module.exports = async (req, res) => {
 
           const oldPrice  = parseFloat(product.sourcePrice || product.price || 0);
           const newPrice  = parseFloat(fresh.price || 0);
-          const inStock   = fresh.inStock !== false && (fresh.quantity || 0) > 0;
+
+          // ── Stock: trust the scraper's top-level inStock flag ──
+          // Scraper sets product.inStock = false only on hard OOS signals (Currently unavailable, no Add to Cart)
+          // Default is true when page loads normally
+          let inStock;
+          if (typeof fresh.inStock === 'boolean') {
+            inStock = fresh.inStock;
+          } else {
+            inStock = true; // scraper didn't detect OOS = assume in stock
+          }
+
+          const wasOOS    = product.syncStatus === 'oos';
+          const backInStock = wasOOS && inStock;
+          const originalQty = product.quantity > 0 ? product.quantity : 10;
           const margin    = oldPrice > 0 ? (parseFloat(product.price) - oldPrice) / oldPrice : 0;
           const newEbayPrice = newPrice > 0 ? (newPrice * (1 + margin)).toFixed(2) : product.price;
 
@@ -1404,10 +1453,10 @@ module.exports = async (req, res) => {
 
           const authHeader  = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' };
 
-          if (!priceChanged && inStock && !imagesChanged) { results.push({ id: product.id, unchanged: true }); continue; }
+          if (!priceChanged && inStock && !imagesChanged && !backInStock) { results.push({ id: product.id, unchanged: true }); continue; }
 
-          // If only images changed, update group and inventory items images
-          if (imagesChanged && product.ebaySku) {
+          // If only images changed — update group and inventory items images (skip if locked)
+          if (imagesChanged && product.ebaySku && !product.ebayLocked) {
             console.log(`sync [${product.id}]: images changed, updating group`);
             // Update inventory item group images
             const grpRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(product.ebaySku)}`, { headers: authHeader });
@@ -1475,22 +1524,24 @@ module.exports = async (req, res) => {
             const updateBody = { ...offer };
             if (priceChanged) updateBody.pricingSummary = { price: { value: String(newEbayPrice), currency: 'USD' } };
             if (!inStock) updateBody.availableQuantity = 0;
+            if (backInStock) updateBody.availableQuantity = originalQty;
 
             const upRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerId}`, {
               method: 'PUT', headers: authHeader,
               body: JSON.stringify(updateBody),
             });
 
-            // Also update inventory item qty if out of stock
-            if (!inStock) {
+            // Sync inventory item quantity
+            if (!inStock || backInStock) {
+              const restoreQty = backInStock ? originalQty : 0;
               await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
                 method: 'PUT', headers: authHeader,
                 body: JSON.stringify({
-                  availability: { shipToLocationAvailability: { quantity: 0 } },
+                  availability: { shipToLocationAvailability: { quantity: restoreQty } },
                   condition: offer.condition || 'NEW',
-                  product: offer.listing?.listingDescription ? undefined : undefined,
                 }),
               });
+              console.log(`sync qty [${sku}]: ${restoreQty} (backInStock=${backInStock}, inStock=${inStock})`);
             }
             if (upRes.ok || upRes.status === 204) updated++;
           }
@@ -1501,12 +1552,13 @@ module.exports = async (req, res) => {
             priceChanged,
             stockChanged,
             imagesChanged,
+            backInStock,
             newSourcePrice: newPrice,
             newEbayPrice: parseFloat(newEbayPrice),
             newImages: imagesChanged ? (fresh.images||[]) : undefined,
             inStock,
           });
-          console.log(`sync [${product.id}]: price ${oldPrice}→${newPrice}, stock:${inStock}, updated ${updated} offers`);
+          console.log(`sync [${product.id}]: price ${oldPrice}→${newPrice}, inStock:${inStock}, backInStock:${backInStock}, updated ${updated} offers`);
 
         } catch(e) {
           console.error('sync error for', product.id, e.message);
@@ -1612,6 +1664,84 @@ module.exports = async (req, res) => {
 
       // Pad to 100 with static fallbacks if scraping didn't yield enough
       return res.json({ success: true, products: results.slice(0, 100), count: results.length });
+    }
+
+    // ── TWEAK: update price/qty/title/condition on eBay without touching variations/images ──
+    if (action === 'tweak') {
+      const { access_token, ebaySku, title, price, quantity, condition, description, images } = body;
+      if (!access_token || !ebaySku) return res.status(400).json({ error: 'Missing fields' });
+      const authHeader = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' };
+
+      // 1. Update all offers (price + qty)
+      const offersRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(ebaySku)}&limit=200`, { headers: authHeader });
+      const offersData = await offersRes.json();
+      const offers = offersData.offers || [];
+
+      let updated = 0;
+      for (const offer of offers) {
+        const updateBody = { ...offer };
+        if (price > 0) updateBody.pricingSummary = { price: { value: String(parseFloat(price).toFixed(2)), currency: 'USD' } };
+        if (quantity >= 0) updateBody.availableQuantity = quantity;
+        const upRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}`, {
+          method: 'PUT', headers: authHeader, body: JSON.stringify(updateBody),
+        });
+        if (upRes.ok || upRes.status === 204) updated++;
+      }
+
+      // 2. Update inventory item group: title, description, images (all optional)
+      const grpRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, { headers: authHeader });
+      if (grpRes.ok) {
+        const grp = await grpRes.json();
+        if (title)       grp.title = title.slice(0, 80);
+        if (description) grp.description = description;
+        if (images?.length) grp.imageUrls = images.slice(0, 12);
+        await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, {
+          method: 'PUT', headers: authHeader, body: JSON.stringify(grp),
+        });
+      }
+
+      // 3. Update condition + description + images on each child inventory item
+      const allSkusRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item?limit=200`, { headers: authHeader });
+      const allSkusData = await allSkusRes.json();
+      const groupItems = (allSkusData.inventoryItems || []).filter(i => i.sku.startsWith(ebaySku.slice(0, 20)));
+      for (const item of groupItems.slice(0, 100)) {
+        const upd = { ...item };
+        if (condition)    upd.condition = condition;
+        if (description)  upd.product = { ...(upd.product||{}), description };
+        if (images?.length) upd.product = { ...(upd.product||{}), imageUrls: images.slice(0, 12) };
+        await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(item.sku)}`, {
+          method: 'PUT', headers: authHeader, body: JSON.stringify(upd),
+        });
+      }
+
+      console.log(`tweak [${ebaySku}]: updated ${updated}/${offers.length} offers, ${groupItems.length} items`);
+      return res.json({ success: true, updatedOffers: updated, updatedItems: groupItems.length });
+    }
+
+    // ── END LISTING: withdraw all offers and end the listing ──
+    if (action === 'endListing') {
+      const { access_token, ebaySku, ebayListingId } = body;
+      if (!access_token || !ebaySku) return res.status(400).json({ error: 'Missing fields' });
+      const authHeader = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' };
+
+      // Get all offers for this group
+      const offersRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(ebaySku)}&limit=200`, { headers: authHeader });
+      const offersData = await offersRes.json();
+      const offers = offersData.offers || [];
+
+      let withdrawn = 0;
+      for (const offer of offers) {
+        if (offer.status === 'PUBLISHED') {
+          const wRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}/withdraw`, {
+            method: 'POST', headers: authHeader,
+          });
+          if (wRes.ok || wRes.status === 204) withdrawn++;
+          else console.log('withdraw failed:', offer.offerId, wRes.status);
+        }
+      }
+
+      console.log(`endListing [${ebaySku}]: withdrew ${withdrawn}/${offers.length} offers`);
+      return res.json({ success: true, withdrawn });
     }
 
     if (action === 'listings') {
