@@ -92,7 +92,16 @@ module.exports = async (req, res) => {
     // ═══════════════════════════════════════════════════════════
     // SCRAPE — full variation + image + price extraction
     // ═══════════════════════════════════════════════════════════
-    if (action === 'scrape') {
+    // Debug action — returns raw extracted product data including _debug info
+    if (action === 'debug') {
+      const url = req.query.url || body.url;
+      if (!url) return res.json({ error: 'No URL provided. Add ?url=https://amazon.com/dp/...' });
+      // Reuse scrape action
+      req.query.action = 'scrape';
+      // Fall through to scrape below — handled by returning full product with _debug
+    }
+
+    if (action === 'scrape' || action === 'debug') {
       const url = body.url || req.query.url;
       if (!url) return res.status(400).json({ error: 'No URL' });
 
@@ -164,266 +173,323 @@ module.exports = async (req, res) => {
           const brandM = html.match(/id="bylineInfo"[^>]*>([\s\S]*?)<\/(?:a|span)>/);
           if (brandM) product.brand = brandM[1].replace(/<[^>]+>/g,'').replace(/Visit the|Store/g,'').trim();
 
-          // ── Base price (multiple fallbacks)
+          // ══════════════════════════════════════════════════════════════
+          // STEP 1: Extract the main twister/variation JSON blob
+          // Amazon embeds ALL variation data in a data-a-dynamic-image attr
+          // or in script tags as jQuery.parseJSON / P.register calls
+          // ══════════════════════════════════════════════════════════════
+
+          // Find the big twister data object — try multiple patterns
+          let twisterJson = null;
+
+          // Pattern A: "twister-js-init" script block
+          const twisterScript = html.match(/var\s+dataToReturn\s*=\s*(\{[\s\S]*?\});\s*return dataToReturn/);
+          if (twisterScript) { try { twisterJson = JSON.parse(twisterScript[1]); } catch {} }
+
+          // Pattern B: jQuery.parseJSON embedded data
+          if (!twisterJson) {
+            const jqMatch = html.match(/jQuery\.parseJSON\s*\(\s*'([\s\S]*?)'\s*\)/);
+            if (jqMatch) { try { twisterJson = JSON.parse(jqMatch[1].replace(/\\'/g,"'")); } catch {} }
+          }
+
+          // Pattern C: P.register('twister-js-init' ...) block — most common
+          if (!twisterJson) {
+            const pReg = html.match(/P\.register\s*\(\s*['"]twister[^'"]*['"]\s*,\s*function\s*\(\)\s*\{([\s\S]*?)\}\s*\)\s*;/);
+            if (pReg) {
+              const inner = pReg[1];
+              const dvd = inner.match(/"dimensionValuesData"\s*:\s*(\{[\s\S]*?\})\s*,\s*"/);
+              if (dvd) { try { twisterJson = { dimensionValuesData: JSON.parse(dvd[1]) }; } catch {} }
+            }
+          }
+
+          // ══════════════════════════════════════════════════════════════
+          // STEP 2: Extract asinVariationValues — the gold standard
+          // Format: { "B0XXXXXX": { "color_name": "Red", "size_name": "M" }, ... }
+          // ══════════════════════════════════════════════════════════════
+          const asinToDims = {}; // asin -> { color_name, size_name, ... }
+          const dimValToAsins = {}; // "color_name:Red" -> [asin, ...]
+
+          // Try all known key names
+          for (const key of ['asinVariationValues', 'asinToDimension', 'variationAsinBindings']) {
+            const pat = new RegExp(`"${key}"\\s*:\\s*(\\{[\\s\\S]*?\\})(?=\\s*,\\s*")`);
+            const m = html.match(pat);
+            if (m) {
+              try {
+                const parsed = JSON.parse(m[1]);
+                Object.assign(asinToDims, parsed);
+                break;
+              } catch {}
+            }
+          }
+
+          // Build reverse index: dimension value -> list of ASINs
+          for (const [asin, dims] of Object.entries(asinToDims)) {
+            for (const [dimKey, dimVal] of Object.entries(dims)) {
+              const k = `${dimKey}:${dimVal}`;
+              if (!dimValToAsins[k]) dimValToAsins[k] = [];
+              dimValToAsins[k].push(asin);
+            }
+          }
+
+          // ══════════════════════════════════════════════════════════════
+          // STEP 3: Extract per-ASIN prices
+          // ══════════════════════════════════════════════════════════════
+          const asinPrice = {}; // asin -> price string
+
+          // Method A: priceToAsinList { "29.99": ["B0XX", ...] }
+          const p2aM = html.match(/"priceToAsinList"\s*:\s*(\{[\s\S]*?\})(?=\s*,\s*")/);
+          if (p2aM) {
+            try {
+              const p2a = JSON.parse(p2aM[1]);
+              for (const [price, asins] of Object.entries(p2a)) {
+                if (Array.isArray(asins)) asins.forEach(a => { if (!asinPrice[a]) asinPrice[a] = price; });
+              }
+            } catch {}
+          }
+
+          // Method B: scan for "B0XXXXXX"..."price"..."amount":N patterns
+          const asinPriceInline = [...html.matchAll(/"([A-Z0-9]{10})"\s*[\s\S]{0,300}?"amount"\s*:\s*([\d.]+)/g)];
+          asinPriceInline.forEach(m => { if (!asinPrice[m[1]]) asinPrice[m[1]] = m[2]; });
+
+          // Method C: merchantCustomerPreferences or offerListings
+          const offersM = html.match(/"offerListings"\s*:\s*(\[[\s\S]*?\])(?=\s*,\s*")/);
+          if (offersM) {
+            try {
+              JSON.parse(offersM[1]).forEach(o => {
+                if (o.asin && o.price?.amount) asinPrice[o.asin] = String(o.price.amount);
+              });
+            } catch {}
+          }
+
+          // Method D: dimensionValuesData from twister — has price per ASIN
+          if (twisterJson?.dimensionValuesData) {
+            for (const [asin, data] of Object.entries(twisterJson.dimensionValuesData)) {
+              if (data?.price?.amount) asinPrice[asin] = String(data.price.amount);
+            }
+          }
+
+          // ══════════════════════════════════════════════════════════════
+          // STEP 4: Extract per-ASIN stock status
+          // ══════════════════════════════════════════════════════════════
+          const asinInStock = {}; // asin -> boolean
+
+          // unavailableAsinSet
+          const unavailM = html.match(/"unavailableAsinSet"\s*:\s*(\[[^\]]*\])/);
+          if (unavailM) { try { JSON.parse(unavailM[1]).forEach(a => { asinInStock[a] = false; }); } catch {} }
+
+          // inStockAsinSet
+          const inStockM = html.match(/"inStockAsinSet"\s*:\s*(\[[^\]]*\])/);
+          if (inStockM) { try { JSON.parse(inStockM[1]).forEach(a => { asinInStock[a] = true; }); } catch {} }
+
+          // buyability field
+          [...html.matchAll(/"asin"\s*:\s*"([A-Z0-9]{10})"[^}]*"buyability"\s*:\s*"([^"]+)"/g)]
+            .forEach(m => { if (asinInStock[m[1]] === undefined) asinInStock[m[1]] = m[2] === 'BUYABLE'; });
+
+          // ══════════════════════════════════════════════════════════════
+          // STEP 5: Extract dimension names and their values
+          // ══════════════════════════════════════════════════════════════
+          const variationData = {}; // dimKey -> [val1, val2, ...]
+
+          // Method A: variationValues block
+          const varValsM = html.match(/"variationValues"\s*:\s*(\{[\s\S]*?\})(?=\s*,\s*")/);
+          if (varValsM) {
+            try {
+              const vv = JSON.parse(varValsM[1]);
+              for (const [k, vals] of Object.entries(vv)) {
+                if (Array.isArray(vals) && vals.length) variationData[k] = vals;
+              }
+            } catch {}
+          }
+
+          // Method B: derive from asinToDims keys (always works if we have asin data)
+          if (!Object.keys(variationData).length && Object.keys(asinToDims).length) {
+            for (const dims of Object.values(asinToDims)) {
+              for (const [dimKey, dimVal] of Object.entries(dims)) {
+                if (!variationData[dimKey]) variationData[dimKey] = [];
+                if (!variationData[dimKey].includes(dimVal)) variationData[dimKey].push(dimVal);
+              }
+            }
+          }
+
+          // Method C: HTML select dropdowns fallback
+          for (const [htmlName, dimKey] of [
+            ['dropdown_selected_size_name', 'size_name'],
+            ['dropdown_selected_color_name', 'color_name'],
+            ['dropdown_selected_style_name', 'style_name'],
+          ]) {
+            if (variationData[dimKey]) continue;
+            const sel = html.match(new RegExp(`name="${htmlName}"[\\s\\S]*?<select[^>]*>([\\s\\S]*?)<\\/select>`, 'i'));
+            if (sel) {
+              const opts = [...sel[1].matchAll(/<option[^>]+value="([^"]+)"[^>]*>([^<]+)<\/option>/g)]
+                .filter(m => m[1] && m[1] !== '-1' && !m[2].includes('Select'))
+                .map(m => m[2].trim());
+              if (opts.length) variationData[dimKey] = opts;
+            }
+          }
+
+          // ══════════════════════════════════════════════════════════════
+          // STEP 6: Extract images
+          // ══════════════════════════════════════════════════════════════
+          const colorImgMap = {}; // color value -> image URL
+          const allImages = [];
+
+          // colorImages block — most reliable
+          const colorImagesM = html.match(/'colorImages'\s*:\s*(\{[\s\S]*?\})\s*,\s*'colorToAsin'/);
+          if (colorImagesM) {
+            try {
+              const ci = JSON.parse(colorImagesM[1].replace(/'/g, '"').replace(/(\w+):/g, '"$1":'));
+              for (const [key, imgs] of Object.entries(ci)) {
+                if (!Array.isArray(imgs)) continue;
+                if (key === 'initial') {
+                  imgs.forEach(i => {
+                    const src = i.hiRes || i.large;
+                    if (src && !allImages.includes(src)) allImages.push(src);
+                  });
+                } else {
+                  const best = imgs.find(i => i.hiRes) || imgs.find(i => i.large) || imgs[0];
+                  if (best) colorImgMap[key] = best.hiRes || best.large || '';
+                }
+              }
+            } catch {}
+          }
+
+          // Fallback: hiRes/large in scripts
+          if (!allImages.length) {
+            const hiRes = [...html.matchAll(/"hiRes"\s*:\s*"(https[^"]+)"/g)].map(m => m[1]);
+            const large = [...html.matchAll(/"large"\s*:\s*"(https[^"]+)"/g)].map(m => m[1]);
+            allImages.push(...[...new Set([...hiRes, ...large])].filter(s => s.includes('images-amazon')));
+          }
+
+          product.images = allImages.slice(0, 12);
+          if (Object.keys(colorImgMap).length) product.variationImages['Color'] = colorImgMap;
+
+          // ══════════════════════════════════════════════════════════════
+          // STEP 7: Base price
+          // ══════════════════════════════════════════════════════════════
           const priceSelectors = [
-            /class="a-price-whole"[^>]*>\s*(\d[\d,]*)\s*<\/span>\s*<span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/,
+            /class="a-price-whole"[^>]*>\s*(\d[\d,]*)<\/span><span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/,
             /"priceAmount"\s*:\s*([\d.]+)/,
             /id="priceblock_ourprice"[^>]*>\s*\$?([\d,]+\.?\d*)/,
             /id="priceblock_dealprice"[^>]*>\s*\$?([\d,]+\.?\d*)/,
             /"buyingPrice"\s*:\s*([\d.]+)/,
             /class="a-offscreen"[^>]*>\$([\d,]+\.?\d*)/,
-            /\$\s*([\d,]+\.\d{2})/,
           ];
           for (const pat of priceSelectors) {
             const m = html.match(pat);
-            if (m) {
-              product.price = m[2] ? `${m[1].replace(/,/g,'')}.${m[2]}` : m[1].replace(/,/g,'');
-              break;
-            }
+            if (m) { product.price = m[2] ? `${m[1].replace(/,/g,'')}.${m[2]}` : m[1].replace(/,/g,''); break; }
           }
 
-          // ══════════════════════════════════════════════════════
-          // AMAZON VARIATION EXTRACTION
-          // Strategy: parse the embedded JSON data blocks that
-          // Amazon uses to power the variation selector (twister)
-          // ══════════════════════════════════════════════════════
-
-          // 1) Extract color→image mapping from colorImages block
-          const colorImgMap = {};
-          const colorImagesMatch = html.match(/'colorImages'\s*:\s*\{([\s\S]*?)\},\s*'colorToAsin'/);
-          if (colorImagesMatch) {
-            try {
-              const parsed = JSON.parse(`{${colorImagesMatch[1]}}`);
-              for (const [colorKey, imgs] of Object.entries(parsed)) {
-                if (!Array.isArray(imgs) || colorKey === 'initial') continue;
-                const best = imgs.find(i => i.hiRes) || imgs.find(i => i.large) || imgs[0];
-                if (best) colorImgMap[colorKey] = best.hiRes || best.large || '';
-              }
-            } catch {}
-          }
-
-          // 2) Extract all product images (from initial colorImages entry)
-          const allProductImages = [];
-          const initImagesMatch = html.match(/'colorImages'\s*:\s*\{[^}]*"initial"\s*:\s*(\[[\s\S]*?\])\s*[,}]/);
-          if (initImagesMatch) {
-            try {
-              const imgs = JSON.parse(initImagesMatch[1]);
-              imgs.forEach(i => {
-                const src = i.hiRes || i.large;
-                if (src && !allProductImages.includes(src)) allProductImages.push(src);
-              });
-            } catch {}
-          }
-          // Fallback image extraction
-          if (!allProductImages.length) {
-            const hiRes = [...html.matchAll(/"hiRes"\s*:\s*"(https[^"]+)"/g)].map(m => m[1]);
-            const large = [...html.matchAll(/"large"\s*:\s*"(https[^"]+)"/g)].map(m => m[1]);
-            allProductImages.push(...[...new Set([...hiRes, ...large])]);
-          }
-          product.images = allProductImages.slice(0, 12);
-
-          // 3) Extract dimension names (e.g. "Size", "Color", "Style")
-          const dimensionNames = [];
-          const dimNameMatches = [...html.matchAll(/"variationDisplayLabel"\s*:\s*"([^"]+)"/g)];
-          dimNameMatches.forEach(m => { if (!dimensionNames.includes(m[1])) dimensionNames.push(m[1]); });
-
-          // Also try: "dimensionValuesDisplayData"
-          const altDimMatch = html.match(/"dimensionValuesDisplayData"\s*:\s*(\{[\s\S]*?\})\s*,\s*"[a-z]/);
-          
-          // 4) Extract variation values per dimension
-          // Try the twister data block first (most reliable)
-          const variationData = {};
-          
-          // Method A: variationValues block
-          const varValuesMatch = html.match(/"variationValues"\s*:\s*(\{[\s\S]*?\})\s*,\s*"[a-zA-Z]/);
-          if (varValuesMatch) {
-            try {
-              const vv = JSON.parse(varValuesMatch[1]);
-              for (const [dimName, values] of Object.entries(vv)) {
-                if (Array.isArray(values)) variationData[dimName] = values;
-              }
-            } catch {}
-          }
-
-          // Method B: dimensionValuesDisplayData
-          const dvddMatch = html.match(/"dimensionValuesDisplayData"\s*:\s*(\{[\s\S]*?\})\s*,\s*"[a-z]/);
-          if (dvddMatch && !Object.keys(variationData).length) {
-            try {
-              const dvdd = JSON.parse(dvddMatch[1]);
-              for (const [key, val] of Object.entries(dvdd)) {
-                if (Array.isArray(val)) variationData[key] = val;
-              }
-            } catch {}
-          }
-
-          // Method C: scan script blocks for color_name and size_name arrays
-          if (!Object.keys(variationData).length) {
-            const scripts = [...html.matchAll(/<script[^>]*type="text\/javascript"[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]);
-            for (const script of scripts) {
-              if (!script.includes('color_name') && !script.includes('size_name') && !script.includes('variation')) continue;
-              // color
-              const cM = script.match(/"color_name"\s*:\s*(\[[^\]]+\])/);
-              if (cM) { try { const c = JSON.parse(cM[1]); if (c.length) variationData['color_name'] = c; } catch {} }
-              // size
-              const sM = script.match(/"size_name"\s*:\s*(\[[^\]]+\])/);
-              if (sM) { try { const s = JSON.parse(sM[1]); if (s.length) variationData['size_name'] = s; } catch {} }
-              // style
-              const stM = script.match(/"style_name"\s*:\s*(\[[^\]]+\])/);
-              if (stM) { try { const st = JSON.parse(stM[1]); if (st.length) variationData['style_name'] = st; } catch {} }
-              if (Object.keys(variationData).length) break;
-            }
-          }
-
-          // Method D: parse select dropdowns in HTML
-          const sizeDropdown = html.match(/name="dropdown_selected_size_name"[\s\S]*?<select[^>]*>([\s\S]*?)<\/select>/i);
-          if (sizeDropdown && !variationData['size_name']) {
-            const opts = [...sizeDropdown[1].matchAll(/<option[^>]+value="([^"]+)"[^>]*>([^<]+)<\/option>/g)]
-              .filter(m => m[1] && m[1] !== '-1' && !m[1].includes('Select'))
-              .map(m => m[2].trim());
-            if (opts.length) variationData['size_name'] = opts;
-          }
-
-          // ─────────────────────────────────────────────────────────
-          // 5) Per-ASIN price + stock — try every Amazon data source
-          // ─────────────────────────────────────────────────────────
-          const asinPriceMap = {};  // asin -> price string
-          const asinStockMap = {};  // asin -> boolean
-          const asinDimMap   = {};  // asin -> { color_name:'Red', size_name:'L' }
-
-          // A) asinVariationValues  (most complete — full dim map per ASIN)
-          const asinVarVals = html.match(/"asinVariationValues"\s*:\s*(\{[\s\S]*?\})(?=\s*,\s*"[a-zA-Z])/);
-          if (asinVarVals) { try { Object.assign(asinDimMap, JSON.parse(asinVarVals[1])); } catch {} }
-
-          // B) asinToDimension fallback
-          if (!Object.keys(asinDimMap).length) {
-            const a2d = html.match(/"asinToDimension"\s*:\s*(\{[\s\S]*?\})(?=\s*,\s*"[a-zA-Z])/);
-            if (a2d) { try { Object.assign(asinDimMap, JSON.parse(a2d[1])); } catch {} }
-          }
-
-          // C) priceToAsinList  { "29.99": ["ASIN1","ASIN2"], ... }
-          const p2a = html.match(/"priceToAsinList"\s*:\s*(\{[\s\S]*?\})(?=\s*,\s*"[a-zA-Z])/);
-          if (p2a) {
-            try {
-              const pa = JSON.parse(p2a[1]);
-              for (const [price, asins] of Object.entries(pa)) {
-                if (Array.isArray(asins)) asins.forEach(a => { if (!asinPriceMap[a]) asinPriceMap[a] = price; });
-              }
-            } catch {}
-          }
-
-          // D) offerListings  [ { asin, price: { amount } }, ... ]
-          const offerM = html.match(/"offerListings"\s*:\s*(\[[\s\S]*?\])(?=\s*,\s*"[a-zA-Z])/);
-          if (offerM) {
-            try {
-              JSON.parse(offerM[1]).forEach(o => {
-                if (o.asin && o.price?.amount) asinPriceMap[o.asin] = String(o.price.amount);
-              });
-            } catch {}
-          }
-
-          // E) Inline "asin":"B0XX","price":N patterns scattered in scripts
-          [...html.matchAll(/"asin"\s*:\s*"([A-Z0-9]{10})"[^{}]{0,200}"amount"\s*:\s*([\d.]+)/g)]
-            .forEach(m => { if (!asinPriceMap[m[1]]) asinPriceMap[m[1]] = m[2]; });
-
-          // F) unavailableAsinSet / inStockAsinSet
-          const unavailM = html.match(/"unavailableAsinSet"\s*:\s*(\[[\s\S]*?\])/);
-          if (unavailM) { try { JSON.parse(unavailM[1]).forEach(a => { asinStockMap[a] = false; }); } catch {} }
-          const inStockM = html.match(/"inStockAsinSet"\s*:\s*(\[[\s\S]*?\])/);
-          if (inStockM) { try { JSON.parse(inStockM[1]).forEach(a => { asinStockMap[a] = true; }); } catch {} }
-
-          // G) buyability / availability text per ASIN
-          [...html.matchAll(/"asin"\s*:\s*"([A-Z0-9]{10})"[^{}]{0,400}"buyability"\s*:\s*"([^"]+)"/g)]
-            .forEach(m => { if (asinStockMap[m[1]] === undefined) asinStockMap[m[1]] = m[2] === 'BUYABLE'; });
-
-          // Helper — find ASIN for a single dimension value
-          function findAsin(dimKey, val) {
-            for (const [asin, dims] of Object.entries(asinDimMap)) {
-              if (dims[dimKey] === val) return asin;
-            }
-            return null;
-          }
-
-          // ─────────────────────────────────────────────────────────
-          // 6) Build variation groups with per-variant price + stock
-          // ─────────────────────────────────────────────────────────
+          // ══════════════════════════════════════════════════════════════
+          // STEP 8: Build variation groups with correct price + stock
+          // ══════════════════════════════════════════════════════════════
           const dimKeyToLabel = {
             'color_name':'Color','size_name':'Size','style_name':'Style',
             'material_type':'Material','pattern_name':'Pattern',
             'configuration_name':'Configuration','edition_name':'Edition',
             'item_package_quantity':'Package Quantity','scent_name':'Scent',
-            'flavor_name':'Flavor',
+            'flavor_name':'Flavor','hand_orientation_name':'Orientation',
           };
 
           for (const [dimKey, values] of Object.entries(variationData)) {
             if (!Array.isArray(values) || !values.length) continue;
-            const label = dimKeyToLabel[dimKey]
-              || dimNameMatches.find(m => m[1].toLowerCase().includes(dimKey.split('_')[0]))?.[1]
-              || dimKey.replace(/_name$/,'').replace(/_/g,' ').replace(/\b\w/g, c => c.toUpperCase());
+            const label = dimKeyToLabel[dimKey] || dimKey.replace(/_name$/,'').replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
 
             const varValues = values.map(val => {
               const strVal = String(val);
-              const img    = dimKey === 'color_name' ? (colorImgMap[strVal] || '') : '';
-              const asin   = findAsin(dimKey, strVal);
 
-              // Price: per-ASIN if found, else base product price
-              const varPrice = (asin && asinPriceMap[asin]) ? asinPriceMap[asin] : (product.price || '0');
+              // Find all ASINs that have this dimension value
+              const matchingAsins = dimValToAsins[`${dimKey}:${strVal}`] || [];
 
-              // Stock: per-ASIN if found, else default 10
+              // Also direct lookup from asinToDims
+              if (!matchingAsins.length) {
+                for (const [asin, dims] of Object.entries(asinToDims)) {
+                  if (dims[dimKey] === strVal && !matchingAsins.includes(asin)) matchingAsins.push(asin);
+                }
+              }
+
+              // Price: find cheapest available price among matching ASINs
+              let varPrice = product.price || '0';
+              const availablePrices = matchingAsins
+                .filter(a => asinInStock[a] !== false && asinPrice[a])
+                .map(a => parseFloat(asinPrice[a]))
+                .filter(p => p > 0);
+              if (availablePrices.length) varPrice = Math.min(...availablePrices).toFixed(2);
+              else {
+                // Try any price even out of stock
+                const anyPrice = matchingAsins.map(a => parseFloat(asinPrice[a]||0)).filter(p=>p>0);
+                if (anyPrice.length) varPrice = Math.min(...anyPrice).toFixed(2);
+              }
+
+              // Stock: in stock if ANY matching ASIN is available
               let inStock = true;
-              if (asin && asinStockMap[asin] !== undefined) inStock = asinStockMap[asin];
-              const stock = inStock ? 10 : 0;
+              if (matchingAsins.length > 0) {
+                inStock = matchingAsins.some(a => asinInStock[a] !== false);
+                // If none have explicit stock data, default to in stock
+                if (!matchingAsins.some(a => asinInStock[a] !== undefined)) inStock = true;
+              }
+
+              // Image: color map or fallback to product image
+              const img = dimKey === 'color_name' ? (colorImgMap[strVal] || allImages[0] || '') : '';
 
               return {
-                value:       strVal,
-                price:       varPrice,
-                sourcePrice: varPrice,   // preserve original for margin calc
-                stock,
+                value: strVal,
+                price: varPrice,
+                sourcePrice: varPrice,
+                stock: inStock ? 10 : 0,
                 inStock,
-                asin:        asin || '',
-                image:       img,
-                enabled:     inStock,    // auto-disable out-of-stock variants
+                asins: matchingAsins,
+                image: img,
+                enabled: inStock,
               };
             });
 
             product.variations.push({ name: label, values: varValues });
-            if (dimKey === 'color_name' && Object.keys(colorImgMap).length) {
-              product.variationImages['Color'] = colorImgMap;
-            }
           }
 
           product.hasVariations = product.variations.length > 0;
 
-          // Set base price to cheapest available variant
+          // Set base price = cheapest available variant
           if (product.hasVariations) {
-            const avail = product.variations.flatMap(vg => vg.values)
-              .filter(v => v.inStock !== false && parseFloat(v.price) > 0)
+            const prices = product.variations.flatMap(vg => vg.values)
+              .filter(v => v.inStock && parseFloat(v.price) > 0)
               .map(v => parseFloat(v.price));
-            if (avail.length) product.price = Math.min(...avail).toFixed(2);
+            if (prices.length) product.price = Math.min(...prices).toFixed(2);
           }
 
-          // 7) Description from bullet points
+          // ── Description
           const bullets = [...html.matchAll(/<span class="a-list-item">\s*([\s\S]*?)\s*<\/span>/g)]
             .map(m => m[1].replace(/<[^>]+>/g,'').trim())
             .filter(b => b.length > 15 && b.length < 500 && !b.includes('{'))
             .slice(0, 5);
           if (bullets.length) product.description = bullets.join('\n');
           if (!product.description) {
-            const featureDiv = html.match(/id="feature-bullets"[^>]*>([\s\S]*?)<\/div>/);
-            if (featureDiv) product.description = featureDiv[1].replace(/<[^>]+>/g,'').replace(/\s+/g,' ').trim().slice(0,1000);
+            const feat = html.match(/id="feature-bullets"[^>]*>([\s\S]*?)<\/div>/);
+            if (feat) product.description = feat[1].replace(/<[^>]+>/g,'').replace(/\s+/g,' ').trim().slice(0,1000);
           }
 
-          // 8) Item specifics from product details table
+          // ── Item specifics
           const specTable = html.match(/id="productDetails_techSpec[^"]*"[^>]*>([\s\S]*?)<\/table>/i) ||
                             html.match(/id="detailBullets_feature_div"[^>]*>([\s\S]*?)<\/div>/i);
           if (specTable) {
             const rows = [...specTable[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)];
             for (const row of rows.slice(0, 12)) {
-              const cells = [...row[1].matchAll(/<t[hd][^>]*>([\s\S]*?)<\/t[hd]>/g)].map(m => m[1].replace(/<[^>]+>/g,'').replace(/\u200f|\u200e/g,'').trim());
+              const cells = [...row[1].matchAll(/<t[hd][^>]*>([\s\S]*?)<\/t[hd]>/g)]
+                .map(m => m[1].replace(/<[^>]+>/g,'').replace(/\u200f|\u200e/g,'').trim());
               if (cells.length >= 2 && cells[0] && cells[1] && cells[0].length < 60) {
                 product.aspects[cells[0]] = [cells[1]];
               }
             }
           }
+
+          // ── Debug info (remove in prod)
+          product._debug = {
+            asinCount: Object.keys(asinToDims).length,
+            priceMapCount: Object.keys(asinPrice).length,
+            stockMapCount: Object.keys(asinInStock).length,
+            variationDims: Object.keys(variationData),
+            imageCount: allImages.length,
+            colorMapCount: Object.keys(colorImgMap).length,
+          };
         }
 
         // ── WALMART ─────────────────────────────────────────────────────
