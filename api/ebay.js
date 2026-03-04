@@ -1050,6 +1050,40 @@ module.exports = async (req, res) => {
         else                                                          product.aspects['Department'] = ['Unisex'];
       }
 
+      if (!product.aspects['Outer Shell Material'] && !product.aspects['Material']) {
+        // Search title + description + all aspects for material keywords
+        const matTx = [
+          tx2,
+          (product.description||'').toLowerCase(),
+          Object.entries(product.aspects||{}).map(([k,v])=>k+' '+v.join(' ')).join(' ').toLowerCase(),
+        ].join(' ');
+        let mat = 'Polyester'; // safe default
+        if      (/\b100%?\s*cotton|\bcotton\b/.test(matTx))           mat = 'Cotton';
+        else if (/\bdenim\b/.test(matTx))                              mat = 'Denim';
+        else if (/\bfleece\b/.test(matTx))                             mat = 'Fleece';
+        else if (/\bfrench terry|terry cloth|terrycloth\b/.test(matTx)) mat = 'Cotton';
+        else if (/\bcashmere\b/.test(matTx))                           mat = 'Cashmere';
+        else if (/\bwool\b/.test(matTx))                               mat = 'Wool';
+        else if (/\bsilk\b/.test(matTx))                               mat = 'Silk';
+        else if (/\blinen\b/.test(matTx))                              mat = 'Linen';
+        else if (/\bvelvet\b/.test(matTx))                             mat = 'Velvet';
+        else if (/\bsuede\b/.test(matTx))                              mat = 'Suede';
+        else if (/\bfaux leather|vegan leather|pu leather\b/.test(matTx)) mat = 'Faux Leather';
+        else if (/\bleather\b/.test(matTx))                            mat = 'Leather';
+        else if (/\brayon|viscose\b/.test(matTx))                      mat = 'Rayon';
+        else if (/\bspandex|elastane\b/.test(matTx))                   mat = 'Spandex';
+        else if (/\bnylon\b/.test(matTx))                              mat = 'Nylon';
+        else if (/\bpolyester\b/.test(matTx))                          mat = 'Polyester';
+        else if (/\bacrylic\b/.test(matTx))                            mat = 'Acrylic';
+        else if (/\bbamboo\b/.test(matTx))                             mat = 'Bamboo';
+        else if (/\bmodal\b/.test(matTx))                              mat = 'Modal';
+        // Also check Amazon's own Material aspect if scraped
+        const amazonMat = (product.aspects['Material Type']||product.aspects['material_type']||[])[0];
+        if (amazonMat) mat = amazonMat;
+        product.aspects['Outer Shell Material'] = [mat];
+        console.log('material:', mat);
+      }
+
       product.variations.forEach((vg, gi) => {
         if (gi > 0) vg.values.forEach(v => { delete v.price; delete v.sourcePrice; });
       });
