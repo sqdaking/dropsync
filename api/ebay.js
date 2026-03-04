@@ -904,8 +904,9 @@ module.exports = async (req, res) => {
         const rpListData = await rpList.json();
         const existing = (rpListData.returnPolicies||[]).find(p => p.name === 'DropSync Auto Policy');
         if (existing) {
-          await fetch(`${EBAY_API}/sell/account/v1/return_policy/${existing.returnPolicyId}`, { method: 'DELETE', headers: authHeader });
-        }
+          validReturnPolicyId = existing.returnPolicyId;
+          console.log('reusing DropSync policy:', validReturnPolicyId);
+        } else {
         const rpCreate = await fetch(`${EBAY_API}/sell/account/v1/return_policy`, {
           method: 'POST', headers: authHeader,
           body: JSON.stringify({
@@ -918,6 +919,7 @@ module.exports = async (req, res) => {
         const rpNew = await rpCreate.json();
         console.log('DropSync policy:', JSON.stringify(rpNew).slice(0,400));
         if (rpNew.returnPolicyId) validReturnPolicyId = rpNew.returnPolicyId;
+        }
       } catch(e) { console.log('return policy error:', e.message); }
 
       // Delete any stale offers from previous attempts before creating new ones
@@ -983,7 +985,11 @@ module.exports = async (req, res) => {
       // Step 4: publishOfferByInventoryItemGroup
       const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/publish_by_inventory_item_group`, {
         method: 'POST', headers: authHeader,
-        body: JSON.stringify({ inventoryItemGroupKey: groupSku, marketplaceId: 'EBAY_US' })
+        body: JSON.stringify({
+          inventoryItemGroupKey: groupSku,
+          marketplaceId: 'EBAY_US',
+          pricingSummary: { price: { value: String(parseFloat(product.price||0).toFixed(2)), currency: 'USD' } },
+        })
       });
       const pubData = await pubRes.json();
       console.log('publishByGroup status:', pubRes.status, JSON.stringify(pubData).slice(0,500));
