@@ -951,19 +951,12 @@ module.exports = async (req, res) => {
         listingDescription: product.description || product.title,
         listingPolicies,
       };
-
       const offerIds = [];
-      const offerRequests = createdSkus.map((varSku, i) => {
-        const combo = combos[i];
-        const varPrice = combo ? combo.reduce((p,v) => v.price || p, product.price) : product.price;
-        const varStock = combo ? combo.reduce((s,v) => v.stock !== undefined ? v.stock : s, parseInt(product.quantity)||10) : 10;
-        return {
-          ...offerBase,
-          sku: varSku,
-          pricingSummary: { price: { value: String(parseFloat(varPrice||product.price||0).toFixed(2)), currency: 'USD' } },
-          availableQuantity: Math.max(0, parseInt(varStock)||0),
-        };
-      });
+      const offerRequests = createdSkus.map((varSku) => ({
+        ...offerBase,
+        sku: varSku,
+        // Price and quantity live on the inventory_item, not the offer for multi-variation
+      }));
 
       // Batch into groups of 25
       for (let i = 0; i < offerRequests.length; i += 25) {
