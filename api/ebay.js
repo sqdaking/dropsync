@@ -1,4 +1,4 @@
-// DropSync — eBay Backend (Vercel Serverless)
+// DropSync — eBay Backend v4 (Vercel Serverless)
 // Improved Amazon variation, price, and image scraping
 
 const EBAY_API  = 'https://api.ebay.com';
