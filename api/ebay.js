@@ -37,14 +37,46 @@ module.exports = async (req, res) => {
 
     if (action === 'callback') {
       const code = req.query.code;
-      if (!code) return res.status(400).json({ error: 'No code' });
+      if (!code) return res.status(400).send('<h2>Error: No code from eBay</h2>');
       const r = await fetch(`${EBAY_API}/identity/v1/oauth2/token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: basicAuth },
         body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: RUNAME }),
       });
       const d = await r.json();
-      return res.redirect(`${FRONTEND_URL}?access_token=${d.access_token}&refresh_token=${d.refresh_token}&expires_in=${d.expires_in}`);
+      if (!d.access_token) return res.status(400).send(`<h2>Token error: ${JSON.stringify(d)}</h2>`);
+      // Send token to parent window via postMessage (works with local file:// HTML)
+      return res.send(`<!DOCTYPE html><html><head><title>eBay Connected</title>
+<style>body{font-family:sans-serif;background:#0a0a0f;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px}
+.icon{font-size:48px}.title{font-size:22px;font-weight:700;color:#26de81}.sub{font-size:13px;color:#888}</style></head>
+<body>
+<div class="icon">✅</div>
+<div class="title">eBay Connected!</div>
+<div class="sub">This window will close automatically...</div>
+<script>
+  const token = ${JSON.stringify({
+    type: 'ebay_token',
+    access_token: d.access_token,
+    refresh_token: d.refresh_token || '',
+    expires_in: d.expires_in || 7200
+  })};
+  // Post to opener (popup flow)
+  if (window.opener) {
+    window.opener.postMessage(token, '*');
+    setTimeout(() => window.close(), 1500);
+  } else {
+    // Fallback: redirect with params if opened as full page
+    const p = new URLSearchParams({
+      access_token: token.access_token,
+      refresh_token: token.refresh_token,
+      expires_in: token.expires_in
+    });
+    const dest = ${JSON.stringify(FRONTEND_URL || '')};
+    if (dest) window.location.href = dest + '?' + p.toString();
+    else document.querySelector('.sub').textContent = 'Copy your token: ' + token.access_token.slice(0,40) + '...';
+  }
+<\/script>
+</body></html>`);
     }
 
     if (action === 'refresh') {
