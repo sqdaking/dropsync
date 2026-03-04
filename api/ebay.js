@@ -851,6 +851,7 @@ module.exports = async (req, res) => {
           description: product.description || product.title,
           imageUrls: (product.images||[]).slice(0,12),
           aspects: product.aspects || {},
+          variantSKUs: createdSkus,
           variesBy: {
             aspectsImageVariesBy: Object.keys(product.variationImages||{}),
             specifications: product.variations.map(vg => ({
@@ -892,8 +893,8 @@ module.exports = async (req, res) => {
       } catch(e) { console.log('location error:', e.message); }
       console.log('merchantLocationKey:', merchantLocationKey);
       const baseOffer = buildOffer(groupSku, product, policies, merchantLocationKey);
-      // Multi-variation offer needs BOTH sku=groupSku AND inventoryItemGroupKey=groupSku
-      const offerBody = { ...baseOffer, sku: groupSku, inventoryItemGroupKey: groupSku };
+      delete baseOffer.sku;
+      const offerBody = { ...baseOffer, inventoryItemGroupKey: groupSku };
       console.log('groupSku:', groupSku);
       console.log('offerBody keys:', Object.keys(offerBody));
       console.log('offerBody:', JSON.stringify(offerBody).slice(0, 500));
