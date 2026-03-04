@@ -876,11 +876,16 @@ module.exports = async (req, res) => {
           // Try to create a default location
           const createRes = await fetch(`${EBAY_API}/sell/inventory/v1/location/MainWarehouse`, {
             method: 'POST', headers: authHeader,
-            body: JSON.stringify({ location: { address: { country: 'US' } }, locationTypes: ['WAREHOUSE'], name: 'Main Warehouse', merchantLocationStatus: 'ENABLED' })
+            body: JSON.stringify({
+              location: { address: { addressLine1: '1 Main St', city: 'San Jose', stateOrProvince: 'CA', postalCode: '95125', country: 'US' } },
+              locationTypes: ['WAREHOUSE'],
+              name: 'Main Warehouse',
+              merchantLocationStatus: 'ENABLED'
+            })
           });
           const createData = await createRes.json();
           console.log('location create status:', createRes.status, JSON.stringify(createData).slice(0,200));
-          if (createRes.ok) merchantLocationKey = 'MainWarehouse';
+          merchantLocationKey = createRes.ok ? 'MainWarehouse' : 'default';
         }
       } catch(e) { console.log('location error:', e.message); }
       console.log('merchantLocationKey:', merchantLocationKey);
