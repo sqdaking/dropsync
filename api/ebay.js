@@ -753,8 +753,14 @@ module.exports = async (req, res) => {
       const createdSkus = [];
 
       for (const combo of combos) {
-        if (combo.some(v => v.enabled === false)) continue;
-        const varSku = `${groupSku}-${combo.map(v=>v.value.slice(0,5).replace(/[^a-zA-Z0-9]/g,'')).join('-')}`;
+        // Skip only if EXPLICITLY disabled (not just out of stock — eBay wants quantity=0, not skipped)
+        if (combo.every(v => v.enabled === false)) continue;
+        // Build a clean SKU — sanitize each value segment
+        const skuSegments = combo.map(v => {
+          const clean = String(v.value||'').replace(/[^a-zA-Z0-9]/g,'').slice(0,8);
+          return clean || 'VAR';
+        });
+        const varSku = `${groupSku}-${skuSegments.join('-')}`;
         const varPrice = combo.reduce((p,v) => v.price || p, product.price);
         const varStock = combo.reduce((s,v) => v.stock !== undefined ? v.stock : s, parseInt(product.quantity)||10);
         const varImages = getVarImages(combo, product.variationImages, product.images);
@@ -764,15 +770,16 @@ module.exports = async (req, res) => {
         const invRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(varSku)}`, {
           method: 'PUT', headers: authHeader,
           body: JSON.stringify({
-            availability: { shipToLocationAvailability: { quantity: Math.max(0, varStock) } },
+            availability: { shipToLocationAvailability: { quantity: Math.max(0, parseInt(varStock)||0) } },
             condition: product.condition || 'NEW',
             product: { title: product.title.slice(0,80), description: product.description||product.title, imageUrls: varImages.slice(0,12), aspects: varAspects },
           }),
         });
         if (invRes.ok) createdSkus.push(varSku);
+        else { const err = await invRes.text(); console.error('varSku failed:', varSku, err); }
       }
 
-      if (!createdSkus.length) return res.status(400).json({ error: 'No variation SKUs created' });
+      if (!createdSkus.length) return res.status(400).json({ error: 'No variation SKUs created — check that at least one variant is enabled and the inventory API accepted it. Enable debug logs in Vercel for details.' });
 
       const groupRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(groupSku)}`, {
         method: 'PUT', headers: authHeader,
