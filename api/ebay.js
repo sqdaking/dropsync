@@ -473,6 +473,18 @@ module.exports = async (req, res) => {
           product.images = [...new Set(allImages)].slice(0, 12);
           // variationImages set after ASIN fetches below (colorImgMap populated there)
 
+          // Landing ASIN image — already have its HTML, map to its color
+          const landingColor = asinToColor[landingAsin];
+          if (landingColor && !colorImgMap[landingColor]) {
+            const landingImg = html.match(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/);
+            if (landingImg) colorImgMap[landingColor] = landingImg[1];
+          }
+          // Also seed allImages from landing page if thin
+          if (allImages.length < 5) {
+            for (const m of html.matchAll(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/g))
+              if (!allImages.includes(m[1])) allImages.push(m[1]);
+          }
+
           // Finalize images + variationImages after per-ASIN fetches
           product.images = [...new Set(allImages)].slice(0, 12);
           if (Object.keys(colorImgMap).length) product.variationImages['Color'] = colorImgMap;
