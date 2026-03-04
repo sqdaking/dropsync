@@ -882,10 +882,14 @@ module.exports = async (req, res) => {
         fetch(`${EBAY_API}/sell/account/v1/payment_policy?marketplace_id=EBAY_US`, { headers: h }).then(r => r.json()),
         fetch(`${EBAY_API}/sell/account/v1/return_policy?marketplace_id=EBAY_US`, { headers: h }).then(r => r.json()),
       ]);
+      console.log('fp:', JSON.stringify(fp).slice(0,300));
+      console.log('pp:', JSON.stringify(pp).slice(0,300));
+      console.log('rp:', JSON.stringify(rp).slice(0,300));
       return res.json({
         fulfillment: (fp.fulfillmentPolicies || []).map(p => ({ id: p.fulfillmentPolicyId, name: p.name })),
         payment:     (pp.paymentPolicies    || []).map(p => ({ id: p.paymentPolicyId,     name: p.name })),
         return:      (rp.returnPolicies     || []).map(p => ({ id: p.returnPolicyId,      name: p.name })),
+        _raw: { fp, pp, rp }
       });
     }
 
