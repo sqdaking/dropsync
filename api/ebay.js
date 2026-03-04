@@ -929,7 +929,23 @@ module.exports = async (req, res) => {
         if (rpNew.returnPolicyId) validReturnPolicyId = rpNew.returnPolicyId;
       } catch(e) { console.log('return policy error:', e.message); }
 
-      // Step 3: bulkCreateOffer — 25 at a time
+      // Delete any stale offers from previous attempts before creating new ones
+      for (let i = 0; i < createdSkus.length; i += 25) {
+        const batch = createdSkus.slice(i, i + 25);
+        // Get existing offers for these SKUs
+        for (const sku of batch) {
+          try {
+            const existing = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers: authHeader });
+            const existingData = await existing.json();
+            if (existingData.offers?.length) {
+              await Promise.all(existingData.offers.map(o =>
+                fetch(`${EBAY_API}/sell/inventory/v1/offer/${o.offerId}`, { method: 'DELETE', headers: authHeader })
+              ));
+            }
+          } catch(e) {}
+        }
+      }
+      console.log('cleaned up old offers');
       const offerBase = {
         marketplaceId: 'EBAY_US',
         format: 'FIXED_PRICE',
