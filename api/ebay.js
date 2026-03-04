@@ -359,13 +359,28 @@ module.exports = async (req, res) => {
           const inStockM = workHtml.match(/"inStockAsinSet"\s*:\s*(\[[^\]]*\])/);
           if (inStockM) { try { JSON.parse(inStockM[1]).forEach(a => { asinStock[a] = true; }); } catch {} }
 
-          // Fetch individual ASIN pages for accurate prices (sample up to 6 ASINs)
-          const toFetch = asinList.filter(a => !asinPrice[a]).slice(0, 6);
+          // Fetch individual ASIN pages for prices + per-color images
+          // Pick one representative ASIN per unique color to get its image
+          const asinToColor = {}; // asin -> color value
+          for (const [asin, dimVals] of Object.entries(asinDimVals)) {
+            const ci = dimOrder.indexOf('color_name');
+            if (ci >= 0 && dimVals[ci]) asinToColor[asin] = dimVals[ci];
+          }
+          // One ASIN per color (first found)
+          const colorToAsin = {};
+          for (const [asin, color] of Object.entries(asinToColor)) {
+            if (!colorToAsin[color]) colorToAsin[color] = asin;
+          }
+          // Merge: need prices for all ASINs we don't have yet + one per color for images
+          const needPrice = asinList.filter(a => !asinPrice[a]);
+          const needImage = Object.values(colorToAsin);
+          const toFetch = [...new Set([...needPrice, ...needImage])].slice(0, 8);
+
           await Promise.all(toFetch.map(async asin => {
             try {
               const h = await fetchPage(`https://www.amazon.com/dp/${asin}`);
               if (!h) return;
-              // Extract price
+              // Price
               for (const pat of [
                 /class="a-price-whole"[^>]*>\s*(\d[\d,]*)<\/span><span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/,
                 /"priceAmount"\s*:\s*([\d.]+)/,
@@ -374,9 +389,18 @@ module.exports = async (req, res) => {
                 const m = h.match(pat);
                 if (m) { asinPrice[asin] = m[2] ? `${m[1].replace(/,/g,'')}.${m[2]}` : m[1].replace(/,/g,''); break; }
               }
-              // Stock: check for "Currently unavailable" or add to cart button
+              // Stock
               if (h.includes('Currently unavailable') || h.includes('currently unavailable')) asinStock[asin] = false;
               else if (h.includes('Add to Cart') || h.includes('Buy Now')) asinStock[asin] = true;
+              // Main image — grab the first hiRes from this ASIN's colorImages initial block
+              if (needImage.includes(asin)) {
+                const imgM = h.match(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon[^"]+)"/);
+                if (imgM) {
+                  const color = asinToColor[asin];
+                  if (color) colorImgMap[color] = imgM[1];
+                  if (!allImages.includes(imgM[1])) allImages.push(imgM[1]);
+                }
+              }
             } catch {}
           }));
 
@@ -453,6 +477,10 @@ module.exports = async (req, res) => {
             for (const m of html.matchAll(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon[^"]+)"/g))
               if (!allImages.includes(m[1])) allImages.push(m[1]);
           }
+          product.images = [...new Set(allImages)].slice(0, 12);
+          // variationImages set after ASIN fetches below (colorImgMap populated there)
+
+          // Finalize images + variationImages after per-ASIN fetches
           product.images = [...new Set(allImages)].slice(0, 12);
           if (Object.keys(colorImgMap).length) product.variationImages['Color'] = colorImgMap;
 
