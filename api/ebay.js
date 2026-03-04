@@ -727,7 +727,7 @@ module.exports = async (req, res) => {
       if (!access_token || !product) return res.status(400).json({ error: 'Missing fields' });
 
       const groupSku = `DS-${Date.now()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`;
-      const authHeader = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' };
+      const authHeader = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
 
       // Simple listing — no variations
       if (!product.hasVariations || !product.variations?.length) {
