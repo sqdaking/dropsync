@@ -942,6 +942,13 @@ module.exports = async (req, res) => {
       console.log(`Created ${offerIds.length}/${createdSkus.length} offers`);
       if (!offerIds.length) return res.status(400).json({ error: 'No offers created — check category ID and policies' });
 
+      // Debug: fetch the actual return policy to see what eBay sees
+      if (policies.returnPolicyId) {
+        const rpCheck = await fetch(`${EBAY_API}/sell/account/v1/return_policy/${policies.returnPolicyId}`, { headers: authHeader });
+        const rpData = await rpCheck.json();
+        console.log('returnPolicy data:', JSON.stringify(rpData).slice(0,600));
+      }
+
       // Step 4: publishOfferByInventoryItemGroup
       const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/publish_by_inventory_item_group`, {
         method: 'POST', headers: authHeader,
