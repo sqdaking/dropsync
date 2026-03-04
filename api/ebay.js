@@ -1030,13 +1030,14 @@ module.exports = async (req, res) => {
         product.aspects['Brand'] = [brandFromTitle];
       }
 
-      // Auto-fill required clothing aspects if missing
+      // Auto-fill required clothing aspects ONLY for clothing/fashion categories
+      const clothingCats = new Set(['11554','11555','63862','57989','15689','155183','15687','53159','2403','57990','11484','2311','2312','152763','57988','11491','11510','31848','57991','2435','11476','185100','11511','11471','131534','45238','52365','63889','15709','169291','2996','2089','3001']);
       const allSizeValues = (product.variations||[])
         .filter(vg => /size/i.test(vg.name))
         .flatMap(vg => vg.values.map(v => (v.value||'').toLowerCase()));
       const tx2 = (product.title||'').replace(/&#39;/g,"'").replace(/&amp;/g,'&').toLowerCase();
 
-      if (!product.aspects['Size Type']) {
+      if (clothingCats.has(String(product.categoryId)) && !product.aspects['Size Type']) {
         const hasPlus   = allSizeValues.some(v => /plus|\b(1x|2x|3x|4x|0x)\b/.test(v)) || /plus.?size/.test(tx2);
         const hasPetite = allSizeValues.some(v => /petite/.test(v)) || /petite/.test(tx2);
         const hasTall   = allSizeValues.some(v => /\btall\b/.test(v)) || /\btall\b/.test(tx2);
@@ -1046,14 +1047,14 @@ module.exports = async (req, res) => {
         else                product.aspects['Size Type'] = ['Regular'];
       }
 
-      if (!product.aspects['Department']) {
+      if (clothingCats.has(String(product.categoryId)) && !product.aspects['Department']) {
         if      (/\bwomen|\bwomens|\bladies|\bgirls/.test(tx2)) product.aspects['Department'] = ["Women's"];
         else if (/\bmen|\bmens|\bboys/.test(tx2))                product.aspects['Department'] = ["Men's"];
         else if (/\bkids|\bchildren|\bjunior|\btoddler/.test(tx2)) product.aspects['Department'] = ['Kids'];
         else                                                          product.aspects['Department'] = ['Unisex'];
       }
 
-      if (!product.aspects['Type']) {
+      if (clothingCats.has(String(product.categoryId)) && !product.aspects['Type']) {
         const cat = product.categoryId;
         const t3  = tx2;
         let type = null;
@@ -1079,7 +1080,7 @@ module.exports = async (req, res) => {
         if (type) product.aspects['Type'] = [type];
       }
 
-      if (!product.aspects['Outer Shell Material'] && !product.aspects['Material']) {
+      if (clothingCats.has(String(product.categoryId)) && !product.aspects['Outer Shell Material'] && !product.aspects['Material']) {
         // Search title + description + all aspects for material keywords
         const matTx = [
           tx2,
@@ -1172,8 +1173,23 @@ module.exports = async (req, res) => {
       if (!createdSkus.length) return res.status(400).json({ error: 'No variant inventory items created' });
 
       // ── STEP 3: Create inventory_item_group (PARENT) ─────────────────
-      // Parent has: title, description, group images, common aspects, variantSKUs, variesBy
-      // NO price, NO quantity on parent
+      // Normalize variesBy aspect names to match eBay's expected names
+      // eBay requires exact aspect names — "Size" → "Size", "Color" → "Color" etc.
+      const normalizeVarName = n => {
+        const map = { 'colour':'Color','colours':'Color','colors':'Color','size':'Size','sizes':'Size','style':'Style','material':'Material','pattern':'Pattern','pack quantity':'Package Quantity','package quantity':'Package Quantity','package qty':'Package Quantity','configuration':'Configuration','edition':'Edition','scent':'Scent','flavor':'Flavor','flavour':'Flavor' };
+        return map[n.toLowerCase()] || n;
+      };
+      product.variations.forEach(vg => { vg.name = normalizeVarName(vg.name); });
+
+      // Re-sync varAspects names after normalisation (use varAspects keys that match old names)
+      comboList.forEach(({ varAspects }) => {
+        product.variations.forEach(vg => {
+          // varAspects was built with old names — update keys to normalised names
+          const oldKeys = Object.keys(varAspects).filter(k => normalizeVarName(k) !== k);
+          oldKeys.forEach(k => { varAspects[normalizeVarName(k)] = varAspects[k]; delete varAspects[k]; });
+        });
+      });
+
       const groupRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(groupSku)}`, {
         method: 'PUT', headers: authHeader,
         body: JSON.stringify({
@@ -1244,8 +1260,8 @@ module.exports = async (req, res) => {
       if (policies.paymentPolicyId)     listingPolicies.paymentPolicyId     = policies.paymentPolicyId;
       if (validReturnPolicyId)          listingPolicies.returnPolicyId      = validReturnPolicyId;
 
-      const offerRequests = createdSkus.map((varSku, i) => {
-        const c = comboList[i] || comboList[comboList.findIndex(x => x.varSku === varSku)];
+      const offerRequests = createdSkus.map((varSku) => {
+        const c = comboList.find(x => x.varSku === varSku);
         return {
           sku:             varSku,
           marketplaceId:  'EBAY_US',
