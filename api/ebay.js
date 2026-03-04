@@ -1361,6 +1361,111 @@ module.exports = async (req, res) => {
       return res.json(await r.json());
     }
 
+    // ── SYNC: re-check Amazon price/stock, update eBay offers accordingly ──
+    if (action === 'sync') {
+      const { access_token, products } = body;
+      if (!access_token || !products?.length) return res.status(400).json({ error: 'Missing fields' });
+
+      const results = [];
+
+      for (const product of products) {
+        if (!product.sourceUrl || !product.ebaySku) { results.push({ id: product.id, skipped: true }); continue; }
+
+        try {
+          // 1. Re-scrape Amazon for current price & stock
+          const scrapeRes = await fetch(`${req.headers.origin||'https://'+req.headers.host}/api/ebay?action=scrape`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: product.sourceUrl }),
+          });
+          const scrapeData = await scrapeRes.json();
+          const fresh = scrapeData.product;
+          if (!fresh) { results.push({ id: product.id, error: 'scrape failed' }); continue; }
+
+          const oldPrice  = parseFloat(product.sourcePrice || product.price || 0);
+          const newPrice  = parseFloat(fresh.price || 0);
+          const inStock   = fresh.inStock !== false && (fresh.quantity || 0) > 0;
+          const margin    = oldPrice > 0 ? (parseFloat(product.price) - oldPrice) / oldPrice : 0;
+          const newEbayPrice = newPrice > 0 ? (newPrice * (1 + margin)).toFixed(2) : product.price;
+
+          const priceChanged = newPrice > 0 && Math.abs(newPrice - oldPrice) > 0.01;
+          const stockChanged = !inStock;
+          const authHeader  = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' };
+
+          if (!priceChanged && inStock) { results.push({ id: product.id, unchanged: true }); continue; }
+
+          // 2. Get all offer IDs for this group SKU
+          const offersRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(product.ebaySku)}&limit=1`, { headers: authHeader });
+          const offersData = await offersRes.json();
+
+          // Try bulk-fetch all offers by iterating inventory items under this group
+          let offerIds = [];
+          const groupRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(product.ebaySku)}`, { headers: authHeader });
+          if (groupRes.ok) {
+            const groupData = await groupRes.json();
+            const varSkus = groupData.variantSKUs || [];
+            // Get offer IDs for each variant SKU in batches
+            for (let i = 0; i < varSkus.length; i += 20) {
+              const batch = varSkus.slice(i, i + 20);
+              const bRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${batch.map(s=>encodeURIComponent(s)).join(',')}&limit=20`, { headers: authHeader });
+              if (bRes.ok) {
+                const bData = await bRes.json();
+                (bData.offers || []).forEach(o => offerIds.push({ offerId: o.offerId, sku: o.sku }));
+              }
+            }
+          }
+
+          // 3. Update each offer — price and/or qty
+          let updated = 0;
+          for (const { offerId, sku } of offerIds) {
+            // Get current offer
+            const offerRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerId}`, { headers: authHeader });
+            if (!offerRes.ok) continue;
+            const offer = await offerRes.json();
+
+            const updateBody = { ...offer };
+            if (priceChanged) updateBody.pricingSummary = { price: { value: String(newEbayPrice), currency: 'USD' } };
+            if (!inStock) updateBody.availableQuantity = 0;
+
+            const upRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerId}`, {
+              method: 'PUT', headers: authHeader,
+              body: JSON.stringify(updateBody),
+            });
+
+            // Also update inventory item qty if out of stock
+            if (!inStock) {
+              await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
+                method: 'PUT', headers: authHeader,
+                body: JSON.stringify({
+                  availability: { shipToLocationAvailability: { quantity: 0 } },
+                  condition: offer.condition || 'NEW',
+                  product: offer.listing?.listingDescription ? undefined : undefined,
+                }),
+              });
+            }
+            if (upRes.ok || upRes.status === 204) updated++;
+          }
+
+          results.push({
+            id: product.id,
+            updated,
+            priceChanged,
+            stockChanged,
+            newSourcePrice: newPrice,
+            newEbayPrice: parseFloat(newEbayPrice),
+            inStock,
+          });
+          console.log(`sync [${product.id}]: price ${oldPrice}→${newPrice}, stock:${inStock}, updated ${updated} offers`);
+
+        } catch(e) {
+          console.error('sync error for', product.id, e.message);
+          results.push({ id: product.id, error: e.message });
+        }
+      }
+
+      return res.json({ success: true, results });
+    }
+
+
     if (action === 'listings') {
       const token = req.query.access_token || body.access_token;
       const r = await fetch(`${EBAY_API}/sell/inventory/v1/offer?limit=100`, { headers: { Authorization:`Bearer ${token}` } });
