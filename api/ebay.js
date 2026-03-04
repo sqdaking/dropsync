@@ -1683,78 +1683,101 @@ module.exports = async (req, res) => {
     // ── END LISTING: withdraw all offers and end the listing ──
     if (action === 'endListing') {
       const { access_token, ebaySku, ebayListingId } = body;
-      if (!access_token || !ebaySku) return res.status(400).json({ error: 'Missing fields' });
+      if (!access_token || (!ebaySku && !ebayListingId)) return res.status(400).json({ error: 'Missing fields' });
       const authHeader = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' };
 
       let withdrawn = 0;
       const errors = [];
+      const log2 = (...args) => console.log('[endListing]', ...args);
 
-      // Strategy 1: withdraw via listing ID (works for both single + multi-variation)
-      if (ebayListingId) {
-        // Get offers by listing_id filter
-        const byListingRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer?listing_id=${encodeURIComponent(ebayListingId)}&limit=200`, { headers: authHeader });
-        if (byListingRes.ok) {
-          const byListingData = await byListingRes.json();
-          const listingOffers = byListingData.offers || [];
-          console.log(`endListing: found ${listingOffers.length} offers via listing_id ${ebayListingId}`);
-          for (const offer of listingOffers) {
-            if (offer.status === 'PUBLISHED' || offer.status === 'ACTIVE') {
-              const wRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}/withdraw`, {
-                method: 'POST', headers: authHeader,
-              });
-              const wBody = await wRes.text();
-              console.log(`withdraw offer ${offer.offerId}: ${wRes.status} ${wBody.slice(0,200)}`);
-              if (wRes.ok || wRes.status === 204) withdrawn++;
-              else errors.push(`offer ${offer.offerId}: ${wRes.status}`);
-            }
-          }
-        }
-      }
+      const withdrawOffer = async (offerId) => {
+        const wRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerId}/withdraw`, {
+          method: 'POST', headers: authHeader,
+        });
+        const wBody = await wRes.text();
+        log2(`withdraw offer ${offerId}: ${wRes.status}`, wBody.slice(0, 200));
+        if (wRes.ok || wRes.status === 204 || wRes.status === 200) { withdrawn++; return true; }
+        errors.push(`offer ${offerId}: ${wRes.status} ${wBody.slice(0,100)}`);
+        return false;
+      };
 
-      // Strategy 2: if listing has variations, use withdraw_by_inventory_item_group
-      if (withdrawn === 0) {
-        const grpRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, { headers: authHeader });
-        if (grpRes.ok) {
-          // It's a group — withdraw using publish_by_inventory_item_group endpoint (DELETE-like)
+      // Strategy 1: variation group withdraw (most listings pushed by DropSync use this)
+      if (ebaySku) {
+        const grpCheck = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, { headers: authHeader });
+        log2(`group check for ${ebaySku}: ${grpCheck.status}`);
+        if (grpCheck.ok) {
           const wGrpRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/withdraw_by_inventory_item_group`, {
             method: 'POST', headers: authHeader,
             body: JSON.stringify({ inventoryItemGroupKey: ebaySku, marketplaceId: 'EBAY_US' }),
           });
-          const wGrpData = await wGrpRes.json().catch(() => ({}));
-          console.log(`withdraw_by_group ${ebaySku}: ${wGrpRes.status}`, JSON.stringify(wGrpData).slice(0,200));
-          if (wGrpRes.ok || wGrpRes.status === 204) withdrawn = 1;
-          else errors.push(`group withdraw: ${wGrpRes.status} ${JSON.stringify(wGrpData).slice(0,100)}`);
-        }
-      }
-
-      // Strategy 3: get offers by exact SKU (single-item listings)
-      if (withdrawn === 0) {
-        const offersRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(ebaySku)}&limit=200`, { headers: authHeader });
-        if (offersRes.ok) {
-          const offersData = await offersRes.json();
-          const offers = offersData.offers || [];
-          console.log(`endListing fallback: found ${offers.length} offers via sku ${ebaySku}`);
-          for (const offer of offers) {
-            if (offer.status === 'PUBLISHED' || offer.status === 'ACTIVE') {
-              const wRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}/withdraw`, {
-                method: 'POST', headers: authHeader,
-              });
-              if (wRes.ok || wRes.status === 204) withdrawn++;
-              else errors.push(`offer ${offer.offerId}: ${wRes.status}`);
-            }
+          const wGrpText = await wGrpRes.text();
+          log2(`withdraw_by_group ${ebaySku}: ${wGrpRes.status}`, wGrpText.slice(0, 300));
+          if (wGrpRes.ok || wGrpRes.status === 200 || wGrpRes.status === 204) {
+            withdrawn = 1;
+          } else {
+            errors.push(`group: ${wGrpRes.status} ${wGrpText.slice(0,150)}`);
           }
         }
       }
 
-      console.log(`endListing [${ebaySku}]: withdrawn=${withdrawn}, errors=${errors.join(', ')}`);
+      // Strategy 2: single-item offer by SKU
+      if (withdrawn === 0 && ebaySku) {
+        const offersRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(ebaySku)}&limit=200`, { headers: authHeader });
+        const offersText = await offersRes.text();
+        log2(`offers by sku ${ebaySku}: ${offersRes.status}`, offersText.slice(0, 300));
+        if (offersRes.ok) {
+          let offersData; try { offersData = JSON.parse(offersText); } catch { offersData = {}; }
+          const offers = (offersData.offers || []).filter(o => ['PUBLISHED', 'ACTIVE'].includes(o.status));
+          log2(`found ${offers.length} published offers`);
+          for (const offer of offers) await withdrawOffer(offer.offerId);
+        }
+      }
 
-      if (withdrawn > 0 || errors.length === 0) {
+      // Strategy 3: Trading API EndItem (most reliable fallback — works regardless of how listing was created)
+      if (withdrawn === 0 && ebayListingId) {
+        log2(`trying Trading API EndItem for listingId ${ebayListingId}`);
+        const tradingXml = `<?xml version="1.0" encoding="utf-8"?>
+<EndItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials><eBayAuthToken>${access_token}</eBayAuthToken></RequesterCredentials>
+  <ItemID>${ebayListingId}</ItemID>
+  <EndingReason>NotAvailable</EndingReason>
+</EndItemRequest>`;
+        const tradingRes = await fetch('https://api.ebay.com/ws/api.dll', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'text/xml',
+            'X-EBAY-API-COMPATIBILITY-LEVEL': '967',
+            'X-EBAY-API-CALL-NAME': 'EndItem',
+            'X-EBAY-API-SITEID': '0',
+          },
+          body: tradingXml,
+        });
+        const tradingText = await tradingRes.text();
+        log2(`Trading API EndItem: ${tradingRes.status}`, tradingText.slice(0, 400));
+        if (tradingText.includes('<Ack>Success</Ack>') || tradingText.includes('<Ack>Warning</Ack>')) {
+          withdrawn = 1;
+        } else {
+          const errCode = tradingText.match(/<ErrorCode>(.*?)<\/ErrorCode>/)?.[1] || '';
+          const errMsg  = tradingText.match(/<ShortMessage>(.*?)<\/ShortMessage>/)?.[1] || 'Unknown';
+          // Error 291 = item already ended — still consider it success
+          if (errCode === '291' || errMsg.toLowerCase().includes('ended') || errMsg.toLowerCase().includes('not active')) {
+            withdrawn = 1;
+          } else {
+            errors.push(`Trading API: ${errMsg} (code ${errCode})`);
+          }
+        }
+      }
+
+      log2(`result: withdrawn=${withdrawn}, errors=[${errors.join(' | ')}]`);
+
+      if (withdrawn > 0) {
         return res.json({ success: true, withdrawn });
+      } else if (errors.length > 0) {
+        return res.json({ success: false, error: errors.join('; '), withdrawn: 0 });
       } else {
-        return res.json({ success: false, error: `Could not withdraw listing. ${errors.join('; ')}`, withdrawn });
+        return res.json({ success: false, error: 'No active listing found on eBay — may already be ended', withdrawn: 0 });
       }
     }
-
     if (action === 'listings') {
       const token = req.query.access_token || body.access_token;
       const r = await fetch(`${EBAY_API}/sell/inventory/v1/offer?limit=100`, { headers: { Authorization:`Bearer ${token}` } });
