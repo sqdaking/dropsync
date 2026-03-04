@@ -383,23 +383,75 @@ module.exports = async (req, res) => {
           // ── Extract images
           const colorImgMap = {};
           const allImages = [];
-          const ciM = (workHtml + html).match(/'colorImages'\s*:\s*\{([\s\S]*?)\}\s*,\s*'(?:colorToAsin|landing|selected|color)/);
-          if (ciM) {
-            for (const [,key,arr] of ciM[1].matchAll(/'([^']+)'\s*:\s*(\[[\s\S]*?\])(?=\s*,\s*'|\s*$)/g)) {
-              try {
-                const imgs = JSON.parse(arr);
-                const src = (imgs.find(i=>i.hiRes)||imgs.find(i=>i.large)||imgs[0])?.hiRes ||
-                            (imgs.find(i=>i.hiRes)||imgs.find(i=>i.large)||imgs[0])?.large ||
-                            (Object.keys((imgs[0]?.main)||{})[0]) || '';
-                if (!src) continue;
-                if (key === 'initial') { if (!allImages.includes(src)) allImages.push(src); }
-                else colorImgMap[key] = src;
-              } catch {}
+          // Extract colorImages block using brace-walking (not regex — block is huge)
+          function extractColorImages(h) {
+            const map = {}, all = [];
+            const ki = h.indexOf("'colorImages'");
+            if (ki < 0) return { map, all };
+            const bi = h.indexOf('{', ki);
+            if (bi < 0) return { map, all };
+            // Walk to find end of outer object
+            let depth=0, inStr=false, esc=false, blockEnd=-1;
+            for (let i=bi; i<Math.min(h.length,bi+500000); i++) {
+              const c=h[i];
+              if(esc){esc=false;continue;}
+              if(c==='\\'&&inStr){esc=true;continue;}
+              if(c==="'"){inStr=!inStr;continue;}
+              if(c==='"'){inStr=!inStr;continue;}
+              if(inStr)continue;
+              if(c==='{')depth++;
+              else if(c==='}'){depth--;if(depth===0){blockEnd=i;break;}}
             }
+            if(blockEnd<0) return { map, all };
+            const block = h.slice(bi, blockEnd+1);
+            // Extract each color key and its image array
+            // Keys look like: 'initial': [...] or 'BLACK': [...]
+            // Use a manual scan since mixed quotes break JSON.parse
+            const keyRe = /'([^']+)'\s*:\s*\[/g;
+            let km;
+            while((km=keyRe.exec(block))!==null){
+              const key=km[1];
+              const arrStart=km.index+km[0].length-1;
+              // Find matching ] 
+              let ad=0,ai=false,ae=false,arrEnd=-1;
+              for(let i=arrStart;i<Math.min(block.length,arrStart+100000);i++){
+                const c=block[i];
+                if(ae){ae=false;continue;}
+                if(c==='\\'&&ai){ae=true;continue;}
+                if(c==='"'){ai=!ai;continue;}
+                if(ai)continue;
+                if(c==='[')ad++;
+                else if(c===']'){ad--;if(ad===0){arrEnd=i;break;}}
+              }
+              if(arrEnd<0)continue;
+              const arrStr=block.slice(arrStart,arrEnd+1);
+              try{
+                const imgs=JSON.parse(arrStr);
+                if(!Array.isArray(imgs)||!imgs.length)continue;
+                // Get best URL: prefer hiRes, then large, then first key of main
+                const getBest=i=>i.hiRes||i.large||(i.main?Object.keys(i.main)[0]:'')||'';
+                if(key==='initial'){
+                  imgs.forEach(i=>{const s=getBest(i);if(s&&!all.includes(s))all.push(s);});
+                } else {
+                  const best=imgs.find(i=>i.hiRes)||imgs.find(i=>i.large)||imgs[0];
+                  const s=best?getBest(best):'';
+                  if(s)map[key]=s;
+                }
+              }catch{}
+            }
+            return { map, all };
           }
-          if (!allImages.length) {
-            [...html.matchAll(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon[^"]+)"/g)]
-              .forEach(m => { if (!allImages.includes(m[1])) allImages.push(m[1]); });
+
+          const ci1 = extractColorImages(workHtml);
+          const ci2 = extractColorImages(html);
+          Object.assign(colorImgMap, ci2.map, ci1.map); // workHtml wins
+          allImages.push(...ci1.all.filter(s=>!allImages.includes(s)));
+          allImages.push(...ci2.all.filter(s=>!allImages.includes(s)));
+
+          // Fallback: grab all hiRes images from HTML
+          if (allImages.length < 3) {
+            for (const m of html.matchAll(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon[^"]+)"/g))
+              if (!allImages.includes(m[1])) allImages.push(m[1]);
           }
           product.images = [...new Set(allImages)].slice(0, 12);
           if (Object.keys(colorImgMap).length) product.variationImages['Color'] = colorImgMap;
@@ -464,10 +516,23 @@ module.exports = async (req, res) => {
             if (prices.length) product.price = Math.min(...prices).toFixed(2);
           }
 
-          // ── Description
-          const bullets = [...html.matchAll(/<span class="a-list-item">\s*([\s\S]*?)\s*<\/span>/g)]
-            .map(m => m[1].replace(/<[^>]+>/g,'').trim()).filter(b => b.length > 15 && b.length < 500 && !b.includes('{')).slice(0, 5);
-          if (bullets.length) product.description = bullets.join('\n');
+          // ── Description — use feature bullets div, not generic list items
+          const featDiv = html.match(/id="feature-bullets"[^>]*>[\s\S]*?<ul[^>]*>([\s\S]*?)<\/ul>/);
+          if (featDiv) {
+            const bullets = [...featDiv[1].matchAll(/<span class="a-list-item">([\s\S]*?)<\/span>/g)]
+              .map(m => m[1].replace(/<[^>]+>/g,'').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').trim())
+              .filter(b => b.length > 10 && b.length < 600 && !b.includes('{') && !b.includes('\n\n'))
+              .slice(0, 7);
+            if (bullets.length) product.description = bullets.join('\n');
+          }
+          if (!product.description) {
+            // Fallback: grab any list items that look like product features
+            const bullets = [...html.matchAll(/<span class="a-list-item">([\s\S]*?)<\/span>/g)]
+              .map(m => m[1].replace(/<[^>]+>/g,'').trim())
+              .filter(b => b.length > 30 && b.length < 500 && !b.includes('{') && !b.includes('Kitchen') && !b.includes('Storage &'))
+              .slice(0, 5);
+            if (bullets.length) product.description = bullets.join('\n');
+          }
 
           // ── Item specifics
           const specTable = html.match(/id="productDetails_techSpec[^"]*"[^>]*>([\s\S]*?)<\/table>/i) ||
