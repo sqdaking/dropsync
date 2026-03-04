@@ -912,16 +912,7 @@ module.exports = async (req, res) => {
             name: 'DropSync Auto Policy',
             marketplaceId: 'EBAY_US',
             categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
-            returnsAccepted: true,
-            returnPeriod: { value: 30, unit: 'DAY' },
-            refundMethod: 'MONEY_BACK',
-            returnShippingCostPayer: 'BUYER',
-            internationalOverride: {
-              returnsAccepted: true,
-              returnPeriod: { value: 30, unit: 'DAY' },
-              refundMethod: 'MONEY_BACK',
-              returnShippingCostPayer: 'BUYER',
-            },
+            returnsAccepted: false,
           })
         });
         const rpNew = await rpCreate.json();
@@ -974,6 +965,7 @@ module.exports = async (req, res) => {
       // Batch into groups of 25
       for (let i = 0; i < offerRequests.length; i += 25) {
         const batch = offerRequests.slice(i, i + 25);
+        if (i === 0) console.log('first offer request:', JSON.stringify(batch[0]).slice(0,400));
         const bulkRes = await fetch(`${EBAY_API}/sell/inventory/v1/bulk_create_offer`, {
           method: 'POST', headers: authHeader,
           body: JSON.stringify({ requests: batch })
@@ -981,10 +973,12 @@ module.exports = async (req, res) => {
         const bulkData = await bulkRes.json();
         console.log(`bulk_create_offer batch ${i/25+1}: status ${bulkRes.status}, responses: ${bulkData.responses?.length}`);
         if (bulkData.responses) {
-          bulkData.responses.forEach(r => {
+          bulkData.responses.forEach((r, idx) => {
             if (r.offerId) offerIds.push(r.offerId);
-            else console.log('offer failed:', JSON.stringify(r).slice(0,200));
+            else console.log(`offer[${idx}] failed:`, JSON.stringify(r).slice(0,300));
+            if (r.warnings?.length) console.log(`offer[${idx}] warnings:`, JSON.stringify(r.warnings).slice(0,200));
           });
+          if (i === 0) console.log('first offer response:', JSON.stringify(bulkData.responses[0]).slice(0,400));
         }
       }
       console.log(`Created ${offerIds.length}/${createdSkus.length} offers`);
