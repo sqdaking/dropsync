@@ -111,7 +111,7 @@ module.exports = async (req, res) => {
       const snippets = {};
       for (const key of ['updateDivLists','asinVariationValues','priceToAsinList','colorImages','variationValues','unavailableAsinSet']) {
         const idx = h2.indexOf(key);
-        snippets[key] = idx >= 0 ? h2.slice(idx, idx + 800) : 'NOT FOUND';
+        snippets[key] = idx >= 0 ? h2.slice(idx, idx + 2000) : 'NOT FOUND';
       }
       return res.json({ parentAsin, landingSize: h1.length, parentSize: h2.length, snippets });
     }
@@ -302,12 +302,30 @@ module.exports = async (req, res) => {
           if (!dimOrder.length) Object.keys(variationValues).forEach(k => dimOrder.push(k));
 
           // ── Extract dimensionValuesDisplayData: ASIN -> [dim0val, dim1val, ...]
-          // This is the real ASIN<->variant mapping Amazon uses
-          const asinDimVals = {}; // asin -> ["10 Dividers", "BLACK"]
-          const dvddM = workHtml.match(/"dimensionValuesDisplayData"\s*:\s*(\{[\s\S]*?\})\s*,\s*"\w/);
-          if (dvddM) {
+          // Use brace-walking to get the full block (regex stops at first "}")
+          const asinDimVals = {};
+          function extractJsonBlock(h, key) {
+            const ki = h.indexOf(`"${key}"`);
+            if (ki < 0) return null;
+            const bi = h.indexOf('{', ki);
+            if (bi < 0) return null;
+            let depth = 0, inStr = false, esc = false;
+            for (let i = bi; i < Math.min(h.length, bi + 200000); i++) {
+              const c = h[i];
+              if (esc) { esc = false; continue; }
+              if (c === '\\') { esc = true; continue; }
+              if (c === '"') { inStr = !inStr; continue; }
+              if (inStr) continue;
+              if (c === '{') depth++;
+              else if (c === '}') { depth--; if (depth === 0) return h.slice(bi, i + 1); }
+            }
+            return null;
+          }
+          const dvddRaw = extractJsonBlock(workHtml, 'dimensionValuesDisplayData') ||
+                          extractJsonBlock(html, 'dimensionValuesDisplayData');
+          if (dvddRaw) {
             try {
-              const dvdd = JSON.parse(dvddM[1]);
+              const dvdd = JSON.parse(dvddRaw);
               for (const [asin, vals] of Object.entries(dvdd)) {
                 if (Array.isArray(vals)) asinDimVals[asin] = vals;
               }
