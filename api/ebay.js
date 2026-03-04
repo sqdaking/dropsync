@@ -830,10 +830,12 @@ module.exports = async (req, res) => {
             product: { title: product.title.slice(0,80), description: product.description||product.title, imageUrls: varImages.slice(0,12), aspects: varAspects },
           }),
         });
-        if (invRes.ok) createdSkus.push(varSku);
-        else {
+        if (invRes.ok) {
+          createdSkus.push(varSku);
+          if (createdSkus.length === 1) console.log('first varSku ok:', varSku);
+        } else {
           const errText = await invRes.text();
-          console.error('varSku failed:', varSku, errText);
+          console.error('varSku failed:', varSku, errText.slice(0,200));
           if (!firstSkuError) firstSkuError = { sku: varSku, status: invRes.status, body: errText.slice(0, 500) };
         }
       }
@@ -889,10 +891,8 @@ module.exports = async (req, res) => {
       } catch(e) { console.log('location error:', e.message); }
       console.log('merchantLocationKey:', merchantLocationKey);
       const baseOffer = buildOffer(groupSku, product, policies, merchantLocationKey);
-      // For multi-variation listings, sku must equal the inventoryItemGroupKey
-      baseOffer.sku = groupSku;
-      const offerBody = baseOffer;
-      delete offerBody.inventoryItemGroupKey; // not a valid offer field
+      delete baseOffer.sku; // variation offers use inventoryItemGroupKey, not sku
+      const offerBody = { ...baseOffer, inventoryItemGroupKey: groupSku };
       console.log('groupSku:', groupSku);
       console.log('offerBody keys:', Object.keys(offerBody));
       console.log('offerBody:', JSON.stringify(offerBody).slice(0, 500));
