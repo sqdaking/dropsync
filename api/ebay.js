@@ -748,8 +748,54 @@ module.exports = async (req, res) => {
         return res.json({ success:true, sku:groupSku, offerId:offerData.offerId, listingId:pubData.listingId });
       }
 
-      // Multi-variation listing
-      const combos = buildCombos(product.variations);
+      // Clean up variations before building:
+      // 1. Remove groups with only 1 value (eBay rejects single-value variation groups)
+      // 2. Remove groups where all values have the same value as another group (duplicates)
+      // 3. Move single-value groups to aspects instead
+      const cleanVariations = product.variations.filter(vg => {
+        const enabledVals = vg.values.filter(v => v.enabled !== false);
+        return enabledVals.length >= 2; // eBay requires at least 2 values per variation dimension
+      });
+      // If we filtered out some groups, add their single values to aspects
+      product.variations.filter(vg => {
+        const enabledVals = vg.values.filter(v => v.enabled !== false);
+        return enabledVals.length === 1;
+      }).forEach(vg => {
+        const v = vg.values.find(v => v.enabled !== false);
+        if (v && !product.aspects[vg.name]) product.aspects[vg.name] = [v.value];
+      });
+
+      if (!cleanVariations.length) {
+        // No valid variation groups — fall back to single listing
+        const invRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(groupSku)}`, {
+          method: 'PUT', headers: authHeader,
+          body: JSON.stringify({
+            availability: { shipToLocationAvailability: { quantity: parseInt(product.quantity)||10 } },
+            condition: product.condition || 'NEW',
+            product: { title: product.title.slice(0,80), description: product.description||product.title, imageUrls: (product.images||[]).slice(0,12), aspects: product.aspects||{} },
+          }),
+        });
+        if (!invRes.ok) return res.status(400).json({ error: 'Inventory failed', details: await invRes.text() });
+        const offerRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, { method:'POST', headers:authHeader, body:JSON.stringify(buildOffer(groupSku, product)) });
+        const offerData = await offerRes.json();
+        if (!offerRes.ok) return res.status(400).json({ error: 'Offer failed', details: offerData });
+        const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerData.offerId}/publish`, { method:'POST', headers:authHeader });
+        const pubData = await pubRes.json();
+        return res.json({ success:true, sku:groupSku, offerId:offerData.offerId, listingId:pubData.listingId });
+      }
+
+      // Use cleaned variations for combos
+      product.variations = cleanVariations;
+
+      // Multi-variation listing — eBay hard limit is 250 variations
+      let combos = buildCombos(product.variations);
+      if (combos.length > 250) {
+        // Prioritize in-stock combos first, then trim to 250
+        const inStock = combos.filter(c => c.every(v => (v.stock||0) > 0));
+        const outStock = combos.filter(c => c.some(v => (v.stock||0) === 0));
+        combos = [...inStock, ...outStock].slice(0, 250);
+        console.log(`Trimmed combos from ${combos.length+outStock.length} to 250 (eBay limit)`);
+      }
       const createdSkus = [];
 
       for (const combo of combos) {
