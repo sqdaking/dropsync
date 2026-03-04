@@ -359,6 +359,10 @@ module.exports = async (req, res) => {
           const inStockM = workHtml.match(/"inStockAsinSet"\s*:\s*(\[[^\]]*\])/);
           if (inStockM) { try { JSON.parse(inStockM[1]).forEach(a => { asinStock[a] = true; }); } catch {} }
 
+          // Declare image maps BEFORE fetch so the async callbacks can write into them
+          const colorImgMap = {};
+          const allImages = [];
+
           // Fetch individual ASIN pages for prices + per-color images
           // Pick one representative ASIN per unique color to get its image
           const asinToColor = {}; // asin -> color value
@@ -392,22 +396,19 @@ module.exports = async (req, res) => {
               // Stock
               if (h.includes('Currently unavailable') || h.includes('currently unavailable')) asinStock[asin] = false;
               else if (h.includes('Add to Cart') || h.includes('Buy Now')) asinStock[asin] = true;
-              // Main image — grab the first hiRes from this ASIN's colorImages initial block
-              if (needImage.includes(asin)) {
-                const imgM = h.match(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon[^"]+)"/);
-                if (imgM) {
-                  const color = asinToColor[asin];
-                  if (color) colorImgMap[color] = imgM[1];
-                  if (!allImages.includes(imgM[1])) allImages.push(imgM[1]);
-                }
+              // Grab images from this ASIN's page
+              // The 'initial' block always contains this ASIN's color-specific images
+              const hiResOnPage = [...h.matchAll(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/g)]
+                .map(m => m[1]);
+              if (hiResOnPage.length) {
+                const color = asinToColor[asin];
+                if (color && !colorImgMap[color]) colorImgMap[color] = hiResOnPage[0];
+                hiResOnPage.forEach(s => { if (!allImages.includes(s)) allImages.push(s); });
               }
             } catch {}
           }));
 
-          // ── Extract images
-          const colorImgMap = {};
-          const allImages = [];
-          // Extract colorImages block using brace-walking (not regex — block is huge)
+          // ── Seed allImages + extractColorImages helper
           function extractColorImages(h) {
             const map = {}, all = [];
             const ki = h.indexOf("'colorImages'");
@@ -466,17 +467,9 @@ module.exports = async (req, res) => {
             return { map, all };
           }
 
-          const ci1 = extractColorImages(workHtml);
-          const ci2 = extractColorImages(html);
-          Object.assign(colorImgMap, ci2.map, ci1.map); // workHtml wins
-          allImages.push(...ci1.all.filter(s=>!allImages.includes(s)));
-          allImages.push(...ci2.all.filter(s=>!allImages.includes(s)));
-
-          // Fallback: grab all hiRes images from HTML
-          if (allImages.length < 3) {
-            for (const m of html.matchAll(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon[^"]+)"/g))
-              if (!allImages.includes(m[1])) allImages.push(m[1]);
-          }
+          // Seed allImages from landing page hiRes (initial color images)
+          for (const m of html.matchAll(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/g))
+            if (!allImages.includes(m[1])) allImages.push(m[1]);
           product.images = [...new Set(allImages)].slice(0, 12);
           // variationImages set after ASIN fetches below (colorImgMap populated there)
 
