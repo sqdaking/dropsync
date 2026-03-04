@@ -889,8 +889,10 @@ module.exports = async (req, res) => {
       } catch(e) { console.log('location error:', e.message); }
       console.log('merchantLocationKey:', merchantLocationKey);
       const baseOffer = buildOffer(groupSku, product, policies, merchantLocationKey);
-      delete baseOffer.sku;
-      const offerBody = { ...baseOffer, inventoryItemGroupKey: groupSku };
+      // For multi-variation listings, sku must equal the inventoryItemGroupKey
+      baseOffer.sku = groupSku;
+      const offerBody = baseOffer;
+      delete offerBody.inventoryItemGroupKey; // not a valid offer field
       console.log('groupSku:', groupSku);
       console.log('offerBody keys:', Object.keys(offerBody));
       console.log('offerBody:', JSON.stringify(offerBody).slice(0, 500));
