@@ -911,7 +911,7 @@ module.exports = async (req, res) => {
         // ── AUTOMOTIVE ───────────────────────────────────────────────────
         else if (/\b(car seat cover|steering wheel cover|car mat|trunk organizer|car phone mount)\b/.test(tx)) CAT(33637,'Car Accessories');
         else if (/\b(jumper cable|jump starter|car battery charger|tire inflator|air compressor)\b/.test(tx)) CAT(33637,'Car Tools');
-        else if (/\b(motor oil|car wax|car wash|detailing|ceramic coat)\b/.test(tx)) CAT(33637,'Car Care');
+        else if (/\b(motor oil|engine oil|synthetic oil|oil filter|car wax|car wash|detailing|ceramic coat|windshield washer|antifreeze|coolant)\b/.test(tx)) CAT(179819,'Motor Oil & Fluids');
         else if (/\b(dashcam|backup camera|car camera|gps|car gps)\b/.test(tx)) CAT(33637,'Car Electronics');
         else if (/\b(motorcycle|dirt bike|atv|helmet motorcycle|biker)\b/.test(tx)) CAT(10063,'Motorcycle');
 
@@ -1285,6 +1285,26 @@ module.exports = async (req, res) => {
         console.log(`publishByGroup attempt ${attempt}:`, pubStatus, JSON.stringify(pubData).slice(0,500));
         if (pubRes.ok) break;
         if (pubStatus === 500) { await new Promise(r => setTimeout(r, 3000 * attempt)); continue; }
+
+        // Category doesn't support multi-variation — fall back to individual listings
+        const noMultiVar = (pubData.errors||[]).some(e => e.errorId === 25005);
+        if (noMultiVar) {
+          console.log('Category does not support multi-variation — publishing individual offers');
+          const indivIds = [];
+          for (const offerId of offerIds) {
+            const pubOne = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerId}/publish`, {
+              method: 'POST', headers: authHeader,
+            });
+            const pubOneData = await pubOne.json();
+            if (pubOne.ok && pubOneData.listingId) indivIds.push(pubOneData.listingId);
+            else console.log('indiv publish failed:', offerId, JSON.stringify(pubOneData).slice(0,200));
+          }
+          console.log(`Individual publish: ${indivIds.length}/${offerIds.length} succeeded`);
+          if (indivIds.length > 0) {
+            return res.json({ success:true, sku:groupSku, listingId:indivIds[0], variationsCreated:indivIds.length, mode:'individual' });
+          }
+          return res.status(400).json({ error: 'Individual publish also failed', details: pubData });
+        }
 
         // If missing item specifics — fill them in and retry via updateOffer
         const missingAspects = (pubData.errors||[])
