@@ -731,7 +731,7 @@ module.exports = async (req, res) => {
       // ── AUTO CATEGORY DETECTION ──────────────────────────────────────
       // Maps product title/aspects to correct eBay category ID
       if (!product.categoryId || product.categoryId === '9355') {
-        const t  = (product.title||'').toLowerCase();
+        const t  = (product.title||'').toLowerCase().replace(/&#39;/g,"'").replace(/&amp;/g,'&').replace(/&quot;/g,'"').replace(/&lt;/g,'<').replace(/&gt;/g,'>');
         const br = Object.keys(product.aspects||{}).map(k=>(product.aspects[k]||[]).join(' ')).join(' ').toLowerCase();
         const tx = t + ' ' + br; // combined signal
 
@@ -1183,13 +1183,20 @@ module.exports = async (req, res) => {
       if (!offerIds.length) return res.status(400).json({ error: 'No offers created' });
 
       // ── STEP 7: publish_by_inventory_item_group ───────────────────────
-      const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/publish_by_inventory_item_group`, {
-        method: 'POST', headers: authHeader,
-        body: JSON.stringify({ inventoryItemGroupKey: groupSku, marketplaceId: 'EBAY_US' }),
-      });
-      const pubData = await pubRes.json();
-      console.log('publishByGroup:', pubRes.status, JSON.stringify(pubData).slice(0,500));
-      if (!pubRes.ok) return res.status(400).json({ error: 'Publish failed', details: pubData });
+      let pubData, pubStatus;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/publish_by_inventory_item_group`, {
+          method: 'POST', headers: authHeader,
+          body: JSON.stringify({ inventoryItemGroupKey: groupSku, marketplaceId: 'EBAY_US' }),
+        });
+        pubData   = await pubRes.json();
+        pubStatus = pubRes.status;
+        console.log(`publishByGroup attempt ${attempt}:`, pubStatus, JSON.stringify(pubData).slice(0,500));
+        if (pubRes.ok) break;
+        if (pubStatus !== 500) break; // only retry on 500
+        await new Promise(r => setTimeout(r, 3000 * attempt)); // wait 3s, 6s
+      }
+      if (pubStatus !== 200 && pubStatus !== 201) return res.status(400).json({ error: 'Publish failed', details: pubData });
       return res.json({ success:true, sku:groupSku, listingId:pubData.listingId, variationsCreated:offerIds.length });
     }
 
