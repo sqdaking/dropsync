@@ -726,7 +726,8 @@ module.exports = async (req, res) => {
       const { access_token, product } = body;
       if (!access_token || !product) return res.status(400).json({ error: 'Missing fields' });
 
-      const groupSku = `DS-${Date.now()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`;
+      // SKU must be alphanumeric + hyphens only, max 50 chars
+      const groupSku = `DS${Date.now()}${Math.random().toString(36).slice(2,6).toUpperCase()}`;
       const policies = { fulfillmentPolicyId: body.fulfillmentPolicyId, paymentPolicyId: body.paymentPolicyId, returnPolicyId: body.returnPolicyId };
       const authHeader = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
 
@@ -805,10 +806,10 @@ module.exports = async (req, res) => {
         if (combo.every(v => v.enabled === false)) continue;
         // Build a clean SKU — sanitize each value segment
         const skuSegments = combo.map(v => {
-          const clean = String(v.value||'').replace(/[^a-zA-Z0-9]/g,'').slice(0,8);
+          const clean = String(v.value||'').replace(/[^a-zA-Z0-9]/g,'').slice(0,8).toUpperCase();
           return clean || 'VAR';
         });
-        const varSku = `${groupSku}-${skuSegments.join('-')}`;
+        const varSku = `${groupSku}${skuSegments.join('')}`;
         const varPrice = combo.reduce((p,v) => v.price || p, product.price);
         const varStock = combo.reduce((s,v) => v.stock !== undefined ? v.stock : s, parseInt(product.quantity)||10);
         const varImages = getVarImages(combo, product.variationImages, product.images);
@@ -852,8 +853,10 @@ module.exports = async (req, res) => {
       });
       if (!groupRes.ok) return res.status(400).json({ error: 'Group failed', details: await groupRes.text() });
 
-      const offerBody = { ...buildOffer(groupSku, product, policies), inventoryItemGroupKey: groupSku };
-      delete offerBody.sku;
+      const baseOffer = buildOffer(groupSku, product, policies);
+      delete baseOffer.sku;
+      const offerBody = { ...baseOffer, inventoryItemGroupKey: groupSku };
+      console.log('offerBody:', JSON.stringify(offerBody).slice(0, 300));
       const offerRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, { method:'POST', headers:authHeader, body:JSON.stringify(offerBody) });
       const offerData = await offerRes.json();
       if (!offerRes.ok) return res.status(400).json({ error: 'Offer failed', details: offerData });
