@@ -892,8 +892,8 @@ module.exports = async (req, res) => {
       } catch(e) { console.log('location error:', e.message); }
       console.log('merchantLocationKey:', merchantLocationKey);
       const baseOffer = buildOffer(groupSku, product, policies, merchantLocationKey);
-      delete baseOffer.sku;
-      const offerBody = { ...baseOffer, inventoryItemGroupKey: groupSku };
+      // Multi-variation offer needs BOTH sku=groupSku AND inventoryItemGroupKey=groupSku
+      const offerBody = { ...baseOffer, sku: groupSku, inventoryItemGroupKey: groupSku };
       console.log('groupSku:', groupSku);
       console.log('offerBody keys:', Object.keys(offerBody));
       console.log('offerBody:', JSON.stringify(offerBody).slice(0, 500));
