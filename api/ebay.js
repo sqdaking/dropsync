@@ -856,10 +856,15 @@ module.exports = async (req, res) => {
       const baseOffer = buildOffer(groupSku, product, policies);
       delete baseOffer.sku;
       const offerBody = { ...baseOffer, inventoryItemGroupKey: groupSku };
-      console.log('offerBody:', JSON.stringify(offerBody).slice(0, 300));
+      console.log('groupSku:', groupSku);
+      console.log('offerBody keys:', Object.keys(offerBody));
+      console.log('offerBody:', JSON.stringify(offerBody).slice(0, 500));
       const offerRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, { method:'POST', headers:authHeader, body:JSON.stringify(offerBody) });
-      const offerData = await offerRes.json();
-      if (!offerRes.ok) return res.status(400).json({ error: 'Offer failed', details: offerData });
+      const offerRaw = await offerRes.json();
+      console.log('offerRes status:', offerRes.status);
+      console.log('offerData:', JSON.stringify(offerRaw).slice(0, 500));
+      if (!offerRes.ok) return res.status(400).json({ error: 'Offer failed', details: offerRaw });
+      const offerData = offerRaw;
 
       const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerData.offerId}/publish`, { method:'POST', headers:authHeader });
       const pubData = await pubRes.json();
