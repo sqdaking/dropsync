@@ -942,18 +942,21 @@ module.exports = async (req, res) => {
       console.log(`Created ${offerIds.length}/${createdSkus.length} offers`);
       if (!offerIds.length) return res.status(400).json({ error: 'No offers created — check category ID and policies' });
 
-      // Ensure return policy is valid — create a fresh one via API if needed
+      // Always create a fresh DropSync return policy to avoid eBay validation issues
       let validReturnPolicyId = policies.returnPolicyId;
-      if (validReturnPolicyId) {
-        const rpCheck = await fetch(`${EBAY_API}/sell/account/v1/return_policy/${validReturnPolicyId}`, { headers: authHeader });
-        const rpData = await rpCheck.json();
-        console.log('returnPolicy check:', JSON.stringify(rpData).slice(0,400));
-        // If returnsAccepted is missing/false, create a fresh policy
-        if (!rpData.returnsAccepted) {
+      try {
+        // Check if DropSync policy already exists
+        const rpList = await fetch(`${EBAY_API}/sell/account/v1/return_policy?marketplace_id=EBAY_US`, { headers: authHeader });
+        const rpListData = await rpList.json();
+        const existing = (rpListData.returnPolicies||[]).find(p => p.name === 'DropSync Auto Policy');
+        if (existing) {
+          validReturnPolicyId = existing.returnPolicyId;
+          console.log('using existing DropSync policy:', validReturnPolicyId);
+        } else {
           const rpCreate = await fetch(`${EBAY_API}/sell/account/v1/return_policy`, {
             method: 'POST', headers: authHeader,
             body: JSON.stringify({
-              name: 'DropSync Returns Policy',
+              name: 'DropSync Auto Policy',
               marketplaceId: 'EBAY_US',
               categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
               returnsAccepted: true,
@@ -963,17 +966,10 @@ module.exports = async (req, res) => {
             })
           });
           const rpNew = await rpCreate.json();
-          console.log('created return policy:', JSON.stringify(rpNew).slice(0,300));
+          console.log('created DropSync policy:', JSON.stringify(rpNew).slice(0,300));
           if (rpNew.returnPolicyId) validReturnPolicyId = rpNew.returnPolicyId;
         }
-      }
-
-      // Debug: fetch the actual return policy to see what eBay sees
-      if (policies.returnPolicyId) {
-        const rpCheck = await fetch(`${EBAY_API}/sell/account/v1/return_policy/${policies.returnPolicyId}`, { headers: authHeader });
-        const rpData = await rpCheck.json();
-        console.log('returnPolicy data:', JSON.stringify(rpData).slice(0,600));
-      }
+      } catch(e) { console.log('return policy error:', e.message); }
 
       // Step 4: publishOfferByInventoryItemGroup
       const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/publish_by_inventory_item_group`, {
