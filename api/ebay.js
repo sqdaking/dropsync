@@ -31,6 +31,8 @@ module.exports = async (req, res) => {
         'https://api.ebay.com/oauth/api_scope/sell.inventory.readonly',
         'https://api.ebay.com/oauth/api_scope/sell.fulfillment',
         'https://api.ebay.com/oauth/api_scope/sell.fulfillment.readonly',
+        'https://api.ebay.com/oauth/api_scope/sell.account',
+        'https://api.ebay.com/oauth/api_scope/sell.account.readonly',
       ].join(' ');
       return res.redirect(`${EBAY_AUTH}/oauth2/authorize?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(RUNAME)}&response_type=code&scope=${encodeURIComponent(scopes)}`);
     }
