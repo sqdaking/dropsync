@@ -728,6 +728,229 @@ module.exports = async (req, res) => {
       const { access_token, product } = body;
       if (!access_token || !product) return res.status(400).json({ error: 'Missing fields' });
 
+      // ── AUTO CATEGORY DETECTION ──────────────────────────────────────
+      // Maps product title/aspects to correct eBay category ID
+      if (!product.categoryId || product.categoryId === '9355') {
+        const t  = (product.title||'').toLowerCase();
+        const br = Object.keys(product.aspects||{}).map(k=>(product.aspects[k]||[]).join(' ')).join(' ').toLowerCase();
+        const tx = t + ' ' + br; // combined signal
+
+        const CAT = (id, label) => { product.categoryId = String(id); console.log(`auto-cat [${id}] ${label} — "${product.title?.slice(0,50)}"`); };
+
+        // ── CLOTHING ────────────────────────────────────────────────────
+        if      (/\b(men.?s jean|boy.?s jean|denim pant|slim fit jean|skinny jean|straight leg jean|relaxed fit jean|bootcut)\b/.test(tx)) CAT(11554,'Men Jeans');
+        else if (/\b(women.?s jean|girl.?s jean|ladies jean|jegging)\b/.test(tx)) CAT(11555,'Women Jeans');
+        else if (/\b(yoga pant|yoga legging|legging|athletic pant|workout pant|jogger|sweatpant|trackpant|lounge pant)\b/.test(tx)) CAT(185100,'Athletic Bottoms');
+        else if (/\b(men.?s pant|men.?s trouser|dress pant|chino|khaki|cargo pant|slack)\b/.test(tx)) CAT(57989,'Men Pants');
+        else if (/\b(women.?s pant|women.?s trouser|palazzo|culottes|wide leg pant)\b/.test(tx)) CAT(63862,'Women Pants');
+        else if (/\b(men.?s short|board short|cargo short|swim trunk|swim short)\b/.test(tx)) CAT(15689,'Men Shorts');
+        else if (/\b(women.?s short|biker short|high waist short)\b/.test(tx)) CAT(11555,'Women Shorts');
+        else if (/\b(hoodie|sweatshirt|pullover|crewneck sweat)\b/.test(tx)) CAT(155183,'Hoodies Sweatshirts');
+        else if (/\b(men.?s t.?shirt|men.?s tee|graphic tee|crew tee)\b/.test(tx)) CAT(15687,'Men T-Shirts');
+        else if (/\b(women.?s t.?shirt|women.?s tee|women.?s top|crop top|tank top|cami)\b/.test(tx)) CAT(53159,'Women Tops');
+        else if (/\b(polo shirt|golf shirt)\b/.test(tx)) CAT(2403,'Polo Shirts');
+        else if (/\b(dress shirt|button down|button up|oxford shirt|flannel shirt)\b/.test(tx)) CAT(57990,'Dress Shirts');
+        else if (/\b(men.?s shirt)\b/.test(tx)) CAT(57990,'Men Shirts');
+        else if (/\b(blouse|women.?s shirt)\b/.test(tx)) CAT(53159,'Women Shirts');
+        else if (/\b(sweater|cardigan|pullover knit|turtleneck)\b/.test(tx)) CAT(11484,'Sweaters');
+        else if (/\b(dress|maxi dress|midi dress|mini dress|sun dress|wrap dress|bodycon)\b/.test(tx)) CAT(2311,'Women Dresses');
+        else if (/\b(skirt|mini skirt|maxi skirt|midi skirt|pleated skirt)\b/.test(tx)) CAT(2312,'Skirts');
+        else if (/\b(jumpsuit|romper|playsuit|overalls)\b/.test(tx)) CAT(152763,'Jumpsuits Rompers');
+        else if (/\b(men.?s jacket|puffer jacket|bomber jacket|denim jacket|parka|anorak|windbreaker|rain jacket)\b/.test(tx)) CAT(57988,'Men Jackets Coats');
+        else if (/\b(women.?s jacket|women.?s coat|blazer|trench coat)\b/.test(tx)) CAT(63862,'Women Jackets');
+        else if (/\b(suit|tuxedo|blazer jacket)\b/.test(tx)) CAT(3001,'Men Suits');
+        else if (/\b(vest|waistcoat)\b/.test(tx)) CAT(11476,'Vests');
+        else if (/\b(compression|rash guard|swim shirt|uv shirt)\b/.test(tx)) CAT(185100,'Athletic Shirts');
+        else if (/\b(underwear|boxer|brief|trunk|panty|bra|lingerie|thong)\b/.test(tx)) CAT(11511,'Underwear');
+        else if (/\b(sock|no.?show sock|ankle sock|compression sock|knee.?high sock)\b/.test(tx)) CAT(11471,'Socks');
+        else if (/\b(glove|mitten)\b/.test(tx)) CAT(131534,'Gloves');
+        else if (/\b(scarf|wrap|shawl|poncho)\b/.test(tx)) CAT(45238,'Scarves');
+        else if (/\b(beanie|winter hat|knit hat|bobble hat)\b/.test(tx)) CAT(52365,'Beanies');
+        else if (/\b(baseball cap|snapback|trucker hat|dad hat|bucket hat|sun hat|fedora|cowboy hat|cap)\b/.test(tx)) CAT(52365,'Hats Caps');
+        else if (/\b(swimsuit|bikini|one.?piece swim|monokini|swimwear|bathing suit)\b/.test(tx)) CAT(11491,'Swimwear');
+        else if (/\b(pajama|pyjama|sleepwear|nightgown|robe|lounge wear)\b/.test(tx)) CAT(11510,'Sleepwear');
+        else if (/\b(maternity|nursing|pregnancy)\b/.test(tx)) CAT(31848,'Maternity Clothing');
+        else if (/\b(uniform|scrub|workwear|hi.?vis|safety vest)\b/.test(tx)) CAT(57991,'Workwear');
+        else if (/\b(costume|halloween|cosplay)\b/.test(tx)) CAT(2435,'Costumes');
+
+        // ── FOOTWEAR ─────────────────────────────────────────────────────
+        else if (/\b(sneaker|athletic shoe|running shoe|training shoe|tennis shoe)\b/.test(tx)) CAT(15709,'Sneakers');
+        else if (/\b(boot|ankle boot|chelsea boot|combat boot|cowboy boot|rain boot|snow boot|ugg)\b/.test(tx)) CAT(63889,'Boots');
+        else if (/\b(sandal|flip flop|thong sandal|slide|birkenstock)\b/.test(tx)) CAT(11632,'Sandals');
+        else if (/\b(loafer|moccasin|slip.?on|flat shoe|ballet flat|oxford shoe|derby)\b/.test(tx)) CAT(53120,'Flats Loafers');
+        else if (/\b(heel|stiletto|pump|wedge shoe|platform shoe)\b/.test(tx)) CAT(55793,'Heels');
+        else if (/\b(slipper|house shoe|clog)\b/.test(tx)) CAT(11632,'Slippers');
+        else if (/\b(shoe|footwear)\b/.test(tx)) CAT(63889,'Shoes');
+
+        // ── BAGS & ACCESSORIES ───────────────────────────────────────────
+        else if (/\b(backpack|rucksack|school bag|laptop bag backpack)\b/.test(tx)) CAT(169291,'Backpacks');
+        else if (/\b(handbag|purse|tote bag|shoulder bag|crossbody|clutch|satchel)\b/.test(tx)) CAT(169291,'Handbags');
+        else if (/\b(duffel|duffle|gym bag|travel bag|weekender)\b/.test(tx)) CAT(169291,'Duffel Bags');
+        else if (/\b(suitcase|luggage|carry.?on|hardshell luggage|rolling bag)\b/.test(tx)) CAT(48749,'Luggage');
+        else if (/\b(wallet|bifold|money clip|card holder|cardholder|card wallet)\b/.test(tx)) CAT(2996,'Wallets');
+        else if (/\b(belt|suspender|brace)\b/.test(tx)) CAT(2089,'Belts');
+        else if (/\b(sunglasses|sunglass|eyewear|uv400 glasses|polarized glasses)\b/.test(tx)) CAT(79720,'Sunglasses');
+        else if (/\b(glasses frame|eyeglass|spectacle|reading glasses)\b/.test(tx)) CAT(79720,'Eyeglasses');
+        else if (/\b(umbrella|parasol)\b/.test(tx)) CAT(2996,'Umbrellas');
+        else if (/\b(hair accessory|hair tie|scrunchie|headband|hair clip|barrette)\b/.test(tx)) CAT(50606,'Hair Accessories');
+
+        // ── JEWELRY ──────────────────────────────────────────────────────
+        else if (/\b(necklace|pendant|chain necklace|choker)\b/.test(tx)) CAT(164,'Necklaces');
+        else if (/\b(bracelet|bangle|charm bracelet|cuff bracelet)\b/.test(tx)) CAT(10978,'Bracelets');
+        else if (/\b(earring|stud earring|hoop earring|drop earring)\b/.test(tx)) CAT(10985,'Earrings');
+        else if (/\b(ring|engagement ring|band ring|promise ring)\b/.test(tx)) CAT(67726,'Rings');
+        else if (/\b(watch|smartwatch|chronograph|timepiece)\b/.test(tx)) CAT(31387,'Watches');
+        else if (/\b(jewelry set|jewellery set|jewelry bundle)\b/.test(tx)) CAT(10968,'Jewelry Sets');
+
+        // ── ELECTRONICS ──────────────────────────────────────────────────
+        else if (/\b(iphone|ipad|airpod|macbook|apple watch)\b/.test(tx)) CAT(9355,'Apple');
+        else if (/\b(samsung galaxy|samsung phone|android phone|smartphone|cell phone|mobile phone)\b/.test(tx)) CAT(9355,'Cell Phones');
+        else if (/\b(laptop|notebook computer|chromebook|macbook)\b/.test(tx)) CAT(177,'Laptops');
+        else if (/\b(tablet|ipad|kindle|e.?reader|android tablet)\b/.test(tx)) CAT(171485,'Tablets');
+        else if (/\b(headphone|earphone|earpiece|airpod|earbud|over.?ear|in.?ear)\b/.test(tx)) CAT(112529,'Headphones');
+        else if (/\b(bluetooth speaker|portable speaker|soundbar|speaker system)\b/.test(tx)) CAT(14969,'Speakers');
+        else if (/\b(keyboard|mechanical keyboard|gaming keyboard)\b/.test(tx)) CAT(3676,'Keyboards');
+        else if (/\b(mouse|gaming mouse|wireless mouse|trackpad)\b/.test(tx)) CAT(3676,'Computer Mouse');
+        else if (/\b(monitor|display screen|gaming monitor|4k monitor)\b/.test(tx)) CAT(80053,'Monitors');
+        else if (/\b(charger|charging cable|usb cable|lightning cable|power bank|power adapter)\b/.test(tx)) CAT(44980,'Chargers Cables');
+        else if (/\b(phone case|iphone case|samsung case|screen protector|tempered glass)\b/.test(tx)) CAT(9394,'Phone Cases');
+        else if (/\b(camera|dslr|mirrorless|action camera|gopro|webcam|dashcam)\b/.test(tx)) CAT(625,'Cameras');
+        else if (/\b(drone|quadcopter|fpv)\b/.test(tx)) CAT(179697,'Drones');
+        else if (/\b(smart home|alexa|google home|smart plug|smart bulb|ring doorbell)\b/.test(tx)) CAT(184435,'Smart Home');
+        else if (/\b(gaming chair|gaming headset|controller|joystick|gamepad|nintendo|playstation|xbox)\b/.test(tx)) CAT(139971,'Video Games');
+        else if (/\b(led strip|led light|ring light|desk lamp|floor lamp|string light)\b/.test(tx)) CAT(112581,'Lighting');
+        else if (/\b(extension cord|surge protector|power strip)\b/.test(tx)) CAT(44980,'Power Strips');
+        else if (/\b(printer|scanner|ink cartridge|toner)\b/.test(tx)) CAT(1245,'Printers');
+
+        // ── HOME & KITCHEN ───────────────────────────────────────────────
+        else if (/\b(air fryer|instant pot|pressure cooker|slow cooker|crockpot)\b/.test(tx)) CAT(20625,'Kitchen Appliances');
+        else if (/\b(coffee maker|espresso machine|french press|pour over|keurig|nespresso)\b/.test(tx)) CAT(20625,'Coffee Makers');
+        else if (/\b(blender|nutribullet|smoothie maker|food processor|juicer|mixer)\b/.test(tx)) CAT(20625,'Blenders');
+        else if (/\b(knife|chef knife|knife set|cutting board|kitchen shear|peeler|grater)\b/.test(tx)) CAT(20625,'Kitchen Knives');
+        else if (/\b(pan|skillet|frying pan|cast iron|wok|saute pan|griddle)\b/.test(tx)) CAT(20625,'Pans');
+        else if (/\b(pot|saucepan|dutch oven|stockpot|cookware set)\b/.test(tx)) CAT(20625,'Pots Cookware');
+        else if (/\b(baking sheet|baking pan|muffin tin|cake pan|pie dish|baking mat)\b/.test(tx)) CAT(20625,'Bakeware');
+        else if (/\b(food storage|meal prep container|tupperware|glass container|lunch box)\b/.test(tx)) CAT(20625,'Food Storage');
+        else if (/\b(water bottle|tumbler|travel mug|thermos|insulated bottle|stanley cup|hydro flask)\b/.test(tx)) CAT(20625,'Water Bottles');
+        else if (/\b(wine glass|cocktail glass|mug|cup|glassware|drinkware)\b/.test(tx)) CAT(20625,'Glassware');
+        else if (/\b(dish|plate|bowl|dinnerware|tableware|flatware|silverware|spoon|fork)\b/.test(tx)) CAT(20625,'Dinnerware');
+        else if (/\b(towel|bath towel|hand towel|washcloth|kitchen towel|dish towel)\b/.test(tx)) CAT(20625,'Towels');
+        else if (/\b(bedsheet|pillowcase|duvet cover|comforter|blanket|throw|quilt|pillow)\b/.test(tx)) CAT(20444,'Bedding');
+        else if (/\b(mattress|memory foam mattress|mattress topper|box spring)\b/.test(tx)) CAT(175758,'Mattresses');
+        else if (/\b(shower curtain|bath mat|toilet|bathroom accessory)\b/.test(tx)) CAT(20487,'Bathroom');
+        else if (/\b(candle|wax melt|diffuser|essential oil|air freshener|incense)\b/.test(tx)) CAT(116023,'Candles Scents');
+        else if (/\b(picture frame|wall art|poster|canvas print|wall decor|mirror)\b/.test(tx)) CAT(10033,'Wall Decor');
+        else if (/\b(storage bin|organizer|closet organizer|shelf|storage rack|drawer organizer)\b/.test(tx)) CAT(20580,'Storage Organization');
+        else if (/\b(vacuum|steam mop|mop|broom|dustpan|cleaning brush|sponge|microfiber)\b/.test(tx)) CAT(20580,'Cleaning');
+        else if (/\b(plant pot|planter|vase|garden pot|flower pot)\b/.test(tx)) CAT(181015,'Planters');
+        else if (/\b(tool|drill|saw|hammer|wrench|screwdriver|tape measure|level|power tool)\b/.test(tx)) CAT(631,'Tools');
+        else if (/\b(rug|area rug|floor mat|door mat|carpet runner)\b/.test(tx)) CAT(20571,'Rugs');
+        else if (/\b(curtain|drape|window blind|roman shade|valance)\b/.test(tx)) CAT(20580,'Window Treatment');
+        else if (/\b(lock|padlock|door handle|door knob|deadbolt|security camera|baby monitor)\b/.test(tx)) CAT(631,'Home Security');
+
+        // ── BEAUTY & PERSONAL CARE ───────────────────────────────────────
+        else if (/\b(lipstick|lip gloss|lip liner|lip balm|chapstick)\b/.test(tx)) CAT(11863,'Lip Makeup');
+        else if (/\b(mascara|eyeliner|eyeshadow|eye primer|eye makeup)\b/.test(tx)) CAT(11863,'Eye Makeup');
+        else if (/\b(foundation|concealer|blush|bronzer|highlighter|primer|bb cream|cc cream)\b/.test(tx)) CAT(11863,'Face Makeup');
+        else if (/\b(nail polish|nail gel|nail kit|nail art|nail file|nail clipper)\b/.test(tx)) CAT(11863,'Nail Care');
+        else if (/\b(perfume|cologne|fragrance|eau de toilette|eau de parfum)\b/.test(tx)) CAT(180345,'Fragrances');
+        else if (/\b(shampoo|conditioner|hair mask|hair serum|hair oil|dry shampoo)\b/.test(tx)) CAT(11858,'Hair Care');
+        else if (/\b(hair dryer|hair straightener|flat iron|curling iron|curling wand|hot tool)\b/.test(tx)) CAT(26397,'Hair Tools');
+        else if (/\b(face wash|facial cleanser|face mask|serum|moisturizer|toner|retinol|vitamin c serum)\b/.test(tx)) CAT(11858,'Skin Care');
+        else if (/\b(sunscreen|spf|sunblock)\b/.test(tx)) CAT(11858,'Sun Care');
+        else if (/\b(electric toothbrush|toothbrush|toothpaste|mouthwash|dental floss|whitening strip)\b/.test(tx)) CAT(26395,'Dental');
+        else if (/\b(razor|shaver|electric razor|trimmer|shaving cream|aftershave)\b/.test(tx)) CAT(26395,'Shaving');
+        else if (/\b(deodorant|antiperspirant|body spray|body wash|lotion|body butter)\b/.test(tx)) CAT(11858,'Body Care');
+
+        // ── SPORTS & FITNESS ─────────────────────────────────────────────
+        else if (/\b(yoga mat|exercise mat|foam roller|resistance band|pull up bar|ab roller)\b/.test(tx)) CAT(15273,'Fitness Equipment');
+        else if (/\b(dumbbell|barbell|weight plate|kettlebell|weight set)\b/.test(tx)) CAT(15273,'Weights');
+        else if (/\b(treadmill|elliptical|stationary bike|rowing machine|exercise bike)\b/.test(tx)) CAT(15273,'Cardio Equipment');
+        else if (/\b(protein powder|whey|creatine|pre.?workout|bcaa|mass gainer|protein shake)\b/.test(tx)) CAT(180959,'Sports Supplements');
+        else if (/\b(camping|tent|sleeping bag|hiking|trekking|backpacking|trail|outdoor gear)\b/.test(tx)) CAT(181389,'Camping Hiking');
+        else if (/\b(bike|bicycle|mountain bike|road bike|ebike|cycling)\b/.test(tx)) CAT(7294,'Cycling');
+        else if (/\b(fishing|fishing rod|fishing reel|tackle|lure|bait)\b/.test(tx)) CAT(11117,'Fishing');
+        else if (/\b(golf club|golf ball|golf bag|golf glove|golf tee|driver iron wedge)\b/.test(tx)) CAT(1513,'Golf');
+        else if (/\b(tennis racket|tennis ball|badminton|pickleball)\b/.test(tx)) CAT(159043,'Tennis');
+        else if (/\b(basketball|football|soccer ball|baseball|volleyball|football glove)\b/.test(tx)) CAT(888,'Team Sports');
+        else if (/\b(boxing glove|punching bag|mma|martial art|kickboxing)\b/.test(tx)) CAT(73991,'Boxing MMA');
+        else if (/\b(skateboard|longboard|roller skate|inline skate)\b/.test(tx)) CAT(2989,'Skating');
+        else if (/\b(ski|snowboard|snow goggle|ski jacket|ski boot)\b/.test(tx)) CAT(36261,'Skiing Snowboarding');
+        else if (/\b(swim goggle|swim cap|swimfin|swim training)\b/.test(tx)) CAT(26443,'Swimming');
+        else if (/\b(jump rope|speed rope|skipping rope)\b/.test(tx)) CAT(15273,'Jump Ropes');
+
+        // ── HEALTH & WELLNESS ────────────────────────────────────────────
+        else if (/\b(vitamin|multivitamin|fish oil|omega.?3|magnesium|zinc|iron supplement|probiotic|collagen)\b/.test(tx)) CAT(180959,'Vitamins Supplements');
+        else if (/\b(blood pressure|glucometer|pulse oximeter|thermometer|stethoscope)\b/.test(tx)) CAT(67784,'Health Monitors');
+        else if (/\b(heating pad|ice pack|back brace|knee brace|ankle brace|compression sleeve)\b/.test(tx)) CAT(73966,'Braces Supports');
+        else if (/\b(cpap|nebulizer|inhaler|blood sugar|glucose)\b/.test(tx)) CAT(67784,'Medical Equipment');
+        else if (/\b(scale|body fat scale|smart scale|bathroom scale)\b/.test(tx)) CAT(67784,'Scales');
+        else if (/\b(massage gun|massager|foam roller|neck massager|foot massager)\b/.test(tx)) CAT(67784,'Massage Relaxation');
+
+        // ── TOYS & KIDS ──────────────────────────────────────────────────
+        else if (/\b(lego|building block|construction toy)\b/.test(tx)) CAT(183446,'Building Blocks');
+        else if (/\b(rc car|remote control car|rc truck|rc drone|remote control toy)\b/.test(tx)) CAT(2562,'RC Toys');
+        else if (/\b(doll|barbie|action figure|stuffed animal|plush|teddy bear)\b/.test(tx)) CAT(19068,'Dolls Stuffed Animals');
+        else if (/\b(board game|card game|puzzle|jigsaw|tabletop game)\b/.test(tx)) CAT(2550,'Board Card Games');
+        else if (/\b(baby toy|infant toy|toddler toy|sensory toy|teether)\b/.test(tx)) CAT(19068,'Baby Toys');
+        else if (/\b(arts and craft|paint set|drawing|coloring book|slime|kinetic sand)\b/.test(tx)) CAT(11731,'Arts Crafts');
+        else if (/\b(scooter|kids bike|balance bike|tricycle|kids ride.?on)\b/.test(tx)) CAT(2989,'Kids Bikes Scooters');
+        else if (/\b(car seat|baby seat|booster seat)\b/.test(tx)) CAT(66692,'Car Seats');
+        else if (/\b(stroller|pram|baby carriage|baby carrier|baby wrap)\b/.test(tx)) CAT(182115,'Strollers');
+        else if (/\b(diaper|nappy|wipe|baby bottle|pacifier|nursing|breast pump)\b/.test(tx)) CAT(20394,'Baby Feeding');
+        else if (/\b(kids clothing|toddler clothing|baby clothing|onesie|romper baby|baby outfit)\b/.test(tx)) CAT(3082,'Kids Clothing');
+        else if (/\b(backpack kids|school bag kids|lunch bag kids)\b/.test(tx)) CAT(19068,'Kids Bags');
+
+        // ── PET ──────────────────────────────────────────────────────────
+        else if (/\b(dog leash|dog collar|dog harness|dog bed|dog crate|dog toy|puppy)\b/.test(tx)) CAT(20743,'Dog Supplies');
+        else if (/\b(cat litter|cat bed|cat toy|cat tree|cat scratching|kitten)\b/.test(tx)) CAT(20741,'Cat Supplies');
+        else if (/\b(dog food|cat food|pet food|pet treat|bird food|fish food)\b/.test(tx)) CAT(20741,'Pet Food');
+        else if (/\b(pet grooming|dog shampoo|cat shampoo|pet brush|nail grinder pet)\b/.test(tx)) CAT(20741,'Pet Grooming');
+        else if (/\b(fish tank|aquarium|terrarium|reptile|hamster|guinea pig|bird cage)\b/.test(tx)) CAT(20748,'Other Pets');
+
+        // ── AUTOMOTIVE ───────────────────────────────────────────────────
+        else if (/\b(car seat cover|steering wheel cover|car mat|trunk organizer|car phone mount)\b/.test(tx)) CAT(33637,'Car Accessories');
+        else if (/\b(jumper cable|jump starter|car battery charger|tire inflator|air compressor)\b/.test(tx)) CAT(33637,'Car Tools');
+        else if (/\b(motor oil|car wax|car wash|detailing|ceramic coat)\b/.test(tx)) CAT(33637,'Car Care');
+        else if (/\b(dashcam|backup camera|car camera|gps|car gps)\b/.test(tx)) CAT(33637,'Car Electronics');
+        else if (/\b(motorcycle|dirt bike|atv|helmet motorcycle|biker)\b/.test(tx)) CAT(10063,'Motorcycle');
+
+        // ── OFFICE & SCHOOL ──────────────────────────────────────────────
+        else if (/\b(notebook|journal|planner|bullet journal|diary)\b/.test(tx)) CAT(29223,'Notebooks Journals');
+        else if (/\b(pen|marker|highlighter|pencil|ballpoint|fountain pen|gel pen)\b/.test(tx)) CAT(29223,'Pens');
+        else if (/\b(desk organizer|file folder|binder|stapler|tape dispenser|paper clip)\b/.test(tx)) CAT(29223,'Office Supplies');
+        else if (/\b(monitor stand|desk mat|mouse pad|laptop stand|desk pad|cable management)\b/.test(tx)) CAT(58058,'Desk Accessories');
+        else if (/\b(whiteboard|corkboard|bulletin board|dry erase)\b/.test(tx)) CAT(29223,'Boards');
+        else if (/\b(calculator|scientific calculator)\b/.test(tx)) CAT(29223,'Calculators');
+
+        // ── GARDEN & OUTDOOR ─────────────────────────────────────────────
+        else if (/\b(garden hose|sprinkler|watering can|garden tool|shovel|rake|trowel|pruner)\b/.test(tx)) CAT(181015,'Garden Tools');
+        else if (/\b(outdoor furniture|patio chair|garden chair|adirondack|hammock|swing chair)\b/.test(tx)) CAT(3197,'Outdoor Furniture');
+        else if (/\b(bbq|grill|charcoal grill|gas grill|smoker|barbecue)\b/.test(tx)) CAT(42231,'Grills BBQ');
+        else if (/\b(bird feeder|bird bath|wind chime|garden statue|garden gnome)\b/.test(tx)) CAT(181015,'Garden Decor');
+        else if (/\b(seed|fertilizer|potting soil|compost|pesticide|weed killer|plant food)\b/.test(tx)) CAT(181015,'Gardening');
+        else if (/\b(solar light|pathway light|outdoor light|landscape light|string light outdoor)\b/.test(tx)) CAT(112581,'Outdoor Lighting');
+        else if (/\b(pool|hot tub|spa|inflatable pool|pool float|swim ring)\b/.test(tx)) CAT(20716,'Pools Spas');
+
+        // ── MUSIC & INSTRUMENTS ──────────────────────────────────────────
+        else if (/\b(guitar|electric guitar|acoustic guitar|bass guitar|ukulele)\b/.test(tx)) CAT(33034,'Guitars');
+        else if (/\b(piano|keyboard instrument|midi keyboard|synthesizer)\b/.test(tx)) CAT(180010,'Pianos Keyboards');
+        else if (/\b(drum|drum kit|drum pad|drumstick|percussion)\b/.test(tx)) CAT(180011,'Drums Percussion');
+        else if (/\b(microphone|condenser mic|dynamic mic|usb mic|recording)\b/.test(tx)) CAT(18872,'Microphones');
+        else if (/\b(vinyl record|turntable|record player)\b/.test(tx)) CAT(14969,'Turntables');
+
+        // ── FOOD & GROCERY ────────────────────────────────────────────────
+        else if (/\b(coffee bean|ground coffee|instant coffee|k.?cup|coffee pod)\b/.test(tx)) CAT(4438,'Coffee');
+        else if (/\b(tea|green tea|herbal tea|matcha|chai)\b/.test(tx)) CAT(4438,'Tea');
+        else if (/\b(snack|chip|candy|chocolate|cookie|cracker|popcorn|nut|trail mix)\b/.test(tx)) CAT(4438,'Snacks');
+        else if (/\b(protein bar|energy bar|granola bar|meal replacement)\b/.test(tx)) CAT(180959,'Nutrition Bars');
+        else if (/\b(hot sauce|seasoning|spice|condiment|olive oil|vinegar)\b/.test(tx)) CAT(4438,'Condiments Spices');
+
+        // ── FALLBACK ─────────────────────────────────────────────────────
+        else if (/\b(clothing|apparel|fashion|outfit|wear|garment)\b/.test(tx)) CAT(11450,'General Clothing');
+        else CAT(11450,'General — fallback');
+      }
+
       // SKU must be alphanumeric + hyphens only, max 50 chars
       const groupSku = `GRP${Date.now()}${Math.random().toString(36).slice(2,6).toUpperCase()}`;
       const varSkuBase = `ITM${Date.now()}${Math.random().toString(36).slice(2,6).toUpperCase()}`;
