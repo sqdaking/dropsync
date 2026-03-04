@@ -251,56 +251,123 @@ module.exports = async (req, res) => {
             if (opts.length) variationData['size_name'] = opts;
           }
 
-          // 5) Extract per-ASIN prices from asinVariationValues or unifiedPrice
-          const asinPriceMap = {};
-          const asinDimMap = {}; // asin -> { color_name: 'Red', size_name: 'L' }
+          // ─────────────────────────────────────────────────────────
+          // 5) Per-ASIN price + stock — try every Amazon data source
+          // ─────────────────────────────────────────────────────────
+          const asinPriceMap = {};  // asin -> price string
+          const asinStockMap = {};  // asin -> boolean
+          const asinDimMap   = {};  // asin -> { color_name:'Red', size_name:'L' }
 
-          // Try to find asinToDimension mapping
-          const asinToDimMatch = html.match(/"asinToDimension"\s*:\s*(\{[\s\S]*?\})\s*,\s*"[a-zA-Z]/);
-          if (asinToDimMatch) {
-            try { Object.assign(asinDimMap, JSON.parse(asinToDimMatch[1])); } catch {}
+          // A) asinVariationValues  (most complete — full dim map per ASIN)
+          const asinVarVals = html.match(/"asinVariationValues"\s*:\s*(\{[\s\S]*?\})(?=\s*,\s*"[a-zA-Z])/);
+          if (asinVarVals) { try { Object.assign(asinDimMap, JSON.parse(asinVarVals[1])); } catch {} }
+
+          // B) asinToDimension fallback
+          if (!Object.keys(asinDimMap).length) {
+            const a2d = html.match(/"asinToDimension"\s*:\s*(\{[\s\S]*?\})(?=\s*,\s*"[a-zA-Z])/);
+            if (a2d) { try { Object.assign(asinDimMap, JSON.parse(a2d[1])); } catch {} }
           }
 
-          // Try merchantCustomerPreference or offerListings for per-ASIN prices
-          const offerMatch = html.match(/"offerListings"\s*:\s*(\[[\s\S]*?\])\s*,\s*"[a-zA-Z]/);
-          if (offerMatch) {
+          // C) priceToAsinList  { "29.99": ["ASIN1","ASIN2"], ... }
+          const p2a = html.match(/"priceToAsinList"\s*:\s*(\{[\s\S]*?\})(?=\s*,\s*"[a-zA-Z])/);
+          if (p2a) {
             try {
-              const offers = JSON.parse(offerMatch[1]);
-              offers.forEach(o => { if (o.asin && o.price?.amount) asinPriceMap[o.asin] = String(o.price.amount); });
+              const pa = JSON.parse(p2a[1]);
+              for (const [price, asins] of Object.entries(pa)) {
+                if (Array.isArray(asins)) asins.forEach(a => { if (!asinPriceMap[a]) asinPriceMap[a] = price; });
+              }
             } catch {}
           }
 
-          // 6) Build variation groups
+          // D) offerListings  [ { asin, price: { amount } }, ... ]
+          const offerM = html.match(/"offerListings"\s*:\s*(\[[\s\S]*?\])(?=\s*,\s*"[a-zA-Z])/);
+          if (offerM) {
+            try {
+              JSON.parse(offerM[1]).forEach(o => {
+                if (o.asin && o.price?.amount) asinPriceMap[o.asin] = String(o.price.amount);
+              });
+            } catch {}
+          }
+
+          // E) Inline "asin":"B0XX","price":N patterns scattered in scripts
+          [...html.matchAll(/"asin"\s*:\s*"([A-Z0-9]{10})"[^{}]{0,200}"amount"\s*:\s*([\d.]+)/g)]
+            .forEach(m => { if (!asinPriceMap[m[1]]) asinPriceMap[m[1]] = m[2]; });
+
+          // F) unavailableAsinSet / inStockAsinSet
+          const unavailM = html.match(/"unavailableAsinSet"\s*:\s*(\[[\s\S]*?\])/);
+          if (unavailM) { try { JSON.parse(unavailM[1]).forEach(a => { asinStockMap[a] = false; }); } catch {} }
+          const inStockM = html.match(/"inStockAsinSet"\s*:\s*(\[[\s\S]*?\])/);
+          if (inStockM) { try { JSON.parse(inStockM[1]).forEach(a => { asinStockMap[a] = true; }); } catch {} }
+
+          // G) buyability / availability text per ASIN
+          [...html.matchAll(/"asin"\s*:\s*"([A-Z0-9]{10})"[^{}]{0,400}"buyability"\s*:\s*"([^"]+)"/g)]
+            .forEach(m => { if (asinStockMap[m[1]] === undefined) asinStockMap[m[1]] = m[2] === 'BUYABLE'; });
+
+          // Helper — find ASIN for a single dimension value
+          function findAsin(dimKey, val) {
+            for (const [asin, dims] of Object.entries(asinDimMap)) {
+              if (dims[dimKey] === val) return asin;
+            }
+            return null;
+          }
+
+          // ─────────────────────────────────────────────────────────
+          // 6) Build variation groups with per-variant price + stock
+          // ─────────────────────────────────────────────────────────
           const dimKeyToLabel = {
-            'color_name': 'Color', 'size_name': 'Size', 'style_name': 'Style',
-            'material_type': 'Material', 'pattern_name': 'Pattern',
-            'configuration_name': 'Configuration', 'edition_name': 'Edition',
+            'color_name':'Color','size_name':'Size','style_name':'Style',
+            'material_type':'Material','pattern_name':'Pattern',
+            'configuration_name':'Configuration','edition_name':'Edition',
+            'item_package_quantity':'Package Quantity','scent_name':'Scent',
+            'flavor_name':'Flavor',
           };
 
           for (const [dimKey, values] of Object.entries(variationData)) {
             if (!Array.isArray(values) || !values.length) continue;
-            const label = dimKeyToLabel[dimKey] || dimNameMatches.find(m => m[1].toLowerCase().includes(dimKey.split('_')[0]))?.[ 1] || dimKey.replace(/_name$/,'').replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
-            
+            const label = dimKeyToLabel[dimKey]
+              || dimNameMatches.find(m => m[1].toLowerCase().includes(dimKey.split('_')[0]))?.[1]
+              || dimKey.replace(/_name$/,'').replace(/_/g,' ').replace(/\b\w/g, c => c.toUpperCase());
+
             const varValues = values.map(val => {
               const strVal = String(val);
-              const img = dimKey === 'color_name' ? (colorImgMap[strVal] || '') : '';
-              // Find price for this variant if available
-              let varPrice = product.price;
-              for (const [asin, dims] of Object.entries(asinDimMap)) {
-                if (dims[dimKey] === strVal && asinPriceMap[asin]) { varPrice = asinPriceMap[asin]; break; }
-              }
-              return { value: strVal, price: varPrice, stock: 10, image: img, enabled: true };
+              const img    = dimKey === 'color_name' ? (colorImgMap[strVal] || '') : '';
+              const asin   = findAsin(dimKey, strVal);
+
+              // Price: per-ASIN if found, else base product price
+              const varPrice = (asin && asinPriceMap[asin]) ? asinPriceMap[asin] : (product.price || '0');
+
+              // Stock: per-ASIN if found, else default 10
+              let inStock = true;
+              if (asin && asinStockMap[asin] !== undefined) inStock = asinStockMap[asin];
+              const stock = inStock ? 10 : 0;
+
+              return {
+                value:       strVal,
+                price:       varPrice,
+                sourcePrice: varPrice,   // preserve original for margin calc
+                stock,
+                inStock,
+                asin:        asin || '',
+                image:       img,
+                enabled:     inStock,    // auto-disable out-of-stock variants
+              };
             });
 
             product.variations.push({ name: label, values: varValues });
-
-            // Build variation image map for Color
             if (dimKey === 'color_name' && Object.keys(colorImgMap).length) {
               product.variationImages['Color'] = colorImgMap;
             }
           }
 
           product.hasVariations = product.variations.length > 0;
+
+          // Set base price to cheapest available variant
+          if (product.hasVariations) {
+            const avail = product.variations.flatMap(vg => vg.values)
+              .filter(v => v.inStock !== false && parseFloat(v.price) > 0)
+              .map(v => parseFloat(v.price));
+            if (avail.length) product.price = Math.min(...avail).toFixed(2);
+          }
 
           // 7) Description from bullet points
           const bullets = [...html.matchAll(/<span class="a-list-item">\s*([\s\S]*?)\s*<\/span>/g)]
