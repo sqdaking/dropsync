@@ -757,6 +757,7 @@ module.exports = async (req, res) => {
         else if (/\b(jumpsuit|romper|playsuit|overalls)\b/.test(tx)) CAT(152763,'Jumpsuits Rompers');
         else if (/\b(men.?s jacket|puffer jacket|bomber jacket|denim jacket|parka|anorak|windbreaker|rain jacket)\b/.test(tx)) CAT(57988,'Men Jackets Coats');
         else if (/\b(women.?s jacket|women.?s coat|blazer|trench coat)\b/.test(tx)) CAT(63862,'Women Jackets');
+        else if (/\b(wide.?leg pant|wide leg trouser|palazzo|culottes)\b/.test(tx)) CAT(63862,'Women Wide Leg Pants');
         else if (/\b(suit|tuxedo|blazer jacket)\b/.test(tx)) CAT(3001,'Men Suits');
         else if (/\b(vest|waistcoat)\b/.test(tx)) CAT(11476,'Vests');
         else if (/\b(compression|rash guard|swim shirt|uv shirt)\b/.test(tx)) CAT(185100,'Athletic Shirts');
@@ -1401,8 +1402,17 @@ function buildCombos(variations) {
 }
 
 function getVarImages(combo, variationImages, fallback) {
-  const imgs = [];
-  if (variationImages) for (const v of combo) { const gi = variationImages[v.name]; if (gi?.[v.value]) imgs.push(gi[v.value]); }
-  for (const v of combo) if (v.image) imgs.push(v.image);
-  return [...new Set([...imgs, ...(fallback||[])])];
+  // Try to find a variant-specific image (e.g. color image)
+  if (variationImages) {
+    for (const v of combo) {
+      const img = variationImages[v.name]?.[v.value];
+      if (img) return [img]; // one image only
+    }
+  }
+  // Try inline image on combo value
+  for (const v of combo) {
+    if (v.image) return [v.image];
+  }
+  // Fallback to first product image
+  return fallback?.[0] ? [fallback[0]] : [];
 }
