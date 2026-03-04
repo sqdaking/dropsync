@@ -857,10 +857,15 @@ module.exports = async (req, res) => {
           },
         }),
       });
-      if (!groupRes.ok) return res.status(400).json({ error: 'Group failed', details: await groupRes.text() });
+      if (!groupRes.ok) {
+        const groupErr = await groupRes.text();
+        console.log('groupRes failed:', groupRes.status, groupErr.slice(0,300));
+        return res.status(400).json({ error: 'Group failed', details: groupErr });
+      }
+      console.log('groupRes ok:', groupRes.status);
 
       // Get real merchant location key from eBay account
-      let merchantLocationKey = 'default';
+      let merchantLocationKey = null;
       try {
         const locRes = await fetch(`${EBAY_API}/sell/inventory/v1/location`, { headers: authHeader });
         const locData = await locRes.json();
@@ -868,13 +873,16 @@ module.exports = async (req, res) => {
         if (locData.locations?.length) {
           merchantLocationKey = locData.locations[0].merchantLocationKey;
         } else {
-          // Create a default location if none exist
-          await fetch(`${EBAY_API}/sell/inventory/v1/location/default`, {
+          // Try to create a default location
+          const createRes = await fetch(`${EBAY_API}/sell/inventory/v1/location/MainWarehouse`, {
             method: 'POST', headers: authHeader,
-            body: JSON.stringify({ location: { address: { country: 'US' } }, locationTypes: ['WAREHOUSE'], name: 'Default', merchantLocationStatus: 'ENABLED' })
+            body: JSON.stringify({ location: { address: { country: 'US' } }, locationTypes: ['WAREHOUSE'], name: 'Main Warehouse', merchantLocationStatus: 'ENABLED' })
           });
+          const createData = await createRes.json();
+          console.log('location create status:', createRes.status, JSON.stringify(createData).slice(0,200));
+          if (createRes.ok) merchantLocationKey = 'MainWarehouse';
         }
-      } catch(e) { console.log('location fetch error:', e.message); }
+      } catch(e) { console.log('location error:', e.message); }
       console.log('merchantLocationKey:', merchantLocationKey);
       const baseOffer = buildOffer(groupSku, product, policies, merchantLocationKey);
       delete baseOffer.sku;
@@ -934,8 +942,9 @@ module.exports = async (req, res) => {
   }
 };
 
-function buildOffer(sku, product, policies = {}, merchantLocationKey = 'default') {
-  const p = { sku, marketplaceId:'EBAY_US', format:'FIXED_PRICE', listingDuration:'GTC', pricingSummary:{ price:{ value:String(parseFloat(product.price||0).toFixed(2)), currency:'USD' } }, categoryId:product.categoryId||'9355', merchantLocationKey };
+function buildOffer(sku, product, policies = {}, merchantLocationKey = null) {
+  const p = { sku, marketplaceId:'EBAY_US', format:'FIXED_PRICE', listingDuration:'GTC', pricingSummary:{ price:{ value:String(parseFloat(product.price||0).toFixed(2)), currency:'USD' } }, categoryId:product.categoryId||'9355' };
+  if (merchantLocationKey) p.merchantLocationKey = merchantLocationKey;
   if (process.env.EBAY_FULFILLMENT_POLICY_ID) p.fulfillmentPolicyId = process.env.EBAY_FULFILLMENT_POLICY_ID;
   if (process.env.EBAY_PAYMENT_POLICY_ID)     p.paymentPolicyId     = process.env.EBAY_PAYMENT_POLICY_ID;
   if (process.env.EBAY_RETURN_POLICY_ID)      p.returnPolicyId      = process.env.EBAY_RETURN_POLICY_ID;
