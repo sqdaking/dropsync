@@ -908,7 +908,7 @@ module.exports = async (req, res) => {
       };
       if (policies.fulfillmentPolicyId) offerBase.fulfillmentPolicyId = policies.fulfillmentPolicyId;
       if (policies.paymentPolicyId)     offerBase.paymentPolicyId     = policies.paymentPolicyId;
-      if (policies.returnPolicyId)      offerBase.returnPolicyId      = policies.returnPolicyId;
+      if (validReturnPolicyId)          offerBase.returnPolicyId      = validReturnPolicyId;
 
       const offerIds = [];
       const offerRequests = createdSkus.map((varSku, i) => {
@@ -941,6 +941,32 @@ module.exports = async (req, res) => {
       }
       console.log(`Created ${offerIds.length}/${createdSkus.length} offers`);
       if (!offerIds.length) return res.status(400).json({ error: 'No offers created — check category ID and policies' });
+
+      // Ensure return policy is valid — create a fresh one via API if needed
+      let validReturnPolicyId = policies.returnPolicyId;
+      if (validReturnPolicyId) {
+        const rpCheck = await fetch(`${EBAY_API}/sell/account/v1/return_policy/${validReturnPolicyId}`, { headers: authHeader });
+        const rpData = await rpCheck.json();
+        console.log('returnPolicy check:', JSON.stringify(rpData).slice(0,400));
+        // If returnsAccepted is missing/false, create a fresh policy
+        if (!rpData.returnsAccepted) {
+          const rpCreate = await fetch(`${EBAY_API}/sell/account/v1/return_policy`, {
+            method: 'POST', headers: authHeader,
+            body: JSON.stringify({
+              name: 'DropSync Returns Policy',
+              marketplaceId: 'EBAY_US',
+              categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
+              returnsAccepted: true,
+              returnPeriod: { value: 30, unit: 'DAY' },
+              refundMethod: 'MONEY_BACK',
+              returnShippingCostPayer: 'BUYER',
+            })
+          });
+          const rpNew = await rpCreate.json();
+          console.log('created return policy:', JSON.stringify(rpNew).slice(0,300));
+          if (rpNew.returnPolicyId) validReturnPolicyId = rpNew.returnPolicyId;
+        }
+      }
 
       // Debug: fetch the actual return policy to see what eBay sees
       if (policies.returnPolicyId) {
