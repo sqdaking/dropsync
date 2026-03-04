@@ -871,6 +871,22 @@ module.exports = async (req, res) => {
       return res.json({ success:true, sku:groupSku, offerId:offerData.offerId, listingId:pubData.listingId, variationsCreated:createdSkus.length });
     }
 
+    if (action === 'policies') {
+      const token = req.query.access_token || body.access_token;
+      if (!token) return res.status(400).json({ error: 'No token' });
+      const h = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
+      const [fp, pp, rp] = await Promise.all([
+        fetch(`${EBAY_API}/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US`, { headers: h }).then(r => r.json()),
+        fetch(`${EBAY_API}/sell/account/v1/payment_policy?marketplace_id=EBAY_US`, { headers: h }).then(r => r.json()),
+        fetch(`${EBAY_API}/sell/account/v1/return_policy?marketplace_id=EBAY_US`, { headers: h }).then(r => r.json()),
+      ]);
+      return res.json({
+        fulfillment: (fp.fulfillmentPolicies || []).map(p => ({ id: p.fulfillmentPolicyId, name: p.name })),
+        payment:     (pp.paymentPolicies    || []).map(p => ({ id: p.paymentPolicyId,     name: p.name })),
+        return:      (rp.returnPolicies     || []).map(p => ({ id: p.returnPolicyId,      name: p.name })),
+      });
+    }
+
     if (action === 'orders') {
       const token = req.query.access_token || body.access_token;
       const r = await fetch(`${EBAY_API}/sell/fulfillment/v1/order?limit=50`, { headers: { Authorization:`Bearer ${token}` } });
