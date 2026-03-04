@@ -929,7 +929,7 @@ module.exports = async (req, res) => {
         if (rpNew.returnPolicyId) validReturnPolicyId = rpNew.returnPolicyId;
       } catch(e) { console.log('return policy error:', e.message); }
 
-      // Step 3: bulkCreateOffer — 25 at a time (much faster than one per call)
+      // Step 3: bulkCreateOffer — 25 at a time
       const offerBase = {
         marketplaceId: 'EBAY_US',
         format: 'FIXED_PRICE',
@@ -940,7 +940,8 @@ module.exports = async (req, res) => {
       };
       if (policies.fulfillmentPolicyId) offerBase.fulfillmentPolicyId = policies.fulfillmentPolicyId;
       if (policies.paymentPolicyId)     offerBase.paymentPolicyId     = policies.paymentPolicyId;
-      if (validReturnPolicyId)          offerBase.returnPolicyId      = validReturnPolicyId;
+      // Intentionally omit returnPolicyId — eBay will use account default
+      // (returnPolicyId validation is broken for multi-variation listings)
 
       const offerIds = [];
       const offerRequests = createdSkus.map((varSku, i) => {
