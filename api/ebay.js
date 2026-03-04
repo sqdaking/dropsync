@@ -798,27 +798,25 @@ module.exports = async (req, res) => {
 
       // Multi-variation listing — eBay hard limit is 250 variations
       let combos = buildCombos(product.variations);
-      if (combos.length > 250) {
-        // Prioritize in-stock combos first, then trim to 250
+      if (combos.length > 100) {
         const inStock = combos.filter(c => c.every(v => (v.stock||0) > 0));
         const outStock = combos.filter(c => c.some(v => (v.stock||0) === 0));
-        combos = [...inStock, ...outStock].slice(0, 250);
-        console.log(`Trimmed combos from ${combos.length+outStock.length} to 250 (eBay limit)`);
+        combos = [...inStock, ...outStock].slice(0, 100);
+        console.log(`Trimmed combos to 100 (timeout prevention)`);
       }
       const createdSkus = [];
       let firstSkuError = null;
       const usedSkus = new Set();
+      const comboList = [];
 
+      // Build all varSku data first
       for (const [comboIdx, combo] of combos.entries()) {
-        // Skip only if EXPLICITLY disabled (not just out of stock — eBay wants quantity=0, not skipped)
         if (combo.every(v => v.enabled === false)) continue;
-        // Build a clean SKU — sanitize each value segment
         const skuSegments = combo.map(v => {
           const clean = String(v.value||'').replace(/[^a-zA-Z0-9]/g,'').slice(0,6).toUpperCase();
           return clean || 'VAR';
         });
         let varSku = `${varSkuBase}${skuSegments.join('').slice(0,16)}`;
-        // Guarantee uniqueness
         if (usedSkus.has(varSku)) varSku = `${varSkuBase}${String(comboIdx).padStart(4,'0')}`;
         usedSkus.add(varSku);
         const varPrice = combo.reduce((p,v) => v.price || p, product.price);
@@ -826,23 +824,30 @@ module.exports = async (req, res) => {
         const varImages = getVarImages(combo, product.variationImages, product.images);
         const varAspects = { ...(product.aspects||{}) };
         combo.forEach(v => { varAspects[v.name] = [v.value]; });
+        comboList.push({ varSku, varPrice, varStock, varImages, varAspects, combo });
+      }
 
-        const invRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(varSku)}`, {
-          method: 'PUT', headers: authHeader,
-          body: JSON.stringify({
-            availability: { shipToLocationAvailability: { quantity: Math.max(0, parseInt(varStock)||0) } },
-            condition: product.condition || 'NEW',
-            product: { title: product.title.slice(0,80), description: product.description||product.title, imageUrls: varImages.slice(0,12), aspects: varAspects },
-          }),
-        });
-        if (invRes.ok) {
-          createdSkus.push(varSku);
-          if (createdSkus.length === 1) console.log('first varSku ok:', varSku);
-        } else {
-          const errText = await invRes.text();
-          console.error('varSku failed:', varSku, errText.slice(0,200));
-          if (!firstSkuError) firstSkuError = { sku: varSku, status: invRes.status, body: errText.slice(0, 500) };
-        }
+      // Create inventory items in parallel batches of 10
+      for (let i = 0; i < comboList.length; i += 10) {
+        const batch = comboList.slice(i, i + 10);
+        await Promise.all(batch.map(async ({ varSku, varStock, varImages, varAspects }) => {
+          const invRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(varSku)}`, {
+            method: 'PUT', headers: authHeader,
+            body: JSON.stringify({
+              availability: { shipToLocationAvailability: { quantity: Math.max(0, parseInt(varStock)||0) } },
+              condition: product.condition || 'NEW',
+              product: { title: product.title.slice(0,80), description: product.description||product.title, imageUrls: varImages.slice(0,12), aspects: varAspects },
+            }),
+          });
+          if (invRes.ok) {
+            createdSkus.push(varSku);
+            if (createdSkus.length === 1) console.log('first varSku ok:', varSku);
+          } else {
+            const errText = await invRes.text();
+            console.error('varSku failed:', varSku, errText.slice(0,200));
+            if (!firstSkuError) firstSkuError = { sku: varSku, status: invRes.status, body: errText.slice(0,500) };
+          }
+        }));
       }
 
       if (!createdSkus.length) return res.status(400).json({ error: 'No variation SKUs created', details: firstSkuError });
@@ -892,9 +897,7 @@ module.exports = async (req, res) => {
       } catch(e) { console.log('location error:', e.message); }
       console.log('merchantLocationKey:', merchantLocationKey);
 
-      // Step 3: createOffer for each varSku
-      // All offers share same listing-level settings, only sku/price/qty differ
-      const offerIds = [];
+      // Step 3: bulkCreateOffer — 25 at a time (much faster than one per call)
       const offerBase = {
         marketplaceId: 'EBAY_US',
         format: 'FIXED_PRICE',
@@ -907,32 +910,36 @@ module.exports = async (req, res) => {
       if (policies.paymentPolicyId)     offerBase.paymentPolicyId     = policies.paymentPolicyId;
       if (policies.returnPolicyId)      offerBase.returnPolicyId      = policies.returnPolicyId;
 
-      for (const varSku of createdSkus) {
-        // Find the combo for this varSku to get price
-        const comboIdx = createdSkus.indexOf(varSku);
-        const combo = combos[comboIdx];
+      const offerIds = [];
+      const offerRequests = createdSkus.map((varSku, i) => {
+        const combo = combos[i];
         const varPrice = combo ? combo.reduce((p,v) => v.price || p, product.price) : product.price;
         const varStock = combo ? combo.reduce((s,v) => v.stock !== undefined ? v.stock : s, parseInt(product.quantity)||10) : 10;
-
-        const offerBody = {
+        return {
           ...offerBase,
           sku: varSku,
           pricingSummary: { price: { value: String(parseFloat(varPrice||product.price||0).toFixed(2)), currency: 'USD' } },
           availableQuantity: Math.max(0, parseInt(varStock)||0),
         };
+      });
 
-        const offerRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, {
-          method: 'POST', headers: authHeader, body: JSON.stringify(offerBody)
+      // Batch into groups of 25
+      for (let i = 0; i < offerRequests.length; i += 25) {
+        const batch = offerRequests.slice(i, i + 25);
+        const bulkRes = await fetch(`${EBAY_API}/sell/inventory/v1/bulk_create_offer`, {
+          method: 'POST', headers: authHeader,
+          body: JSON.stringify({ requests: batch })
         });
-        const offerData = await offerRes.json();
-        if (offerRes.ok && offerData.offerId) {
-          offerIds.push(offerData.offerId);
-        } else {
-          console.log('offer failed for sku:', varSku, JSON.stringify(offerData).slice(0,300));
+        const bulkData = await bulkRes.json();
+        console.log(`bulk_create_offer batch ${i/25+1}: status ${bulkRes.status}, responses: ${bulkData.responses?.length}`);
+        if (bulkData.responses) {
+          bulkData.responses.forEach(r => {
+            if (r.offerId) offerIds.push(r.offerId);
+            else console.log('offer failed:', JSON.stringify(r).slice(0,200));
+          });
         }
       }
       console.log(`Created ${offerIds.length}/${createdSkus.length} offers`);
-
       if (!offerIds.length) return res.status(400).json({ error: 'No offers created — check category ID and policies' });
 
       // Step 4: publishOfferByInventoryItemGroup
