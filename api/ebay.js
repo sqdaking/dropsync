@@ -904,25 +904,29 @@ module.exports = async (req, res) => {
         const rpListData = await rpList.json();
         const existing = (rpListData.returnPolicies||[]).find(p => p.name === 'DropSync Auto Policy');
         if (existing) {
-          validReturnPolicyId = existing.returnPolicyId;
-          console.log('using existing DropSync policy:', validReturnPolicyId);
-        } else {
-          const rpCreate = await fetch(`${EBAY_API}/sell/account/v1/return_policy`, {
-            method: 'POST', headers: authHeader,
-            body: JSON.stringify({
-              name: 'DropSync Auto Policy',
-              marketplaceId: 'EBAY_US',
-              categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
+          await fetch(`${EBAY_API}/sell/account/v1/return_policy/${existing.returnPolicyId}`, { method: 'DELETE', headers: authHeader });
+        }
+        const rpCreate = await fetch(`${EBAY_API}/sell/account/v1/return_policy`, {
+          method: 'POST', headers: authHeader,
+          body: JSON.stringify({
+            name: 'DropSync Auto Policy',
+            marketplaceId: 'EBAY_US',
+            categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
+            returnsAccepted: true,
+            returnPeriod: { value: 30, unit: 'DAY' },
+            refundMethod: 'MONEY_BACK',
+            returnShippingCostPayer: 'BUYER',
+            internationalOverride: {
               returnsAccepted: true,
               returnPeriod: { value: 30, unit: 'DAY' },
               refundMethod: 'MONEY_BACK',
               returnShippingCostPayer: 'BUYER',
-            })
-          });
-          const rpNew = await rpCreate.json();
-          console.log('created DropSync policy:', JSON.stringify(rpNew).slice(0,300));
-          if (rpNew.returnPolicyId) validReturnPolicyId = rpNew.returnPolicyId;
-        }
+            },
+          })
+        });
+        const rpNew = await rpCreate.json();
+        console.log('DropSync policy:', JSON.stringify(rpNew).slice(0,400));
+        if (rpNew.returnPolicyId) validReturnPolicyId = rpNew.returnPolicyId;
       } catch(e) { console.log('return policy error:', e.message); }
 
       // Step 3: bulkCreateOffer — 25 at a time (much faster than one per call)
