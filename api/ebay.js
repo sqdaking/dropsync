@@ -807,16 +807,20 @@ module.exports = async (req, res) => {
       }
       const createdSkus = [];
       let firstSkuError = null;
+      const usedSkus = new Set();
 
-      for (const combo of combos) {
+      for (const [comboIdx, combo] of combos.entries()) {
         // Skip only if EXPLICITLY disabled (not just out of stock — eBay wants quantity=0, not skipped)
         if (combo.every(v => v.enabled === false)) continue;
         // Build a clean SKU — sanitize each value segment
         const skuSegments = combo.map(v => {
-          const clean = String(v.value||'').replace(/[^a-zA-Z0-9]/g,'').slice(0,8).toUpperCase();
+          const clean = String(v.value||'').replace(/[^a-zA-Z0-9]/g,'').slice(0,6).toUpperCase();
           return clean || 'VAR';
         });
-        const varSku = `${varSkuBase}${skuSegments.join('').slice(0,20)}`;
+        let varSku = `${varSkuBase}${skuSegments.join('').slice(0,16)}`;
+        // Guarantee uniqueness
+        if (usedSkus.has(varSku)) varSku = `${varSkuBase}${String(comboIdx).padStart(4,'0')}`;
+        usedSkus.add(varSku);
         const varPrice = combo.reduce((p,v) => v.price || p, product.price);
         const varStock = combo.reduce((s,v) => v.stock !== undefined ? v.stock : s, parseInt(product.quantity)||10);
         const varImages = getVarImages(combo, product.variationImages, product.images);
