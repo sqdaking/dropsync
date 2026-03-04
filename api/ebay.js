@@ -865,7 +865,7 @@ module.exports = async (req, res) => {
       console.log('groupRes ok:', groupRes.status);
 
       // Get real merchant location key from eBay account
-      let merchantLocationKey = null;
+      let merchantLocationKey = 'default';
       try {
         const locRes = await fetch(`${EBAY_API}/sell/inventory/v1/location`, { headers: authHeader });
         const locData = await locRes.json();
@@ -873,7 +873,7 @@ module.exports = async (req, res) => {
         if (locData.locations?.length) {
           merchantLocationKey = locData.locations[0].merchantLocationKey;
         } else {
-          // Try to create a default location
+          // Try to create a default location — returns 204 No Content on success
           const createRes = await fetch(`${EBAY_API}/sell/inventory/v1/location/MainWarehouse`, {
             method: 'POST', headers: authHeader,
             body: JSON.stringify({
@@ -883,8 +883,7 @@ module.exports = async (req, res) => {
               merchantLocationStatus: 'ENABLED'
             })
           });
-          const createData = await createRes.json();
-          console.log('location create status:', createRes.status, JSON.stringify(createData).slice(0,200));
+          console.log('location create status:', createRes.status);
           merchantLocationKey = createRes.ok ? 'MainWarehouse' : 'default';
         }
       } catch(e) { console.log('location error:', e.message); }
@@ -947,9 +946,8 @@ module.exports = async (req, res) => {
   }
 };
 
-function buildOffer(sku, product, policies = {}, merchantLocationKey = null) {
-  const p = { sku, marketplaceId:'EBAY_US', format:'FIXED_PRICE', listingDuration:'GTC', pricingSummary:{ price:{ value:String(parseFloat(product.price||0).toFixed(2)), currency:'USD' } }, categoryId:product.categoryId||'9355' };
-  if (merchantLocationKey) p.merchantLocationKey = merchantLocationKey;
+function buildOffer(sku, product, policies = {}, merchantLocationKey = 'default') {
+  const p = { sku, marketplaceId:'EBAY_US', format:'FIXED_PRICE', listingDuration:'GTC', pricingSummary:{ price:{ value:String(parseFloat(product.price||0).toFixed(2)), currency:'USD' } }, categoryId:product.categoryId||'9355', merchantLocationKey };
   if (process.env.EBAY_FULFILLMENT_POLICY_ID) p.fulfillmentPolicyId = process.env.EBAY_FULFILLMENT_POLICY_ID;
   if (process.env.EBAY_PAYMENT_POLICY_ID)     p.paymentPolicyId     = process.env.EBAY_PAYMENT_POLICY_ID;
   if (process.env.EBAY_RETURN_POLICY_ID)      p.returnPolicyId      = process.env.EBAY_RETURN_POLICY_ID;
