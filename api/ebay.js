@@ -92,6 +92,30 @@ module.exports = async (req, res) => {
     // ═══════════════════════════════════════════════════════════
     // SCRAPE — full variation + image + price extraction
     // ═══════════════════════════════════════════════════════════
+    // Parent snippet — checks what's on the parent ASIN page
+    if (action === 'parent') {
+      let url = req.query.url || body.url;
+      if (!url) return res.json({ error: 'No URL' });
+      const asinM = url.match(/\/dp\/([A-Z0-9]{10})/);
+      if (!asinM) return res.json({ error: 'No ASIN found' });
+      // First fetch landing to get parentAsin
+      const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36';
+      const r1 = await fetch(`https://www.amazon.com/dp/${asinM[1]}`, { headers: { 'User-Agent': ua, 'Accept': 'text/html', 'Accept-Language': 'en-US,en;q=0.9' } });
+      const h1 = await r1.text();
+      const pM = h1.match(/parentAsin[=:&"']+([A-Z0-9]{10})/);
+      const parentAsin = pM ? pM[1] : null;
+      if (!parentAsin) return res.json({ error: 'No parentAsin found', landingSize: h1.length });
+      // Fetch parent page
+      const r2 = await fetch(`https://www.amazon.com/dp/${parentAsin}`, { headers: { 'User-Agent': ua, 'Accept': 'text/html', 'Accept-Language': 'en-US,en;q=0.9' } });
+      const h2 = await r2.text();
+      const snippets = {};
+      for (const key of ['updateDivLists','asinVariationValues','priceToAsinList','colorImages','variationValues','unavailableAsinSet']) {
+        const idx = h2.indexOf(key);
+        snippets[key] = idx >= 0 ? h2.slice(idx, idx + 800) : 'NOT FOUND';
+      }
+      return res.json({ parentAsin, landingSize: h1.length, parentSize: h2.length, snippets });
+    }
+
     // Snippet action — dumps raw HTML around key Amazon data blocks
     if (action === 'snippet') {
       let url = req.query.url || body.url;
