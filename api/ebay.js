@@ -730,7 +730,11 @@ module.exports = async (req, res) => {
 
       // SKU must be alphanumeric + hyphens only, max 50 chars
       const groupSku = `DS${Date.now()}${Math.random().toString(36).slice(2,6).toUpperCase()}`;
-      const policies = { fulfillmentPolicyId: body.fulfillmentPolicyId, paymentPolicyId: body.paymentPolicyId, returnPolicyId: body.returnPolicyId };
+      const policies = {
+        fulfillmentPolicyId: (body.fulfillmentPolicyId||'').split('?')[0].trim(),
+        paymentPolicyId:     (body.paymentPolicyId||'').split('?')[0].trim(),
+        returnPolicyId:      (body.returnPolicyId||'').split('?')[0].trim(),
+      };
       const authHeader = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
 
       // Simple listing — no variations
