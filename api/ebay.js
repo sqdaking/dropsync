@@ -891,8 +891,8 @@ module.exports = async (req, res) => {
       } catch(e) { console.log('location error:', e.message); }
       console.log('merchantLocationKey:', merchantLocationKey);
       const baseOffer = buildOffer(groupSku, product, policies, merchantLocationKey);
-      delete baseOffer.sku; // variation offers use inventoryItemGroupKey, not sku
-      const offerBody = { ...baseOffer, inventoryItemGroupKey: groupSku };
+      // For multi-variation listings, sku = inventoryItemGroupKey (don't use inventoryItemGroupKey field)
+      const offerBody = baseOffer; // sku is already set to groupSku by buildOffer
       console.log('groupSku:', groupSku);
       console.log('offerBody keys:', Object.keys(offerBody));
       console.log('offerBody:', JSON.stringify(offerBody).slice(0, 500));
