@@ -738,8 +738,8 @@ module.exports = async (req, res) => {
         const CAT = (id, label) => { product.categoryId = String(id); console.log(`auto-cat [${id}] ${label} — "${product.title?.slice(0,50)}"`); };
 
         // ── CLOTHING ────────────────────────────────────────────────────
-        if      (/\b(men.?s jean|boy.?s jean|denim pant|slim fit jean|skinny jean|straight leg jean|relaxed fit jean|bootcut)\b/.test(tx)) CAT(11554,'Men Jeans');
-        else if (/\b(women.?s jean|girl.?s jean|ladies jean|jegging)\b/.test(tx)) CAT(11555,'Women Jeans');
+        if      (/\b(men.?s jean|boy.?s jean|denim pant|men.?s skinny jean|men.?s straight|men.?s slim jean|bootcut)\b/.test(tx)) CAT(11554,'Men Jeans');
+        else if (/\b(women.?s jean|girl.?s jean|ladies jean|jegging|skinny jean|high waist jean|plus size jean|womens jean|womens skinny|high waisted jean)\b/.test(tx)) CAT(11555,'Women Jeans');
         else if (/\b(yoga pant|yoga legging|legging|athletic pant|workout pant|jogger|sweatpant|trackpant|lounge pant|capri pant|capris|cargo pant|cargo capri|palazzo|culottes|wide leg pant|women.?s pant|women.?s trouser|ladies pant)\b/.test(tx)) CAT(63862,'Women Pants');
         else if (/\b(men.?s pant|men.?s trouser|dress pant|chino|khaki|cargo short|slack)\b/.test(tx)) CAT(57989,'Men Pants');
         else if (/\b(men.?s short|board short|cargo short|swim trunk|swim short)\b/.test(tx)) CAT(15689,'Men Shorts');
@@ -1284,26 +1284,9 @@ module.exports = async (req, res) => {
         pubStatus = pubRes.status;
         console.log(`publishByGroup attempt ${attempt}:`, pubStatus, JSON.stringify(pubData).slice(0,500));
         if (pubRes.ok) break;
-        if (pubStatus === 500) { await new Promise(r => setTimeout(r, 3000 * attempt)); continue; }
-
-        // Category doesn't support multi-variation — fall back to individual listings
-        const noMultiVar = (pubData.errors||[]).some(e => e.errorId === 25005);
-        if (noMultiVar) {
-          console.log('Category does not support multi-variation — publishing individual offers');
-          const indivIds = [];
-          for (const offerId of offerIds) {
-            const pubOne = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerId}/publish`, {
-              method: 'POST', headers: authHeader,
-            });
-            const pubOneData = await pubOne.json();
-            if (pubOne.ok && pubOneData.listingId) indivIds.push(pubOneData.listingId);
-            else console.log('indiv publish failed:', offerId, JSON.stringify(pubOneData).slice(0,200));
-          }
-          console.log(`Individual publish: ${indivIds.length}/${offerIds.length} succeeded`);
-          if (indivIds.length > 0) {
-            return res.json({ success:true, sku:groupSku, listingId:indivIds[0], variationsCreated:indivIds.length, mode:'individual' });
-          }
-          return res.status(400).json({ error: 'Individual publish also failed', details: pubData });
+        if (pubStatus === 500) {
+          await new Promise(r => setTimeout(r, 3000 * attempt));
+          continue;
         }
 
         // If missing item specifics — fill them in and retry via updateOffer
