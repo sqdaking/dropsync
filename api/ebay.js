@@ -956,8 +956,7 @@ module.exports = async (req, res) => {
       };
       if (policies.fulfillmentPolicyId) offerBase.fulfillmentPolicyId = policies.fulfillmentPolicyId;
       if (policies.paymentPolicyId)     offerBase.paymentPolicyId     = policies.paymentPolicyId;
-      // Intentionally omit returnPolicyId — eBay will use account default
-      // (returnPolicyId validation is broken for multi-variation listings)
+      if (validReturnPolicyId)          offerBase.returnPolicyId      = validReturnPolicyId;
 
       const offerIds = [];
       const offerRequests = createdSkus.map((varSku, i) => {
