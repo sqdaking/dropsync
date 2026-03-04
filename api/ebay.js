@@ -727,6 +727,7 @@ module.exports = async (req, res) => {
       if (!access_token || !product) return res.status(400).json({ error: 'Missing fields' });
 
       const groupSku = `DS-${Date.now()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`;
+      const policies = { fulfillmentPolicyId: body.fulfillmentPolicyId, paymentPolicyId: body.paymentPolicyId, returnPolicyId: body.returnPolicyId };
       const authHeader = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
 
       // Simple listing — no variations
@@ -740,7 +741,7 @@ module.exports = async (req, res) => {
           }),
         });
         if (!invRes.ok) return res.status(400).json({ error: 'Inventory failed', details: await invRes.text() });
-        const offerRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, { method:'POST', headers:authHeader, body:JSON.stringify(buildOffer(groupSku, product)) });
+        const offerRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, { method:'POST', headers:authHeader, body:JSON.stringify(buildOffer(groupSku, product, policies)) });
         const offerData = await offerRes.json();
         if (!offerRes.ok) return res.status(400).json({ error: 'Offer failed', details: offerData });
         const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerData.offerId}/publish`, { method:'POST', headers:authHeader });
@@ -776,7 +777,7 @@ module.exports = async (req, res) => {
           }),
         });
         if (!invRes.ok) return res.status(400).json({ error: 'Inventory failed', details: await invRes.text() });
-        const offerRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, { method:'POST', headers:authHeader, body:JSON.stringify(buildOffer(groupSku, product)) });
+        const offerRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, { method:'POST', headers:authHeader, body:JSON.stringify(buildOffer(groupSku, product, policies)) });
         const offerData = await offerRes.json();
         if (!offerRes.ok) return res.status(400).json({ error: 'Offer failed', details: offerData });
         const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerData.offerId}/publish`, { method:'POST', headers:authHeader });
@@ -851,7 +852,7 @@ module.exports = async (req, res) => {
       });
       if (!groupRes.ok) return res.status(400).json({ error: 'Group failed', details: await groupRes.text() });
 
-      const offerBody = { ...buildOffer(groupSku, product), inventoryItemGroupKey: groupSku };
+      const offerBody = { ...buildOffer(groupSku, product, policies), inventoryItemGroupKey: groupSku };
       delete offerBody.sku;
       const offerRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, { method:'POST', headers:authHeader, body:JSON.stringify(offerBody) });
       const offerData = await offerRes.json();
@@ -882,15 +883,15 @@ module.exports = async (req, res) => {
   }
 };
 
-function buildOffer(sku, product) {
+function buildOffer(sku, product, policies = {}) {
   const p = { sku, marketplaceId:'EBAY_US', format:'FIXED_PRICE', listingDuration:'GTC', pricingSummary:{ price:{ value:String(parseFloat(product.price||0).toFixed(2)), currency:'USD' } }, categoryId:product.categoryId||'9355', merchantLocationKey:'default' };
   if (process.env.EBAY_FULFILLMENT_POLICY_ID) p.fulfillmentPolicyId = process.env.EBAY_FULFILLMENT_POLICY_ID;
   if (process.env.EBAY_PAYMENT_POLICY_ID)     p.paymentPolicyId     = process.env.EBAY_PAYMENT_POLICY_ID;
   if (process.env.EBAY_RETURN_POLICY_ID)      p.returnPolicyId      = process.env.EBAY_RETURN_POLICY_ID;
   // Source rules from frontend override env vars
-  if (body.fulfillmentPolicyId) p.fulfillmentPolicyId = body.fulfillmentPolicyId;
-  if (body.paymentPolicyId)     p.paymentPolicyId     = body.paymentPolicyId;
-  if (body.returnPolicyId)      p.returnPolicyId      = body.returnPolicyId;
+  if (policies.fulfillmentPolicyId) p.fulfillmentPolicyId = policies.fulfillmentPolicyId;
+  if (policies.paymentPolicyId)     p.paymentPolicyId     = policies.paymentPolicyId;
+  if (policies.returnPolicyId)      p.returnPolicyId      = policies.returnPolicyId;
   return p;
 }
 
