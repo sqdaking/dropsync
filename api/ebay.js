@@ -738,8 +738,8 @@ module.exports = async (req, res) => {
         const CAT = (id, label) => { product.categoryId = String(id); console.log(`auto-cat [${id}] ${label} — "${product.title?.slice(0,50)}"`); };
 
         // ── CLOTHING ────────────────────────────────────────────────────
-        if      (/\b(men.?s jean|boy.?s jean|denim pant|men.?s skinny jean|men.?s straight|men.?s slim jean|bootcut)\b/.test(tx)) CAT(11554,'Men Jeans');
-        else if (/\b(women.?s jean|girl.?s jean|ladies jean|jegging|skinny jean|high waist jean|plus size jean|womens jean|womens skinny|high waisted jean)\b/.test(tx)) CAT(11555,'Women Jeans');
+        if      (/\b(men.?s jeans?|boy.?s jeans?|denim pant|men.?s skinny|men.?s straight|men.?s slim jean|bootcut)\b/.test(tx)) CAT(11554,'Men Jeans');
+        else if (/\b(women.?s jeans?|girl.?s jeans?|ladies jeans?|jegging|skinny jeans?|high waist jeans?|plus size jeans?|womens jeans?|womens skinny|high waisted jeans?)\b/.test(tx)) CAT(11555,'Women Jeans');
         else if (/\b(yoga pant|yoga legging|legging|athletic pant|workout pant|jogger|sweatpant|trackpant|lounge pant|capri pant|capris|cargo pant|cargo capri|palazzo|culottes|wide leg pant|women.?s pant|women.?s trouser|ladies pant)\b/.test(tx)) CAT(63862,'Women Pants');
         else if (/\b(men.?s pant|men.?s trouser|dress pant|chino|khaki|cargo short|slack)\b/.test(tx)) CAT(57989,'Men Pants');
         else if (/\b(men.?s short|board short|cargo short|swim trunk|swim short)\b/.test(tx)) CAT(15689,'Men Shorts');
@@ -948,6 +948,10 @@ module.exports = async (req, res) => {
 
         // ── FALLBACK ─────────────────────────────────────────────────────
         else if (/\b(clothing|apparel|fashion|outfit|wear|garment)\b/.test(tx)) CAT(11450,'General Clothing');
+        // Last-resort fallback — use a multi-variation safe general category
+        else if (/\bjeans?\b/.test(tx) && /\bwom|girl|lad|female/.test(tx)) CAT(11555,'Women Jeans — fallback');
+        else if (/\bjeans?\b/.test(tx)) CAT(11554,'Men Jeans — fallback');
+        else if (/\bpant|trouser|legging|short\b/.test(tx) && /\bwom|girl|lad|female/.test(tx)) CAT(63862,'Women Pants — fallback');
         else CAT(11450,'General — fallback');
       }
 
