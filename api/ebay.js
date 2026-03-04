@@ -740,7 +740,7 @@ module.exports = async (req, res) => {
         // ── CLOTHING ────────────────────────────────────────────────────
         if      (/\b(men.?s jean|boy.?s jean|denim pant|slim fit jean|skinny jean|straight leg jean|relaxed fit jean|bootcut)\b/.test(tx)) CAT(11554,'Men Jeans');
         else if (/\b(women.?s jean|girl.?s jean|ladies jean|jegging)\b/.test(tx)) CAT(11555,'Women Jeans');
-        else if (/\b(yoga pant|yoga legging|legging|athletic pant|workout pant|jogger|sweatpant|trackpant|lounge pant|capri pant|cargo pant|cargo capri|palazzo|culottes|wide leg pant|women.?s pant|women.?s trouser|ladies pant)\b/.test(tx)) CAT(63862,'Women Pants');
+        else if (/\b(yoga pant|yoga legging|legging|athletic pant|workout pant|jogger|sweatpant|trackpant|lounge pant|capri pant|capris|cargo pant|cargo capri|palazzo|culottes|wide leg pant|women.?s pant|women.?s trouser|ladies pant)\b/.test(tx)) CAT(63862,'Women Pants');
         else if (/\b(men.?s pant|men.?s trouser|dress pant|chino|khaki|cargo short|slack)\b/.test(tx)) CAT(57989,'Men Pants');
         else if (/\b(men.?s short|board short|cargo short|swim trunk|swim short)\b/.test(tx)) CAT(15689,'Men Shorts');
         else if (/\b(women.?s short|biker short|high waist short)\b/.test(tx)) CAT(11555,'Women Shorts');
@@ -1050,6 +1050,32 @@ module.exports = async (req, res) => {
         else                                                          product.aspects['Department'] = ['Unisex'];
       }
 
+      if (!product.aspects['Type']) {
+        const cat = product.categoryId;
+        const t3  = tx2;
+        let type = null;
+        if      (/capri|cropped/.test(t3))                type = 'Capri';
+        else if (/cargo/.test(t3))                        type = 'Cargo';
+        else if (/jogger|sweatpant|trackpant/.test(t3))   type = 'Jogger';
+        else if (/legging/.test(t3))                      type = 'Leggings';
+        else if (/wide.?leg|palazzo|culottes/.test(t3))   type = 'Wide Leg';
+        else if (/straight.?leg/.test(t3))                type = 'Straight Leg';
+        else if (/slim.?fit|skinny/.test(t3))             type = 'Slim';
+        else if (/bootcut|boot.?cut/.test(t3))            type = 'Bootcut';
+        else if (/shorts?/.test(t3))                      type = 'Shorts';
+        else if (/dress/.test(t3))                        type = 'Dress';
+        else if (/skirt/.test(t3))                        type = 'Skirt';
+        else if (/hoodie/.test(t3))                       type = 'Hoodie';
+        else if (/jacket|coat/.test(t3))                  type = 'Jacket';
+        else if (/shirt|tee|top|blouse/.test(t3))         type = 'Shirt';
+        else if (/pant|trouser/.test(t3))                 type = 'Pants';
+        else if (cat === '181389')                        type = 'Pants';
+        else if (cat === '63862' || cat === '57989')      type = 'Pants';
+        else if (cat === '11554' || cat === '11555')      type = 'Jeans';
+        else if (cat === '185100')                        type = 'Athletic';
+        if (type) product.aspects['Type'] = [type];
+      }
+
       if (!product.aspects['Outer Shell Material'] && !product.aspects['Material']) {
         // Search title + description + all aspects for material keywords
         const matTx = [
@@ -1257,8 +1283,52 @@ module.exports = async (req, res) => {
         pubStatus = pubRes.status;
         console.log(`publishByGroup attempt ${attempt}:`, pubStatus, JSON.stringify(pubData).slice(0,500));
         if (pubRes.ok) break;
-        if (pubStatus !== 500) break; // only retry on 500
-        await new Promise(r => setTimeout(r, 3000 * attempt)); // wait 3s, 6s
+        if (pubStatus === 500) { await new Promise(r => setTimeout(r, 3000 * attempt)); continue; }
+
+        // If missing item specifics — fill them in and retry via updateOffer
+        const missingAspects = (pubData.errors||[])
+          .filter(e => e.errorId === 25002 && e.parameters?.some(p => p.name === '2'))
+          .map(e => e.parameters.find(p => p.name === '2')?.value)
+          .filter(Boolean);
+        if (missingAspects.length && attempt < 3) {
+          console.log('filling missing aspects:', missingAspects);
+          missingAspects.forEach(asp => { if (!product.aspects[asp]) product.aspects[asp] = ['Not Specified']; });
+          // Update the inventory item group with new aspects
+          await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(groupSku)}`, {
+            method: 'PUT', headers: authHeader,
+            body: JSON.stringify({
+              inventoryItemGroupKey: groupSku,
+              title: product.title.slice(0,80),
+              description: product.description || product.title,
+              imageUrls: (product.images||[]).slice(0,12),
+              aspects: product.aspects,
+              variantSKUs: createdSkus,
+              variesBy: {
+                aspectsImageVariesBy: Object.keys(product.variationImages||{}).slice(0,1),
+                specifications: product.variations.map(vg => ({
+                  name: vg.name,
+                  values: vg.values.filter(v=>v.enabled!==false).map(v=>v.value),
+                })),
+              },
+            }),
+          });
+          // Also update inventory items aspects
+          for (let i = 0; i < comboList.length; i += 10) {
+            await Promise.all(comboList.slice(i,i+10).map(async ({ varSku, varStock, varImages, varAspects }) => {
+              missingAspects.forEach(asp => { if (!varAspects[asp]) varAspects[asp] = ['Not Specified']; });
+              await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(varSku)}`, {
+                method: 'PUT', headers: authHeader,
+                body: JSON.stringify({
+                  availability: { shipToLocationAvailability: { quantity: Math.max(0, parseInt(varStock)||0) } },
+                  condition: product.condition || 'NEW',
+                  product: { title: product.title.slice(0,80), imageUrls: varImages.slice(0,12), aspects: varAspects },
+                }),
+              });
+            }));
+          }
+          continue; // retry publish
+        }
+        break;
       }
       if (pubStatus !== 200 && pubStatus !== 201) return res.status(400).json({ error: 'Publish failed', details: pubData });
       return res.json({ success:true, sku:groupSku, listingId:pubData.listingId, variationsCreated:offerIds.length });
