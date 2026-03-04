@@ -1021,11 +1021,33 @@ module.exports = async (req, res) => {
       // Ensure Brand is always set — required by most eBay categories
       if (!product.aspects) product.aspects = {};
       if (!product.aspects['Brand'] || !product.aspects['Brand'].length) {
-        // Try to extract brand from title (first capitalized word before space/comma)
         const brandFromTitle = product.brand
           || (product.title||'').match(/^([A-Z][a-zA-Z0-9&]+(?:\s+[A-Z][a-zA-Z0-9&]+)?)/)?.[1]
           || 'Unbranded';
         product.aspects['Brand'] = [brandFromTitle];
+      }
+
+      // Auto-fill required clothing aspects if missing
+      const allSizeValues = (product.variations||[])
+        .filter(vg => /size/i.test(vg.name))
+        .flatMap(vg => vg.values.map(v => (v.value||'').toLowerCase()));
+      const tx2 = (product.title||'').replace(/&#39;/g,"'").replace(/&amp;/g,'&').toLowerCase();
+
+      if (!product.aspects['Size Type']) {
+        const hasPlus   = allSizeValues.some(v => /plus|\b(1x|2x|3x|4x|0x)\b/.test(v)) || /plus.?size/.test(tx2);
+        const hasPetite = allSizeValues.some(v => /petite/.test(v)) || /petite/.test(tx2);
+        const hasTall   = allSizeValues.some(v => /\btall\b/.test(v)) || /\btall\b/.test(tx2);
+        if      (hasPlus)   product.aspects['Size Type'] = ['Plus'];
+        else if (hasPetite) product.aspects['Size Type'] = ['Petite'];
+        else if (hasTall)   product.aspects['Size Type'] = ['Tall'];
+        else                product.aspects['Size Type'] = ['Regular'];
+      }
+
+      if (!product.aspects['Department']) {
+        if      (/\bwomen|\bwomens|\bladies|\bgirls/.test(tx2)) product.aspects['Department'] = ["Women's"];
+        else if (/\bmen|\bmens|\bboys/.test(tx2))                product.aspects['Department'] = ["Men's"];
+        else if (/\bkids|\bchildren|\bjunior|\btoddler/.test(tx2)) product.aspects['Department'] = ['Kids'];
+        else                                                          product.aspects['Department'] = ['Unisex'];
       }
 
       product.variations.forEach((vg, gi) => {
