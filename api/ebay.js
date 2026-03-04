@@ -105,7 +105,7 @@ module.exports = async (req, res) => {
               redirect: 'follow',
             });
             if (htmlRes.status === 503 || htmlRes.status === 429) {
-              lastErr = ;
+              lastErr = `HTTP ${htmlRes.status} — Amazon rate limited`;
               continue;
             }
             html = await htmlRes.text();
