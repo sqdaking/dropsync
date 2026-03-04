@@ -353,11 +353,13 @@ module.exports = async (req, res) => {
             } catch {}
           }
 
-          // unavailableAsinSet
+          // unavailableAsinSet — explicit out of stock list
           const unavailM = workHtml.match(/"unavailableAsinSet"\s*:\s*(\[[^\]]*\])/);
           if (unavailM) { try { JSON.parse(unavailM[1]).forEach(a => { asinStock[a] = false; }); } catch {} }
+          // inStockAsinSet — explicit in stock list  
           const inStockM = workHtml.match(/"inStockAsinSet"\s*:\s*(\[[^\]]*\])/);
           if (inStockM) { try { JSON.parse(inStockM[1]).forEach(a => { asinStock[a] = true; }); } catch {} }
+          // If neither set exists, leave asinStock empty — defaults to in stock below
 
           // Declare image maps BEFORE fetch so the async callbacks can write into them
           const colorImgMap = {};
@@ -393,9 +395,13 @@ module.exports = async (req, res) => {
                 const m = h.match(pat);
                 if (m) { asinPrice[asin] = m[2] ? `${m[1].replace(/,/g,'')}.${m[2]}` : m[1].replace(/,/g,''); break; }
               }
-              // Stock
-              if (h.includes('Currently unavailable') || h.includes('currently unavailable')) asinStock[asin] = false;
-              else if (h.includes('Add to Cart') || h.includes('Buy Now')) asinStock[asin] = true;
+              // Stock — default to IN STOCK unless we explicitly see unavailable
+              if (h.includes('Currently unavailable') || h.includes('currently unavailable') || h.includes('unavailable') && h.includes('this item') || h.includes('Item under review')) {
+                asinStock[asin] = false;
+              } else {
+                // Any of these signals = in stock
+                asinStock[asin] = true;
+              }
               // Grab images from this ASIN's page
               // The 'initial' block always contains this ASIN's color-specific images
               const hiResOnPage = [...h.matchAll(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/g)]
