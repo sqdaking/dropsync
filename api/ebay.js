@@ -1389,9 +1389,52 @@ module.exports = async (req, res) => {
 
           const priceChanged = newPrice > 0 && Math.abs(newPrice - oldPrice) > 0.01;
           const stockChanged = !inStock;
+
+          // Check if main images changed
+          const oldImgs = (product.images || []).slice(0, 3).join(',');
+          const newImgs = (fresh.images || []).slice(0, 3).join(',');
+          const imagesChanged = newImgs && newImgs !== oldImgs;
+
           const authHeader  = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' };
 
-          if (!priceChanged && inStock) { results.push({ id: product.id, unchanged: true }); continue; }
+          if (!priceChanged && inStock && !imagesChanged) { results.push({ id: product.id, unchanged: true }); continue; }
+
+          // If only images changed, update group and inventory items images
+          if (imagesChanged && product.ebaySku) {
+            console.log(`sync [${product.id}]: images changed, updating group`);
+            // Update inventory item group images
+            const grpRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(product.ebaySku)}`, { headers: authHeader });
+            if (grpRes.ok) {
+              const grpData = await grpRes.json();
+              grpData.imageUrls = (fresh.images || []).slice(0, 12);
+              await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(product.ebaySku)}`, {
+                method: 'PUT', headers: authHeader,
+                body: JSON.stringify(grpData),
+              });
+              // Update each variant's single image too
+              const varSkus = grpData.variantSKUs || [];
+              for (let i = 0; i < varSkus.length; i += 10) {
+                await Promise.all(varSkus.slice(i, i+10).map(async varSku => {
+                  const ivRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(varSku)}`, { headers: authHeader });
+                  if (!ivRes.ok) return;
+                  const iv = await ivRes.json();
+                  // Pick variant-specific image if available, else first fresh image
+                  const varImg = (fresh.variationImages && iv.product?.aspects)
+                    ? Object.entries(fresh.variationImages || {}).reduce((found, [dim, map]) => {
+                        const val = (iv.product.aspects[dim] || [])[0];
+                        return found || (val && map[val]) || null;
+                      }, null)
+                    : null;
+                  iv.product = iv.product || {};
+                  iv.product.imageUrls = varImg ? [varImg] : [(fresh.images || [])[0]].filter(Boolean);
+                  await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(varSku)}`, {
+                    method: 'PUT', headers: authHeader,
+                    body: JSON.stringify(iv),
+                  });
+                }));
+              }
+            }
+          }
 
           // 2. Get all offer IDs for this group SKU
           const offersRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(product.ebaySku)}&limit=1`, { headers: authHeader });
@@ -1450,8 +1493,10 @@ module.exports = async (req, res) => {
             updated,
             priceChanged,
             stockChanged,
+            imagesChanged,
             newSourcePrice: newPrice,
             newEbayPrice: parseFloat(newEbayPrice),
+            newImages: imagesChanged ? (fresh.images||[]) : undefined,
             inStock,
           });
           console.log(`sync [${product.id}]: price ${oldPrice}→${newPrice}, stock:${inStock}, updated ${updated} offers`);
