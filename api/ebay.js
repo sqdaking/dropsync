@@ -814,8 +814,11 @@ module.exports = async (req, res) => {
         let varSku = `${varSkuBase}${seg.join('').slice(0,16)}`;
         if (usedSkus.has(varSku)) varSku = `${varSkuBase}${String(idx).padStart(4,'0')}`;
         usedSkus.add(varSku);
-        const varPrice  = combo.reduce((p,v) => v.price  || p, product.price);
-        const varStock  = combo.reduce((s,v) => v.stock !== undefined ? v.stock : s, parseInt(product.quantity)||10);
+        // Price comes from first variation group that has a price (usually Size)
+        // Stock comes from first variation group that has stock set
+        // This avoids conflicts when multiple dimensions have independent prices
+        const varPrice = combo.find(v => v.price && parseFloat(v.price) > 0)?.price || product.price;
+        const varStock = combo.find(v => v.stock !== undefined)?.stock ?? (parseInt(product.quantity)||10);
         const varImages = getVarImages(combo, product.variationImages, product.images);
         const varAspects = { ...(product.aspects||{}) };
         combo.forEach(v => { varAspects[v.name] = [v.value]; });
