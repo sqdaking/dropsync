@@ -859,7 +859,24 @@ module.exports = async (req, res) => {
       });
       if (!groupRes.ok) return res.status(400).json({ error: 'Group failed', details: await groupRes.text() });
 
-      const baseOffer = buildOffer(groupSku, product, policies);
+      // Get real merchant location key from eBay account
+      let merchantLocationKey = 'default';
+      try {
+        const locRes = await fetch(`${EBAY_API}/sell/inventory/v1/location`, { headers: authHeader });
+        const locData = await locRes.json();
+        console.log('locations:', JSON.stringify(locData).slice(0,300));
+        if (locData.locations?.length) {
+          merchantLocationKey = locData.locations[0].merchantLocationKey;
+        } else {
+          // Create a default location if none exist
+          await fetch(`${EBAY_API}/sell/inventory/v1/location/default`, {
+            method: 'POST', headers: authHeader,
+            body: JSON.stringify({ location: { address: { country: 'US' } }, locationTypes: ['WAREHOUSE'], name: 'Default', merchantLocationStatus: 'ENABLED' })
+          });
+        }
+      } catch(e) { console.log('location fetch error:', e.message); }
+      console.log('merchantLocationKey:', merchantLocationKey);
+      const baseOffer = buildOffer(groupSku, product, policies, merchantLocationKey);
       delete baseOffer.sku;
       const offerBody = { ...baseOffer, inventoryItemGroupKey: groupSku };
       console.log('groupSku:', groupSku);
@@ -917,8 +934,8 @@ module.exports = async (req, res) => {
   }
 };
 
-function buildOffer(sku, product, policies = {}) {
-  const p = { sku, marketplaceId:'EBAY_US', format:'FIXED_PRICE', listingDuration:'GTC', pricingSummary:{ price:{ value:String(parseFloat(product.price||0).toFixed(2)), currency:'USD' } }, categoryId:product.categoryId||'9355', merchantLocationKey:'default' };
+function buildOffer(sku, product, policies = {}, merchantLocationKey = 'default') {
+  const p = { sku, marketplaceId:'EBAY_US', format:'FIXED_PRICE', listingDuration:'GTC', pricingSummary:{ price:{ value:String(parseFloat(product.price||0).toFixed(2)), currency:'USD' } }, categoryId:product.categoryId||'9355', merchantLocationKey };
   if (process.env.EBAY_FULFILLMENT_POLICY_ID) p.fulfillmentPolicyId = process.env.EBAY_FULFILLMENT_POLICY_ID;
   if (process.env.EBAY_PAYMENT_POLICY_ID)     p.paymentPolicyId     = process.env.EBAY_PAYMENT_POLICY_ID;
   if (process.env.EBAY_RETURN_POLICY_ID)      p.returnPolicyId      = process.env.EBAY_RETURN_POLICY_ID;
