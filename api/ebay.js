@@ -152,9 +152,6 @@ module.exports = async (req, res) => {
       let url = body.url || req.query.url;
       if (!url) return res.status(400).json({ error: 'No URL' });
 
-      // ── scrape-html: browser already fetched the HTML, skip server fetch ──
-      let _preloadedHtml = body.html || null;  // set below if provided
-
       // ── Normalize any Amazon URL to clean dp/ASIN page ──────────────
       if (url.includes('amazon.com')) {
         // Extract ASIN from any Amazon URL format:
@@ -241,12 +238,9 @@ module.exports = async (req, res) => {
         const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 
         // Try fetching with retries
-        let html = _preloadedHtml || '';
+        let html = '';
         let lastErr = null;
-        if (html) {
-          console.log(`Using browser-preloaded HTML (${html.length} bytes) for ${url}`);
-        }
-        for (let attempt = 0; !html && attempt < 3; attempt++) {
+        for (let attempt = 0; attempt < 3; attempt++) {
           try {
             if (attempt > 0) await new Promise(r => setTimeout(r, 1500 * attempt));
             const htmlRes = await fetch(url, {
@@ -692,204 +686,35 @@ module.exports = async (req, res) => {
           if (!product.images.length) { const imgs=[...html.matchAll(/"url":"(https:\/\/i5\.walmartimages\.com[^"]+)"/g)].map(m=>m[1]); product.images=[...new Set(imgs)].slice(0,12); }
         }
 
-        // ── ALIEXPRESS ───────────────────────────────────────────────────
+        // ── ALIEXPRESS ──────────────────────────────────────────────────
         else if (url.includes('aliexpress.com') || url.includes('aliexpress.us')) {
           product.source = 'aliexpress';
-          const aliItemId = url.match(/\/item\/(\d+)\.html/)?.[1] || '';
-          console.log(`AliExpress fetch: id=${aliItemId} html_size=${html.length} has_runParams=${html.includes('runParams')}`);
-
-          // Strategy 2: DS API (no anti-bot, works from server IPs)
-          const aliTryApi = async () => {
-            if (!aliItemId) return false;
-            const endpoints = [
-              `https://www.aliexpress.us/fn/wh/productDetail?productId=${aliItemId}&currencyCode=USD&countryCode=US&lang=en_US`,
-              `https://www.aliexpress.us/p/d/api/pc/aesite-pdp/getPdpInfo?productId=${aliItemId}&countryCode=US&currencyCode=USD&lang=en`,
-            ];
-            for (const ep of endpoints) {
-              try {
-                const r = await fetch(ep, {
-                  headers: { 'User-Agent': ua, 'Accept': 'application/json, */*', 'Referer': `https://www.aliexpress.us/item/${aliItemId}.html`, 'Accept-Language': 'en-US,en;q=0.9' },
-                  redirect: 'follow',
-                });
-                if (!r.ok) continue;
-                const j = await r.json();
-                const d = j?.data?.productDetail || j?.data || j?.result || j;
-                const title = d?.subject || d?.title || d?.productInfoComponent?.subject || '';
-                if (!title) continue;
-                product.title = title;
-                product.brand = d?.brandComponent?.brandName || d?.brand || '';
-                const pc = d?.priceComponent || d?.priceInfo || d?.productInfoComponent?.priceComponent;
-                product.price = String(
-                  pc?.discountPrice?.minAmount?.value ?? pc?.salePrice?.minAmount?.value ??
-                  pc?.originalPrice?.minAmount?.value ?? pc?.minActivityAmount?.value ?? pc?.minAmount?.value ?? ''
-                );
-                const imgs = d?.imagePathList || d?.productInfoComponent?.imagePathList || d?.imageModule?.imagePathList || [];
-                if (imgs.length) product.images = imgs.map(i => i.startsWith('http') ? i : `https:${i}`).slice(0, 12);
-                product.inStock = true; product.quantity = 10;
-                console.log(`AliExpress API[${ep.split('?')[0].split('/').pop()}]: got title="${title.slice(0,40)}"`);
-                return true;
-              } catch(e) { console.warn('AliExpress API endpoint failed:', e.message); }
-            }
-            return false;
-          };
-
-          // Strategy 3: regex-only extraction directly from html (no JSON parse)
-          const aliTryRegex = () => {
-            const title = html.match(/"subject"\s*:\s*"([^"]{10,})"/) ||
-                          html.match(/<h1[^>]*class="[^"]*product-title[^"]*"[^>]*>([^<]{10,})/) ||
-                          html.match(/<title>([^<]{10,}?)\s*(?:-\s*AliExpress|\|)/);
-            if (title) product.title = title[1].trim();
-            const price = html.match(/"minActivityAmount"\s*:\s*\{"value"\s*:\s*([\d.]+)/) ||
-                          html.match(/"discountPrice"\s*:[^}]*"value"\s*:\s*([\d.]+)/) ||
-                          html.match(/"minAmount"\s*:\s*\{"value"\s*:\s*([\d.]+)/) ||
-                          html.match(/\$\s*([\d]+\.[\d]{2})/);
-            if (price) product.price = price[1];
-            const imgs = [...html.matchAll(/["']?(https:\/\/ae\d*\.alicdn\.com\/kf\/[^"'<>\s]+\.(?:jpg|jpeg|png|webp)[^"'<>\s]*)/gi)].map(m=>m[1]);
-            if (imgs.length) product.images = [...new Set(imgs)].slice(0, 12);
-            return !!product.title;
-          };
-
-          // Detect hard blocks (CAPTCHA, Baxia security, empty responses)
-          const hardBlocked = html.length < 5000 ||
-                              html.includes('baxia-page') || html.includes('baxia_scene') ||
-                              html.includes('captcha') || html.includes('Verify you are human') ||
-                              html.includes('"error":"Forbidden"') ||
-                              (html.length < 20000 && !html.includes('runParams') && !html.includes('ae-page') && !html.includes('alicdn'));
-
-          if (hardBlocked) {
-            console.log(`AliExpress HARD BLOCK detected (${html.length} bytes) — trying API`);
-            const apiOk = await aliTryApi();
-            if (!apiOk) {
-              // Last resort: regex on whatever html we have
-              aliTryRegex();
-            }
-            if (!product.title) {
-              return res.json({ success: false, error: `AliExpress is blocking server requests for item ${aliItemId}. Try: paste just https://www.aliexpress.us/item/${aliItemId}.html — or wait 2 minutes and retry.`, product });
-            }
-          }
-          // Try window.runParams (classic AliExpress structure)
+          // Try window.runParams
           const rp = html.match(/window\.runParams\s*=\s*(\{[\s\S]*?\});\s*\n/) ||
-                     html.match(/window\.runParams\s*=\s*(\{[\s\S]*?\})\s*;\s*(?:\/\/|\n)/);
+                     html.match(/window\.runParams\s*=\s*(\{[\s\S]*?\})\s*;/);
           if (rp) {
             try {
-              const data = JSON.parse(rp[1]);
-              const d = data?.data || data;
+              const d = (JSON.parse(rp[1])?.data) || JSON.parse(rp[1]);
               const info = d?.productInfoComponent || d;
-
-              product.title = info?.subject || info?.title || d?.titleModule?.subject || '';
-              product.brand = info?.brandComponent?.brandName || d?.brandModule?.brandName || '';
-
-              // Price — try discount first, then original
+              product.title = info?.subject || d?.titleModule?.subject || '';
               const pc = info?.priceComponent || d?.priceModule;
-              product.price =
-                pc?.discountPrice?.formatedAmount?.replace(/[^0-9.]/g,'') ||
-                pc?.originalPrice?.formatedAmount?.replace(/[^0-9.]/g,'') ||
-                String(pc?.minActivityAmount?.value || pc?.minAmount?.value || '');
-
-              // Description / highlights
-              const desc = d?.productDescComponent || d?.descriptionModule;
-              product.description = (desc?.descriptionUrl ? '' : info?.description || d?.detailModule?.description || '');
-
-              // Images — try multiple paths
-              if (info?.imagePathList?.length) {
-                product.images = info.imagePathList.map(i => i.startsWith('http') ? i : `https:${i}`).slice(0,12);
-              } else if (d?.imageModule?.imagePathList?.length) {
-                product.images = d.imageModule.imagePathList.map(i => i.startsWith('http') ? i : `https:${i}`).slice(0,12);
-              }
-
-              // ── SHIPPING COST: extract from shippingComponent ──────────
-              const sc = d?.shippingModule || d?.shippingComponent || d?.deliveryModule;
-              if (sc) {
-                // Iterate shipping options, pick cheapest that ships to US
-                const options = sc?.shippingList || sc?.freightList || sc?.deliveryOptionList || [];
-                let cheapest = null;
-                for (const opt of options) {
-                  const fee = parseFloat(
-                    opt?.freightAmount?.value ?? opt?.price?.value ?? opt?.shippingFee ?? opt?.amount?.value ?? 'NaN'
-                  );
-                  const method = opt?.company || opt?.serviceName || opt?.logisticsDesc || '';
-                  const isFree = fee === 0 || (opt?.displayAmount||'').toLowerCase().includes('free') ||
-                                 (opt?.freightAmount?.formattedAmount||'').toLowerCase().includes('free');
-                  if (isFree) { cheapest = { cost: 0, method: method || 'Free Shipping' }; break; }
-                  if (!isNaN(fee) && (cheapest === null || fee < cheapest.cost)) {
-                    cheapest = { cost: fee, method };
-                  }
-                }
-                // Also check top-level freeShipping flag
-                if (sc.hasFreeShipping || sc.isFreeShipping || sc.freightAmount?.value === '0') {
-                  cheapest = { cost: 0, method: 'Free Shipping' };
-                }
-                if (cheapest !== null) {
-                  product.scrapedShipping = cheapest.cost;
-                  product.shippingMethod = cheapest.method;
-                  console.log(`AliExpress shipping: $${cheapest.cost} (${cheapest.method})`);
-                }
-              }
-
-              // Variations / SKUs
-              const sku = d?.skuComponent || info?.skuComponent || d?.skuModule;
-              if (sku?.productSKUPropertyList) {
-                for (const prop of sku.productSKUPropertyList) {
-                  const vg = {
-                    name: prop.skuPropertyName,
-                    values: (prop.skuPropertyValues||[]).map(v => ({
-                      value: v.propertyValueDisplayName || v.propertyValueName,
-                      price: product.price, stock: 10,
-                      image: v.skuPropertyImagePath ? (v.skuPropertyImagePath.startsWith('http') ? v.skuPropertyImagePath : `https:${v.skuPropertyImagePath}`) : '',
-                      enabled: true,
-                    }))
-                  };
-                  if (vg.values.length > 0) product.variations.push(vg);
-                  if (prop.skuPropertyName.toLowerCase().includes('color')) {
-                    const imgMap = {};
-                    vg.values.forEach(v => { if(v.image) imgMap[v.value] = v.image; });
-                    if (Object.keys(imgMap).length) product.variationImages['Color'] = imgMap;
-                  }
-                }
-                product.hasVariations = product.variations.length > 0;
-              }
-
-              // Specs
-              const specs = d?.specsModule?.props || d?.productPropComponent?.itemProps || [];
-              for (const s of specs.slice(0,12)) {
-                const k = s.attrName || s.name, v = (s.attrValue||s.value||'').replace(/<[^>]+>/g,'').trim();
-                if (k && v) product.aspects[k] = [v];
-              }
-
-            } catch(e) { console.warn('AliExpress runParams parse error:', e.message); }
+              product.price = String(pc?.discountPrice?.formatedAmount?.replace(/[^0-9.]/g,'') || pc?.minActivityAmount?.value || pc?.minAmount?.value || '');
+              if (info?.imagePathList?.length) product.images = info.imagePathList.map(i => i.startsWith('http') ? i : `https:${i}`).slice(0,12);
+            } catch(e) { console.warn('AliExpress parse error:', e.message); }
           }
-
-          // ── Fallback regex if runParams failed or absent ──────────
-          if (!product.title || !product.price || !product.images.length) {
-            if (!product.title) {
-              const m = html.match(/"subject"\s*:\s*"([^"]{5,})"/) || html.match(/"title"\s*:\s*"([^"]{5,})"/) ||
-                        html.match(/<h1[^>]*>([^<]{10,})<\/h1>/);
-              if (m) product.title = m[1].replace(/&amp;/g,'&').replace(/&#39;/g,"'").trim();
-            }
-            if (!product.price) {
-              const m = html.match(/"minActivityAmount"\s*:\s*\{"value"\s*:\s*([0-9.]+)/) ||
-                        html.match(/"discountPrice"[^}]*"value"\s*:\s*([0-9.]+)/) ||
-                        html.match(/"minAmount"\s*:\s*\{"value"\s*:\s*([0-9.]+)/) ||
-                        html.match(/"activityAmount"\s*:\s*\{"value"\s*:\s*([0-9.]+)/);
-              if (m) product.price = m[1];
-            }
-            if (!product.images.length) {
-              const imgs = [
-                ...[...html.matchAll(/"imageUrl"\s*:\s*"(https?:\/\/ae[^"]+)"/g)].map(m=>m[1]),
-                ...[...html.matchAll(/https:\/\/ae\d*\.alicdn\.com\/kf\/[^\s"'<>]+\.(?:jpg|jpeg|png|webp)/gi)].map(m=>m[0]),
-              ];
-              product.images = [...new Set(imgs)].slice(0, 12);
-            }
+          if (!product.title) {
+            const m = html.match(/"subject"\s*:\s*"([^"]{5,})"/); if (m) product.title = m[1];
           }
-          if (product.scrapedShipping === null) {
-            const freeShip = /free\s+shipping|\$0\.00\s+shipping/i.test(html);
-            const shipMatch = html.match(/"freightAmount"\s*:\s*\{"value"\s*:\s*([0-9.]+)/);
-            if (freeShip) { product.scrapedShipping = 0; product.shippingMethod = 'Free Shipping'; }
-            else if (shipMatch) { product.scrapedShipping = parseFloat(shipMatch[1]); }
+          if (!product.price) {
+            const m = html.match(/"minActivityAmount"\s*:\s*\{"value"\s*:\s*([0-9.]+)/) || html.match(/"minAmount"\s*:\s*\{"value"\s*:\s*([0-9.]+)/); if (m) product.price = m[1];
+          }
+          if (!product.images.length) {
+            const imgs = [...html.matchAll(/https:\/\/ae\d*\.alicdn\.com\/kf\/[^"'<>\s]+\.(?:jpg|jpeg|png)/gi)].map(m=>m[0]);
+            product.images = [...new Set(imgs)].slice(0,12);
           }
           product.inStock = !!product.title;
           product.quantity = product.inStock ? 10 : 0;
-          console.log(`AliExpress result: title="${(product.title||'').slice(0,40)}" price=${product.price} images=${product.images.length}`);
+          if (!product.title) return res.json({ success: false, error: 'AliExpress import failed — server IP is blocked. Try manual import.', product });
         }
 
         // ── TARGET ───────────────────────────────────────────────────────
