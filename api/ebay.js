@@ -1,4 +1,4 @@
-// DropSync — eBay Backend v4 (Vercel Serverless)
+https://www.amazon.com/BALEAF-Leggings-Resistant-Thermal-Bootcut/dp/B0D4LLZ9VP/?_encoding=UTF8&pd_rd_w=81asL&content-id=amzn1.sym.4efc43db-939e-4a80-abaf-50c6a6b8c631%3Aamzn1.symc.5a16118f-86f0-44cd-8e3e-6c5f82df43d0&pf_rd_p=4efc43db-939e-4a80-abaf-50c6a6b8c631&pf_rd_r=J66CPQNGHW23G1RWJD1E&pd_rd_wg=fDhDR&pd_rd_r=d3f9060b-b8d2-4c31-819d-6c63904c9483&ref_=pd_hp_d_atf_ci_mcx_mr_ca_hp_atf_d// DropSync — eBay Backend v4 (Vercel Serverless)
 // Improved Amazon variation, price, and image scraping
 
 const EBAY_API  = 'https://api.ebay.com';
