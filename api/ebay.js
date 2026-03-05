@@ -689,6 +689,40 @@ module.exports = async (req, res) => {
         // ── ALIEXPRESS ───────────────────────────────────────────────────
         else if (url.includes('aliexpress.com') || url.includes('aliexpress.us')) {
           product.source = 'aliexpress';
+
+          // Detect AliExpress anti-bot / CAPTCHA pages
+          const isBlocked = html.includes('/_next/static') === false && html.length < 8000 ||
+                            html.includes('captcha') || html.includes('Verify you are human') ||
+                            html.includes('blocked') || html.includes('baxia') ||
+                            (!html.includes('runParams') && !html.includes('window.__') && html.length < 30000);
+          if (isBlocked) {
+            // Try AliExpress internal API endpoint as fallback
+            const itemId = url.match(/\/item\/(\d+)\.html/)?.[1];
+            if (itemId) {
+              try {
+                const apiUrl = `https://www.aliexpress.us/p/d/api/pc/aesite-pdp/getProductInfo?productId=${itemId}&countryCode=US&currencyCode=USD&lang=en`;
+                const apiRes = await fetch(apiUrl, {
+                  headers: { 'User-Agent': ua, 'Accept': 'application/json', 'Referer': url, 'Accept-Language': 'en-US,en;q=0.9' },
+                  redirect: 'follow',
+                });
+                if (apiRes.ok) {
+                  const apiData = await apiRes.json();
+                  const d = apiData?.data || apiData?.result || apiData;
+                  if (d?.subject || d?.title) {
+                    product.title = d.subject || d.title || '';
+                    product.price = String(d.salePrice?.minAmount?.value || d.priceInfo?.salePrice?.minAmount?.value || d.price?.minAmount?.value || '');
+                    if (d.imagePathList?.length) product.images = d.imagePathList.map(i => i.startsWith('http') ? i : `https:${i}`).slice(0, 12);
+                    product.inStock = true;
+                    product.quantity = 10;
+                    console.log('AliExpress: used API fallback, got:', product.title?.slice(0,40));
+                  }
+                }
+              } catch(e) { console.warn('AliExpress API fallback failed:', e.message); }
+            }
+            if (!product.title) {
+              return res.json({ success: false, error: 'AliExpress blocked the request — try again in 1-2 minutes, or copy the item ID into a clean URL like: https://www.aliexpress.us/item/ITEMID.html', product });
+            }
+          }
           // Try window.runParams (classic AliExpress structure)
           const rp = html.match(/window\.runParams\s*=\s*(\{[\s\S]*?\});\s*\n/) ||
                      html.match(/window\.runParams\s*=\s*(\{[\s\S]*?\})\s*;\s*(?:\/\/|\n)/);
