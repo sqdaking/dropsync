@@ -772,11 +772,27 @@ module.exports = async (req, res) => {
             return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
           });
 
+          // ── Stock: shipping available = in stock for dropshipping; pickup-only = OOS ──
+          const hl = html.toLowerCase();
+          const canShip = (hl.includes('ships free') || hl.includes('ships to') || hl.includes('get it by') || hl.includes('standard shipping') || hl.includes('"shipping"')) &&
+            !hl.includes('"shipping_not_available"') && !hl.includes('not available for shipping');
+          const pickupOnly = !canShip && (hl.includes('order pickup') || hl.includes('drive up'));
+          const itemInStock = canShip || (!pickupOnly && hl.includes('add to cart'));
+          product.inStock = itemInStock;
+          product.quantity = itemInStock ? 10 : 0;
+
           if (sortedSizes.length > 1) {
             product.variations.push({
               name: 'Size',
               values: sortedSizes.map(s => ({
-                value: s, price: product.price || '0', stock: 10, image: '', enabled: true,
+                value: s,
+                price: product.price || '0',
+                // All sizes assumed available if shipping works; individual size stock
+                // would require fetching each TCIN separately — mark all enabled for now
+                stock: itemInStock ? 10 : 0,
+                image: '',
+                enabled: itemInStock,
+                inStock: itemInStock,
               })),
             });
             product.hasVariations = true;
