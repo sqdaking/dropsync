@@ -1992,7 +1992,56 @@ module.exports = async (req, res) => {
     }
 
 
+    // ── PRICE & STOCK CHECK — monitor published listings ──────────────────────
+    if (action === 'price-check') {
+      const { products = [] } = req.body;
+      if (!products.length) return res.json({ updates: [] });
+      const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+      const updates = [];
+
+      for (const item of products.slice(0, 15)) {
+        const { id, sourceUrl } = item;
+        if (!sourceUrl || !sourceUrl.startsWith('http')) continue;
+        try {
+          const r = await Promise.race([
+            fetch(sourceUrl, { headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9', Accept: 'text/html,*/*' }, redirect: 'follow' }),
+            new Promise((_,rej) => setTimeout(() => rej(new Error('timeout')), 14000))
+          ]);
+          const html = await r.text();
+          const low  = html.toLowerCase();
+          let price = null, inStock = null;
+
+          if (sourceUrl.includes('amazon.com')) {
+            const pm = html.match(/"priceAmount"\s*:\s*([\d.]+)/) ||
+                       html.match(/"displayPrice"\s*:\s*"\$([\d.]+)/) ||
+                       html.match(/id="priceblock_ourprice"[^>]*>[^$]*\$([\d.]+)/);
+            if (pm) price = parseFloat(pm[1]);
+            inStock = !low.includes('currently unavailable') && !low.includes('out of stock') &&
+                      (html.includes('add-to-cart-button') || html.includes('addToCart'));
+          } else if (sourceUrl.includes('walmart.com')) {
+            const nd = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+            if (nd) { try { const d = JSON.parse(nd[1])?.props?.pageProps?.initialData?.data?.product; if (d) { price = parseFloat(d.priceInfo?.currentPrice?.price) || null; inStock = d.availabilityStatus === 'IN_STOCK'; } } catch {} }
+          } else if (sourceUrl.includes('target.com')) {
+            const nd = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+            if (nd) { try { const pd = JSON.parse(nd[1])?.props?.pageProps?.initialData?.data?.product; price = parseFloat((pd?.item||pd||{}).price?.current_retail || '') || null; inStock = low.includes('ships free') && !low.includes('not available'); } catch {} }
+          } else if (sourceUrl.includes('aliexpress')) {
+            const rp = html.match(/window\.runParams\s*=\s*(\{[\s\S]*?\});\s*\n/);
+            if (rp) { try { const d = JSON.parse(rp[1]); const pc = d?.data?.productInfoComponent?.priceComponent; if (pc) price = parseFloat((pc.discountPrice||pc.originalPrice||{}).formatedAmount?.replace(/[^0-9.]/g,'')) || null; inStock = !!d?.data?.productInfoComponent?.subject; } catch {} }
+          } else if (sourceUrl.includes('webstaurantstore.com')) {
+            const pm2 = html.match(/\$([\d,]+\.\d{2})/);
+            if (pm2) price = parseFloat(pm2[1].replace(/,/g,''));
+            inStock = low.includes('add to cart') && !low.includes('out of stock');
+          }
+
+          if (price !== null || inStock !== null) updates.push({ id, price, inStock, checkedAt: new Date().toISOString() });
+        } catch (e) { console.warn('price-check:', sourceUrl.slice(0,60), e.message); }
+        await new Promise(r => setTimeout(r, 380));
+      }
+      return res.json({ updates });
+    }
+
     // ── BESTSELLERS: scrape Amazon best seller pages for fresh hot products ──
+
     if (action === 'bestsellers') {
       const BSELLER_URLS = [
         { cat: 'Clothing',     url: 'https://www.amazon.com/Best-Sellers-Clothing-Shoes-Jewelry/zgbs/fashion/ref=zg_bs_nav_fashion_0' },
