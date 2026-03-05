@@ -152,6 +152,9 @@ module.exports = async (req, res) => {
       let url = body.url || req.query.url;
       if (!url) return res.status(400).json({ error: 'No URL' });
 
+      // ── scrape-html: browser already fetched the HTML, skip server fetch ──
+      let _preloadedHtml = body.html || null;  // set below if provided
+
       // ── Normalize any Amazon URL to clean dp/ASIN page ──────────────
       if (url.includes('amazon.com')) {
         // Extract ASIN from any Amazon URL format:
@@ -238,9 +241,12 @@ module.exports = async (req, res) => {
         const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 
         // Try fetching with retries
-        let html = '';
+        let html = _preloadedHtml || '';
         let lastErr = null;
-        for (let attempt = 0; attempt < 3; attempt++) {
+        if (html) {
+          console.log(`Using browser-preloaded HTML (${html.length} bytes) for ${url}`);
+        }
+        for (let attempt = 0; !html && attempt < 3; attempt++) {
           try {
             if (attempt > 0) await new Promise(r => setTimeout(r, 1500 * attempt));
             const htmlRes = await fetch(url, {
