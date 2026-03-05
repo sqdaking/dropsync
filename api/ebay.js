@@ -689,38 +689,76 @@ module.exports = async (req, res) => {
         // ── ALIEXPRESS ───────────────────────────────────────────────────
         else if (url.includes('aliexpress.com') || url.includes('aliexpress.us')) {
           product.source = 'aliexpress';
+          const aliItemId = url.match(/\/item\/(\d+)\.html/)?.[1] || '';
+          console.log(`AliExpress fetch: id=${aliItemId} html_size=${html.length} has_runParams=${html.includes('runParams')}`);
 
-          // Detect AliExpress anti-bot / CAPTCHA pages
-          const isBlocked = html.includes('/_next/static') === false && html.length < 8000 ||
-                            html.includes('captcha') || html.includes('Verify you are human') ||
-                            html.includes('blocked') || html.includes('baxia') ||
-                            (!html.includes('runParams') && !html.includes('window.__') && html.length < 30000);
-          if (isBlocked) {
-            // Try AliExpress internal API endpoint as fallback
-            const itemId = url.match(/\/item\/(\d+)\.html/)?.[1];
-            if (itemId) {
+          // Strategy 2: DS API (no anti-bot, works from server IPs)
+          const aliTryApi = async () => {
+            if (!aliItemId) return false;
+            const endpoints = [
+              `https://www.aliexpress.us/fn/wh/productDetail?productId=${aliItemId}&currencyCode=USD&countryCode=US&lang=en_US`,
+              `https://www.aliexpress.us/p/d/api/pc/aesite-pdp/getPdpInfo?productId=${aliItemId}&countryCode=US&currencyCode=USD&lang=en`,
+            ];
+            for (const ep of endpoints) {
               try {
-                const apiUrl = `https://www.aliexpress.us/p/d/api/pc/aesite-pdp/getProductInfo?productId=${itemId}&countryCode=US&currencyCode=USD&lang=en`;
-                const apiRes = await fetch(apiUrl, {
-                  headers: { 'User-Agent': ua, 'Accept': 'application/json', 'Referer': url, 'Accept-Language': 'en-US,en;q=0.9' },
+                const r = await fetch(ep, {
+                  headers: { 'User-Agent': ua, 'Accept': 'application/json, */*', 'Referer': `https://www.aliexpress.us/item/${aliItemId}.html`, 'Accept-Language': 'en-US,en;q=0.9' },
                   redirect: 'follow',
                 });
-                if (apiRes.ok) {
-                  const apiData = await apiRes.json();
-                  const d = apiData?.data || apiData?.result || apiData;
-                  if (d?.subject || d?.title) {
-                    product.title = d.subject || d.title || '';
-                    product.price = String(d.salePrice?.minAmount?.value || d.priceInfo?.salePrice?.minAmount?.value || d.price?.minAmount?.value || '');
-                    if (d.imagePathList?.length) product.images = d.imagePathList.map(i => i.startsWith('http') ? i : `https:${i}`).slice(0, 12);
-                    product.inStock = true;
-                    product.quantity = 10;
-                    console.log('AliExpress: used API fallback, got:', product.title?.slice(0,40));
-                  }
-                }
-              } catch(e) { console.warn('AliExpress API fallback failed:', e.message); }
+                if (!r.ok) continue;
+                const j = await r.json();
+                const d = j?.data?.productDetail || j?.data || j?.result || j;
+                const title = d?.subject || d?.title || d?.productInfoComponent?.subject || '';
+                if (!title) continue;
+                product.title = title;
+                product.brand = d?.brandComponent?.brandName || d?.brand || '';
+                const pc = d?.priceComponent || d?.priceInfo || d?.productInfoComponent?.priceComponent;
+                product.price = String(
+                  pc?.discountPrice?.minAmount?.value ?? pc?.salePrice?.minAmount?.value ??
+                  pc?.originalPrice?.minAmount?.value ?? pc?.minActivityAmount?.value ?? pc?.minAmount?.value ?? ''
+                );
+                const imgs = d?.imagePathList || d?.productInfoComponent?.imagePathList || d?.imageModule?.imagePathList || [];
+                if (imgs.length) product.images = imgs.map(i => i.startsWith('http') ? i : `https:${i}`).slice(0, 12);
+                product.inStock = true; product.quantity = 10;
+                console.log(`AliExpress API[${ep.split('?')[0].split('/').pop()}]: got title="${title.slice(0,40)}"`);
+                return true;
+              } catch(e) { console.warn('AliExpress API endpoint failed:', e.message); }
+            }
+            return false;
+          };
+
+          // Strategy 3: regex-only extraction directly from html (no JSON parse)
+          const aliTryRegex = () => {
+            const title = html.match(/"subject"\s*:\s*"([^"]{10,})"/) ||
+                          html.match(/<h1[^>]*class="[^"]*product-title[^"]*"[^>]*>([^<]{10,})/) ||
+                          html.match(/<title>([^<]{10,}?)\s*(?:-\s*AliExpress|\|)/);
+            if (title) product.title = title[1].trim();
+            const price = html.match(/"minActivityAmount"\s*:\s*\{"value"\s*:\s*([\d.]+)/) ||
+                          html.match(/"discountPrice"\s*:[^}]*"value"\s*:\s*([\d.]+)/) ||
+                          html.match(/"minAmount"\s*:\s*\{"value"\s*:\s*([\d.]+)/) ||
+                          html.match(/\$\s*([\d]+\.[\d]{2})/);
+            if (price) product.price = price[1];
+            const imgs = [...html.matchAll(/["']?(https:\/\/ae\d*\.alicdn\.com\/kf\/[^"'<>\s]+\.(?:jpg|jpeg|png|webp)[^"'<>\s]*)/gi)].map(m=>m[1]);
+            if (imgs.length) product.images = [...new Set(imgs)].slice(0, 12);
+            return !!product.title;
+          };
+
+          // Detect hard blocks (CAPTCHA, Baxia security, empty responses)
+          const hardBlocked = html.length < 5000 ||
+                              html.includes('baxia-page') || html.includes('baxia_scene') ||
+                              html.includes('captcha') || html.includes('Verify you are human') ||
+                              html.includes('"error":"Forbidden"') ||
+                              (html.length < 20000 && !html.includes('runParams') && !html.includes('ae-page') && !html.includes('alicdn'));
+
+          if (hardBlocked) {
+            console.log(`AliExpress HARD BLOCK detected (${html.length} bytes) — trying API`);
+            const apiOk = await aliTryApi();
+            if (!apiOk) {
+              // Last resort: regex on whatever html we have
+              aliTryRegex();
             }
             if (!product.title) {
-              return res.json({ success: false, error: 'AliExpress blocked the request — try again in 1-2 minutes, or copy the item ID into a clean URL like: https://www.aliexpress.us/item/ITEMID.html', product });
+              return res.json({ success: false, error: `AliExpress is blocking server requests for item ${aliItemId}. Try: paste just https://www.aliexpress.us/item/${aliItemId}.html — or wait 2 minutes and retry.`, product });
             }
           }
           // Try window.runParams (classic AliExpress structure)
@@ -815,30 +853,37 @@ module.exports = async (req, res) => {
             } catch(e) { console.warn('AliExpress runParams parse error:', e.message); }
           }
 
-          // ── Fallback regex if runParams failed ──
-          if (!product.title) {
-            const m = html.match(/"subject":"([^"]+)"/);
-            if (m) product.title = m[1];
-          }
-          if (!product.price) {
-            const m = html.match(/"minAmount":\{"value":([0-9.]+)/) || html.match(/"activityAmount":\{"value":([0-9.]+)/);
-            if (m) product.price = m[1];
-          }
-          if (!product.images.length) {
-            const imgs = [...html.matchAll(/"imageUrl":"(https?:\/\/ae[^"]+)"/g)].map(m=>m[1]);
-            product.images = [...new Set(imgs)].slice(0,12);
+          // ── Fallback regex if runParams failed or absent ──────────
+          if (!product.title || !product.price || !product.images.length) {
+            if (!product.title) {
+              const m = html.match(/"subject"\s*:\s*"([^"]{5,})"/) || html.match(/"title"\s*:\s*"([^"]{5,})"/) ||
+                        html.match(/<h1[^>]*>([^<]{10,})<\/h1>/);
+              if (m) product.title = m[1].replace(/&amp;/g,'&').replace(/&#39;/g,"'").trim();
+            }
+            if (!product.price) {
+              const m = html.match(/"minActivityAmount"\s*:\s*\{"value"\s*:\s*([0-9.]+)/) ||
+                        html.match(/"discountPrice"[^}]*"value"\s*:\s*([0-9.]+)/) ||
+                        html.match(/"minAmount"\s*:\s*\{"value"\s*:\s*([0-9.]+)/) ||
+                        html.match(/"activityAmount"\s*:\s*\{"value"\s*:\s*([0-9.]+)/);
+              if (m) product.price = m[1];
+            }
+            if (!product.images.length) {
+              const imgs = [
+                ...[...html.matchAll(/"imageUrl"\s*:\s*"(https?:\/\/ae[^"]+)"/g)].map(m=>m[1]),
+                ...[...html.matchAll(/https:\/\/ae\d*\.alicdn\.com\/kf\/[^\s"'<>]+\.(?:jpg|jpeg|png|webp)/gi)].map(m=>m[0]),
+              ];
+              product.images = [...new Set(imgs)].slice(0, 12);
+            }
           }
           if (product.scrapedShipping === null) {
-            // Regex fallback for shipping
             const freeShip = /free\s+shipping|\$0\.00\s+shipping/i.test(html);
-            const shipMatch = html.match(/"freightAmount":\{"value":([0-9.]+)/);
+            const shipMatch = html.match(/"freightAmount"\s*:\s*\{"value"\s*:\s*([0-9.]+)/);
             if (freeShip) { product.scrapedShipping = 0; product.shippingMethod = 'Free Shipping'; }
             else if (shipMatch) { product.scrapedShipping = parseFloat(shipMatch[1]); }
           }
-
-          // AliExpress stock: if listing exists it's in stock (no pickup concept)
           product.inStock = !!product.title;
           product.quantity = product.inStock ? 10 : 0;
+          console.log(`AliExpress result: title="${(product.title||'').slice(0,40)}" price=${product.price} images=${product.images.length}`);
         }
 
         // ── TARGET ───────────────────────────────────────────────────────
