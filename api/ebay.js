@@ -190,6 +190,27 @@ module.exports = async (req, res) => {
         if (wmMatch) url = `https://www.walmart.com/ip/${wmMatch[1]}`;
       }
 
+      // Normalize AliExpress: aliexpress.us → aliexpress.com; extract product ID from bundle URLs
+      if (url.includes('aliexpress.us') || url.includes('aliexpress.com')) {
+        // Bundle/SSR URLs: extract productIds param (first product only)
+        const bundleMatch = url.match(/[?&]productIds=([0-9]+)/);
+        if (bundleMatch) {
+          url = `https://www.aliexpress.us/item/${bundleMatch[1]}.html`;
+          console.log('AliExpress bundle URL → US item URL:', url);
+        } else {
+          // Always use aliexpress.us — shows USD prices + US shipping costs
+          const itemMatch = url.match(/(?:aliexpress\.us|aliexpress\.com)\/item\/(\d+)\.html/);
+          if (itemMatch) {
+            url = `https://www.aliexpress.us/item/${itemMatch[1]}.html`;
+          } else {
+            const idMatch = url.match(/\/(?:item\/)?([0-9]{10,})\.html/);
+            if (idMatch) url = `https://www.aliexpress.us/item/${idMatch[1]}.html`;
+            else url = url.replace('aliexpress.com', 'aliexpress.us').split('?')[0];
+          }
+        }
+        console.log('Normalized AliExpress URL to:', url);
+      }
+
       // Normalize Target URLs — keep clean /p/[slug]/-/A-[tcin]
       if (url.includes('target.com')) {
         const tMatch = url.match(/(https:\/\/www\.target\.com\/p\/[^?#]+\/A-\d+)/);
@@ -200,6 +221,9 @@ module.exports = async (req, res) => {
         url, source: '', title: '', price: '', images: [],
         description: '', brand: '', aspects: {},
         variations: [], variationImages: {}, hasVariations: false,
+        scrapedShipping: null,  // actual shipping cost from the page (null = use rule default)
+        shippingMethod: '',      // e.g. 'AliExpress Standard Shipping', 'Free Shipping', etc.
+        inStock: true, quantity: 10,
       };
 
       try {
@@ -584,24 +608,76 @@ module.exports = async (req, res) => {
                   for (const crit of data.variantCriteria) {
                     const vg = {
                       name: crit.label || crit.id,
-                      values: (crit.variantList||[]).map(v => ({
-                        value: v.name || v.id,
-                        price: v.priceInfo?.currentPrice?.price?.toString() || product.price,
-                        stock: v.availabilityStatus === 'IN_STOCK' ? 10 : 0,
-                        image: v.images?.[0]?.url || '',
-                        enabled: true,
-                      }))
+                      values: (crit.variantList||[]).map(v => {
+                        // PICKUP_ONLY = in-store only, not shippable → OOS for dropshipping
+                        const shippable = v.availabilityStatus === 'IN_STOCK' &&
+                          v.availabilityStatus !== 'PICKUP_ONLY' &&
+                          (v.fulfillmentType !== 'PICKUP_ONLY') &&
+                          !(v.fulfillmentBadge||'').toLowerCase().includes('pickup only');
+                        const stock = shippable ? 10 : 0;
+                        return {
+                          value: v.name || v.id,
+                          price: v.priceInfo?.currentPrice?.price?.toString() || product.price,
+                          stock,
+                          image: v.images?.[0]?.url || '',
+                          enabled: shippable,
+                          inStock: shippable,
+                        };
+                      })
                     };
                     if (vg.values.length > 0) product.variations.push(vg);
                     if ((crit.label||'').toLowerCase().includes('color')) {
                       const imgMap = {};
-                      vg.values.forEach(v => { if(v.image) imgMap[v.value] = v.image; });
+                      vg.values.forEach(v => { if(v.image && v.inStock !== false) imgMap[v.value] = v.image; });
                       if (Object.keys(imgMap).length) product.variationImages['Color'] = imgMap;
                     }
                   }
                   product.hasVariations = product.variations.length > 0;
                 }
+                // Top-level Walmart stock: only in-stock if shippable
+                const wmStatus = data.availabilityStatus || data.offerInfo?.productAvailabilityStatus || '';
+                const wmPickupOnly = wmStatus === 'PICKUP_ONLY' ||
+                  (data.fulfillmentBadge||'').toLowerCase().includes('pickup only') ||
+                  (data.offerInfo?.deliveryOptions||[]).every(o => o.type === 'PICKUP');
+                if (wmPickupOnly) {
+                  product.inStock = false;
+                  product.quantity = 0;
+                  console.log('Walmart: PICKUP_ONLY → out of stock for dropshipping');
+                } else if (wmStatus === 'OUT_OF_STOCK') {
+                  product.inStock = false;
+                  product.quantity = 0;
+                } else {
+                  const anyShippable = (product.variations||[]).flatMap(vg=>vg.values).some(v=>v.inStock);
+                  product.inStock = product.hasVariations ? anyShippable : (wmStatus === 'IN_STOCK' || wmStatus === '');
+                  product.quantity = product.inStock ? 10 : 0;
+                }
                 if (data.specifications) data.specifications.slice(0,10).forEach(s => { if(s.name&&s.value) product.aspects[s.name]=[s.value]; });
+
+                // Walmart shipping extraction
+                const wShipping = data.offerInfo?.shippingOptions?.[0] ||
+                                  data.shippingOptions?.[0] ||
+                                  data.fulfillmentInfo?.shippingOptions?.[0];
+                if (wShipping) {
+                  const wFee = parseFloat(wShipping.shipPrice?.price || wShipping.amount || 'NaN');
+                  const wFree = wShipping.shipPrice?.price === '0.00' || wShipping.shipPrice?.price === 0 ||
+                                (wShipping.displayLabel||'').toLowerCase().includes('free') ||
+                                data.priceInfo?.wasPrice === null && (data.offerInfo?.isFreeShipping);
+                  if (wFree || wFee === 0) {
+                    product.scrapedShipping = 0;
+                    product.shippingMethod = 'Free Shipping';
+                  } else if (!isNaN(wFee)) {
+                    product.scrapedShipping = wFee;
+                    product.shippingMethod = `$${wFee.toFixed(2)} Shipping`;
+                  }
+                }
+                if (product.scrapedShipping === null) {
+                  // Regex fallback from HTML
+                  const freeM = /free\s+(?:delivery|shipping)/i.test(html);
+                  const feeM = html.match(/shipping[^$]*\$(\d+\.\d{2})/i);
+                  if (freeM) { product.scrapedShipping = 0; product.shippingMethod = 'Free Delivery'; }
+                  else if (feeM) { product.scrapedShipping = parseFloat(feeM[1]); }
+                  else { product.scrapedShipping = 0; product.shippingMethod = 'Free Delivery'; }
+                }
               }
             } catch {}
           }
@@ -611,46 +687,124 @@ module.exports = async (req, res) => {
         }
 
         // ── ALIEXPRESS ───────────────────────────────────────────────────
-        else if (url.includes('aliexpress.com')) {
+        else if (url.includes('aliexpress.com') || url.includes('aliexpress.us')) {
           product.source = 'aliexpress';
-          const rp = html.match(/window\.runParams\s*=\s*(\{[\s\S]*?\});\s*\n/);
+          // Try window.runParams (classic AliExpress structure)
+          const rp = html.match(/window\.runParams\s*=\s*(\{[\s\S]*?\});\s*\n/) ||
+                     html.match(/window\.runParams\s*=\s*(\{[\s\S]*?\})\s*;\s*(?:\/\/|\n)/);
           if (rp) {
             try {
               const data = JSON.parse(rp[1]);
-              const info = data?.data?.productInfoComponent || data?.data;
-              if (info) {
-                product.title = info.subject || info.title || '';
-                product.price = info.priceComponent?.discountPrice?.formatedAmount?.replace(/[^0-9.]/g,'') ||
-                                info.priceComponent?.originalPrice?.formatedAmount?.replace(/[^0-9.]/g,'') || '';
-                product.description = info.description || '';
-                if (info.imagePathList) product.images = info.imagePathList.map(i=>`https:${i}`).slice(0,12);
-                const sku = data?.data?.skuComponent || info.skuComponent;
-                if (sku?.productSKUPropertyList) {
-                  for (const prop of sku.productSKUPropertyList) {
-                    const vg = {
-                      name: prop.skuPropertyName,
-                      values: (prop.skuPropertyValues||[]).map(v => ({
-                        value: v.propertyValueDisplayName || v.propertyValueName,
-                        price: product.price, stock: 10,
-                        image: v.skuPropertyImagePath ? `https:${v.skuPropertyImagePath}` : '',
-                        enabled: true,
-                      }))
-                    };
-                    if (vg.values.length > 0) product.variations.push(vg);
-                    if (prop.skuPropertyName.toLowerCase().includes('color')) {
-                      const imgMap = {};
-                      vg.values.forEach(v => { if(v.image) imgMap[v.value] = v.image; });
-                      if (Object.keys(imgMap).length) product.variationImages['Color'] = imgMap;
-                    }
+              const d = data?.data || data;
+              const info = d?.productInfoComponent || d;
+
+              product.title = info?.subject || info?.title || d?.titleModule?.subject || '';
+              product.brand = info?.brandComponent?.brandName || d?.brandModule?.brandName || '';
+
+              // Price — try discount first, then original
+              const pc = info?.priceComponent || d?.priceModule;
+              product.price =
+                pc?.discountPrice?.formatedAmount?.replace(/[^0-9.]/g,'') ||
+                pc?.originalPrice?.formatedAmount?.replace(/[^0-9.]/g,'') ||
+                String(pc?.minActivityAmount?.value || pc?.minAmount?.value || '');
+
+              // Description / highlights
+              const desc = d?.productDescComponent || d?.descriptionModule;
+              product.description = (desc?.descriptionUrl ? '' : info?.description || d?.detailModule?.description || '');
+
+              // Images — try multiple paths
+              if (info?.imagePathList?.length) {
+                product.images = info.imagePathList.map(i => i.startsWith('http') ? i : `https:${i}`).slice(0,12);
+              } else if (d?.imageModule?.imagePathList?.length) {
+                product.images = d.imageModule.imagePathList.map(i => i.startsWith('http') ? i : `https:${i}`).slice(0,12);
+              }
+
+              // ── SHIPPING COST: extract from shippingComponent ──────────
+              const sc = d?.shippingModule || d?.shippingComponent || d?.deliveryModule;
+              if (sc) {
+                // Iterate shipping options, pick cheapest that ships to US
+                const options = sc?.shippingList || sc?.freightList || sc?.deliveryOptionList || [];
+                let cheapest = null;
+                for (const opt of options) {
+                  const fee = parseFloat(
+                    opt?.freightAmount?.value ?? opt?.price?.value ?? opt?.shippingFee ?? opt?.amount?.value ?? 'NaN'
+                  );
+                  const method = opt?.company || opt?.serviceName || opt?.logisticsDesc || '';
+                  const isFree = fee === 0 || (opt?.displayAmount||'').toLowerCase().includes('free') ||
+                                 (opt?.freightAmount?.formattedAmount||'').toLowerCase().includes('free');
+                  if (isFree) { cheapest = { cost: 0, method: method || 'Free Shipping' }; break; }
+                  if (!isNaN(fee) && (cheapest === null || fee < cheapest.cost)) {
+                    cheapest = { cost: fee, method };
                   }
-                  product.hasVariations = product.variations.length > 0;
+                }
+                // Also check top-level freeShipping flag
+                if (sc.hasFreeShipping || sc.isFreeShipping || sc.freightAmount?.value === '0') {
+                  cheapest = { cost: 0, method: 'Free Shipping' };
+                }
+                if (cheapest !== null) {
+                  product.scrapedShipping = cheapest.cost;
+                  product.shippingMethod = cheapest.method;
+                  console.log(`AliExpress shipping: $${cheapest.cost} (${cheapest.method})`);
                 }
               }
-            } catch {}
+
+              // Variations / SKUs
+              const sku = d?.skuComponent || info?.skuComponent || d?.skuModule;
+              if (sku?.productSKUPropertyList) {
+                for (const prop of sku.productSKUPropertyList) {
+                  const vg = {
+                    name: prop.skuPropertyName,
+                    values: (prop.skuPropertyValues||[]).map(v => ({
+                      value: v.propertyValueDisplayName || v.propertyValueName,
+                      price: product.price, stock: 10,
+                      image: v.skuPropertyImagePath ? (v.skuPropertyImagePath.startsWith('http') ? v.skuPropertyImagePath : `https:${v.skuPropertyImagePath}`) : '',
+                      enabled: true,
+                    }))
+                  };
+                  if (vg.values.length > 0) product.variations.push(vg);
+                  if (prop.skuPropertyName.toLowerCase().includes('color')) {
+                    const imgMap = {};
+                    vg.values.forEach(v => { if(v.image) imgMap[v.value] = v.image; });
+                    if (Object.keys(imgMap).length) product.variationImages['Color'] = imgMap;
+                  }
+                }
+                product.hasVariations = product.variations.length > 0;
+              }
+
+              // Specs
+              const specs = d?.specsModule?.props || d?.productPropComponent?.itemProps || [];
+              for (const s of specs.slice(0,12)) {
+                const k = s.attrName || s.name, v = (s.attrValue||s.value||'').replace(/<[^>]+>/g,'').trim();
+                if (k && v) product.aspects[k] = [v];
+              }
+
+            } catch(e) { console.warn('AliExpress runParams parse error:', e.message); }
           }
-          if (!product.title) { const m=html.match(/"subject":"([^"]+)"/); if(m) product.title=m[1]; }
-          if (!product.price) { const m=html.match(/"minAmount":\{"value":(\d+\.?\d*)/); if(m) product.price=m[1]; }
-          if (!product.images.length) { const imgs=[...html.matchAll(/"imageUrl":"(https?:\/\/ae[^"]+)"/g)].map(m=>m[1]); product.images=[...new Set(imgs)].slice(0,12); }
+
+          // ── Fallback regex if runParams failed ──
+          if (!product.title) {
+            const m = html.match(/"subject":"([^"]+)"/);
+            if (m) product.title = m[1];
+          }
+          if (!product.price) {
+            const m = html.match(/"minAmount":\{"value":([0-9.]+)/) || html.match(/"activityAmount":\{"value":([0-9.]+)/);
+            if (m) product.price = m[1];
+          }
+          if (!product.images.length) {
+            const imgs = [...html.matchAll(/"imageUrl":"(https?:\/\/ae[^"]+)"/g)].map(m=>m[1]);
+            product.images = [...new Set(imgs)].slice(0,12);
+          }
+          if (product.scrapedShipping === null) {
+            // Regex fallback for shipping
+            const freeShip = /free\s+shipping|\$0\.00\s+shipping/i.test(html);
+            const shipMatch = html.match(/"freightAmount":\{"value":([0-9.]+)/);
+            if (freeShip) { product.scrapedShipping = 0; product.shippingMethod = 'Free Shipping'; }
+            else if (shipMatch) { product.scrapedShipping = parseFloat(shipMatch[1]); }
+          }
+
+          // AliExpress stock: if listing exists it's in stock (no pickup concept)
+          product.inStock = !!product.title;
+          product.quantity = product.inStock ? 10 : 0;
         }
 
         // ── TARGET ───────────────────────────────────────────────────────
@@ -781,6 +935,19 @@ module.exports = async (req, res) => {
           product.inStock = itemInStock;
           product.quantity = itemInStock ? 10 : 0;
 
+          // Target shipping: free if order ≥ $35, else $5.99
+          const tPrice = parseFloat(product.price) || 0;
+          if (!itemInStock) {
+            product.scrapedShipping = null; // OOS, no shipping
+          } else if (tPrice >= 35 || hl.includes('free shipping') || hl.includes('free delivery') || hl.includes('ships free')) {
+            product.scrapedShipping = 0;
+            product.shippingMethod = tPrice >= 35 ? 'Free Shipping (≥$35)' : 'Free Shipping';
+          } else {
+            product.scrapedShipping = 5.99;
+            product.shippingMethod = 'Standard Shipping $5.99';
+          }
+          console.log(`Target shipping: $${product.scrapedShipping} (${product.shippingMethod}) price=$${tPrice}`);
+
           if (sortedSizes.length > 1) {
             product.variations.push({
               name: 'Size',
@@ -809,31 +976,105 @@ module.exports = async (req, res) => {
         // ── WEBSTAURANTSTORE ─────────────────────────────────────────────
         else if (url.includes('webstaurantstore.com')) {
           product.source = 'webstaurantstore';
-          const t = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
-          if (t) product.title = t[1].replace(/<[^>]+>/g,'').trim();
-          const pm = html.match(/\$(\d+\.\d{2})/); if (pm) product.price = pm[1];
-          const imgs = [...html.matchAll(/src="(https:\/\/cdn[0-9]*\.webstaurantstore\.com\/images\/[^"]+\.(?:jpg|jpeg|png|webp))"/gi)].map(m=>m[1]);
-          product.images = [...new Set(imgs)].filter(i=>!i.includes('icon')&&!i.includes('logo')).slice(0,12);
-          const descM = html.match(/class="description[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-          if (descM) product.description = descM[1].replace(/<[^>]+>/g,'').trim().slice(0,2000);
-          const varTable = html.match(/<table[^>]*class="[^"]*variant[^"]*"[^>]*>([\s\S]*?)<\/table>/i);
-          if (varTable) {
-            const rows = [...varTable[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)];
-            const vals = [];
-            for (const row of rows.slice(1)) {
-              const cells = [...row[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)].map(m=>m[1].replace(/<[^>]+>/g,'').trim());
-              if (cells.length >= 2 && cells[0]) {
-                const pc = cells.find(c=>c.match(/\$[\d.]+/));
-                vals.push({ value:cells[0], price:pc?pc.replace(/[^0-9.]/g,''):product.price, stock:10, image:'', enabled:true });
-              }
+
+          // Title from H1
+          const wt = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+          if (wt) product.title = wt[1].replace(/<[^>]+>/g,'').trim();
+
+          // Price — first $X.XX on page
+          const wpm = html.match(/\$(\d{1,4}\.\d{2})/);
+          if (wpm) product.price = wpm[1];
+
+          // Brand from vendor link
+          const wbrand = html.match(/vendor\/([a-z0-9-]+)\.html/i);
+          if (wbrand) product.brand = wbrand[1].replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+
+          // Images — cdnimg.webstaurantstore.com (large product images only)
+          const wImgLarge = [...html.matchAll(/cdnimg\.webstaurantstore\.com\/images\/products\/large\/[\d]+\/([\d]+)\.(?:jpg|jpeg|png)/gi)]
+            .map(m => `https://cdnimg.webstaurantstore.com/images/products/large/${m[0].match(/large\/(\d+)\/(\d+)/)[1]}/${m[0].match(/large\/(\d+)\/(\d+)/)[2]}.jpg`);
+          if (wImgLarge.length) {
+            product.images = [...new Set(wImgLarge)].filter(i=>!i.includes('placeholder')).slice(0,12);
+          }
+          if (!product.images.length) {
+            // Fall back to thumbnails
+            const wImgThumb = [...html.matchAll(/cdnimg\.webstaurantstore\.com\/images\/products\/(?:thumbnails|medium)\/[^"'\s]+/gi)].map(m=>`https://${m[0]}`);
+            product.images = [...new Set(wImgThumb)].filter(i=>!i.includes('placeholder')).slice(0,12);
+          }
+
+          // Description — product overview bullets
+          const wOvM = html.match(/Product Overview[\s\S]*?<ul[^>]*>([\s\S]*?)<\/ul>/i);
+          if (wOvM) {
+            const bullets = [...wOvM[1].matchAll(/<li[^>]*>([\s\S]*?)<\/li>/g)]
+              .map(m=>m[1].replace(/<[^>]+>/g,'').trim()).filter(b=>b.length>5);
+            product.description = bullets.join('. ');
+          }
+
+          // Sibling variants: Size group and Finish/Color group
+          // WebstaurantStore uses separate <div class="variants"> sections with header text
+          // Pattern: ## Size: / ## Finish: labels followed by sibling product links
+          const varSections = [...html.matchAll(/<(?:h2|h3|div)[^>]*>\s*(?:Size|Finish|Color|Style)[:\s]*\s*<\/(?:h2|h3|div)>([\s\S]*?)(?=<(?:h2|h3|div)[^>]*>(?:Size|Finish|Color|Style)[:\s]|<div[^>]*class="[^"]*product-[^"]*")/gi)];
+          const siblingLinks = [...html.matchAll(/href="(\/[a-z0-9-]+\/[A-Z0-9]+\.html)"[^>]*>([^<]+)<\/a>/g)];
+          
+          // Build variants from sibling links: group by whether label looks like a size or finish
+          const SIZE_RE = /^(?:xxs|xs|s|sm|m|md|l|lg|xl|xxl|2xl|3xl|4xl|5xl|1x|2x|3x|\d+["′]\s*x\s*\d+["′]?(?:\s*x\s*\d+["′]?)?|\d+(?:\.\d+)?["′]\s*x\s*\d+(?:\.\d+)?["′])$/i;
+          const FINISH_RE = /(?:black|chrome|green|red|blue|silver|gold|white|stainless|epoxy|galvanized|zinc|nickel|bronze)/i;
+
+          const sizeVals = [], finishVals = [];
+          const seenSVals = new Set(), seenFVals = new Set();
+
+          for (const lm of siblingLinks) {
+            const href = lm[1], label = lm[2].trim().replace(/&quot;/g,'"').replace(/&amp;/g,'&').replace(/&#34;/g,'"');
+            if (!label || href === '#' || label.length > 60) continue;
+            // Is this a size-like label?
+            if (SIZE_RE.test(label.replace(/\s+/g,'')) && !seenSVals.has(label)) {
+              seenSVals.add(label);
+              sizeVals.push({ value: label, price: product.price || '0', stock: 10, image: '', enabled: true,
+                             sourceUrl: `https://www.webstaurantstore.com${href}` });
+            } else if (FINISH_RE.test(label) && !seenFVals.has(label)) {
+              seenFVals.add(label);
+              finishVals.push({ value: label, price: product.price || '0', stock: 10, image: '', enabled: true,
+                               sourceUrl: `https://www.webstaurantstore.com${href}` });
             }
-            if (vals.length > 0) { product.variations.push({ name:'Size', values:vals }); product.hasVariations = true; }
           }
-          const specRows = [...html.matchAll(/<tr[^>]*>[\s\S]*?<th[^>]*>([\s\S]*?)<\/th>[\s\S]*?<td[^>]*>([\s\S]*?)<\/td>[\s\S]*?<\/tr>/g)];
-          for (const row of specRows.slice(0,10)) {
+          // Add current page as a variant entry if siblings found
+          if (sizeVals.length > 0) {
+            product.variations.push({ name: 'Size', values: sizeVals });
+            product.hasVariations = true;
+          }
+          if (finishVals.length > 0) {
+            product.variations.push({ name: 'Finish', values: finishVals });
+            product.hasVariations = true;
+          }
+
+          // Specs from spec table
+          const wSpecRows = [...html.matchAll(/<tr[^>]*>[\s\S]*?<(?:th|td)[^>]*>([\s\S]*?)<\/(?:th|td)>[\s\S]*?<td[^>]*>([\s\S]*?)<\/td>[\s\S]*?<\/tr>/g)];
+          for (const row of wSpecRows.slice(0,12)) {
             const k=row[1].replace(/<[^>]+>/g,'').trim(), v=row[2].replace(/<[^>]+>/g,'').trim();
-            if (k&&v) product.aspects[k]=[v];
+            if (k&&v&&k.length<60&&v.length<120) product.aspects[k]=[v];
           }
+
+          // Shipping: WebstaurantStore charges by weight/order; "Ships free with Plus" or flat rate
+          // "Quick Shipping" means it ships within 1 business day
+          const whl = html.toLowerCase();
+          if (whl.includes('ships free') || whl.includes('free shipping') || whl.includes('free delivery')) {
+            product.scrapedShipping = 0;
+            product.shippingMethod = 'Free Shipping';
+          } else {
+            // WebstaurantStore uses variable freight; default $9.99 for standard items
+            // Try to extract displayed shipping rate
+            const wShipM = html.match(/\$([0-9]+\.[0-9]{2})\s*(?:\/each)?.{0,20}(?:shipping|freight)/i);
+            if (wShipM) {
+              product.scrapedShipping = parseFloat(wShipM[1]);
+              product.shippingMethod = `$${wShipM[1]} Shipping`;
+            } else {
+              product.scrapedShipping = null; // use rule default ($9.99)
+              product.shippingMethod = 'Calculated at checkout';
+            }
+          }
+
+          // Stock: WebstaurantStore shows "Add to Cart" when in stock
+          product.inStock = whl.includes('add to cart') && !whl.includes('out of stock') && !whl.includes('notify me');
+          product.quantity = product.inStock ? 10 : 0;
         }
 
         // ── Top-level stock detection ────────────────────────────────────
@@ -867,6 +1108,23 @@ module.exports = async (req, res) => {
             } else {
               product.inStock = true;
               product.quantity = 10;
+            }
+          }
+          // Amazon shipping extraction
+          if (/FREE\s+(?:Delivery|Shipping)|FREE Returns/i.test(htmlLower) ||
+              html.includes('"isFreeShipping":true') || html.includes('"freeShipping":true')) {
+            product.scrapedShipping = 0;
+            product.shippingMethod = 'FREE Delivery';
+          } else {
+            const shipM = html.match(/\$([0-9]+\.[0-9]{2})\s+shipping/i) ||
+                          html.match(/"shippingPrice":\{"amount":"([0-9.]+)"/);
+            if (shipM) {
+              product.scrapedShipping = parseFloat(shipM[1]);
+              product.shippingMethod = `$${shipM[1]} shipping`;
+            } else {
+              // Default: Amazon Prime / standard items ship free
+              product.scrapedShipping = 0;
+              product.shippingMethod = 'FREE Delivery';
             }
           }
           console.log(`stock: inStock=${product.inStock} oos=${isOOS} addToCart=${hasAddToCart}`);
