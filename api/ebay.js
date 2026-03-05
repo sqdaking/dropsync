@@ -184,10 +184,16 @@ module.exports = async (req, res) => {
         }
       }
 
-      // Normalize Walmart URLs too
+      // Normalize Walmart URLs
       if (url.includes('walmart.com')) {
         const wmMatch = url.match(/\/ip\/(?:[^/]+\/)?(\d{6,})/);
         if (wmMatch) url = `https://www.walmart.com/ip/${wmMatch[1]}`;
+      }
+
+      // Normalize Target URLs — keep clean /p/[slug]/-/A-[tcin]
+      if (url.includes('target.com')) {
+        const tMatch = url.match(/(https:\/\/www\.target\.com\/p\/[^?#]+\/A-\d+)/);
+        if (tMatch) url = tMatch[1];
       }
 
       const product = {
@@ -647,6 +653,196 @@ module.exports = async (req, res) => {
           if (!product.images.length) { const imgs=[...html.matchAll(/"imageUrl":"(https?:\/\/ae[^"]+)"/g)].map(m=>m[1]); product.images=[...new Set(imgs)].slice(0,12); }
         }
 
+        // ── TARGET ───────────────────────────────────────────────────────
+        else if (url.includes('target.com')) {
+          product.source = 'target';
+
+          // Extract TCIN from URL: /A-94940497 or ?tcin=94940497
+          const tcinM = url.match(/\/A-(\d{6,})/) || url.match(/[?&]tcin=(\d{6,})/);
+          const tcin = tcinM ? tcinM[1] : null;
+
+          // ── Try Redsky API first (clean structured JSON) ──
+          let apiData = null;
+          if (tcin) {
+            try {
+              const apiUrl = `https://redsky.target.com/redsky_aggregations/v1/web/pdp_client_v1?key=9f36aeafbe60771e321a7cc95a78140772ab3e96&tcin=${tcin}&is_bot=false&store_id=1685&pricing_store_id=1685`;
+              const apiRes = await fetch(apiUrl, {
+                headers: {
+                  'User-Agent': ua,
+                  'Accept': 'application/json',
+                  'Origin': 'https://www.target.com',
+                  'Referer': url,
+                },
+              });
+              if (apiRes.ok) {
+                const apiJson = await apiRes.json();
+                apiData = apiJson?.data?.product;
+              }
+            } catch (e) { console.warn('Target Redsky API failed:', e.message); }
+          }
+
+          if (apiData) {
+            // ── Redsky API path ──────────────────────────────────────────
+            const item = apiData?.item;
+            product.title = item?.product_description?.title || '';
+            product.brand = item?.primary_brand?.name || '';
+            product.description = [
+              item?.product_description?.long_description || '',
+              ...(item?.product_description?.bullet_descriptions || []).map(b => b.replace(/<[^>]+>/g,'').trim()),
+            ].filter(Boolean).join('\n');
+
+            // Price
+            const pricing = apiData?.price;
+            product.price = (pricing?.current_retail || pricing?.reg_retail || '').toString();
+
+            // Rating
+            const rating = apiData?.ratings_and_reviews?.statistics;
+            if (rating) {
+              product.aspects['Rating'] = [`${rating.overall_rating?.toFixed(1) || ''} (${rating.total_review_count || 0} reviews)`];
+            }
+
+            // Images — scene7 CDN, request large size
+            const imgMeta = item?.enrichment?.images?.primary_image_url;
+            const altImgs = item?.enrichment?.images?.alternate_image_urls || [];
+            const allImgUrls = [imgMeta, ...altImgs].filter(Boolean).map(i =>
+              i.includes('?') ? i.replace(/wid=\d+|hei=\d+/g, 'wid=800&hei=800') : `${i}?wid=800&hei=800&fmt=pjpeg`
+            );
+            product.images = [...new Set(allImgUrls)].slice(0, 12);
+
+            // Variations — Target sizes are separate TCINs; collect from variation data
+            const varChildren = apiData?.variation_hierarchy || apiData?.children || [];
+            const varType = apiData?.variation_type;
+
+            if (varChildren.length > 0 || varType) {
+              // Try to get all sibling variant TCINs from the variation data
+              try {
+                const parentTcin = item?.parent_tcin || tcin;
+                // Fetch parent to get all children
+                const parentApiUrl = `https://redsky.target.com/redsky_aggregations/v1/web/pdp_client_v1?key=9f36aeafbe60771e321a7cc95a78140772ab3e96&tcin=${parentTcin}&is_bot=false&store_id=1685`;
+                const parentRes = await fetch(parentApiUrl, {
+                  headers: { 'User-Agent': ua, 'Accept': 'application/json', 'Origin': 'https://www.target.com', 'Referer': url },
+                });
+                if (parentRes.ok) {
+                  const parentJson = await parentRes.json();
+                  const children = parentJson?.data?.product?.children || [];
+                  if (children.length > 0) {
+                    // Group by variation dimension (Size, Color, etc.)
+                    const dimGroups = {};
+                    for (const child of children) {
+                      const dims = child.variation?.['swatches'] || child.item?.variation_hierarchy || [];
+                      for (const dim of dims) {
+                        const dimName = dim.type === 'size_type' ? 'Size' : dim.type === 'color_type' ? 'Color' : (dim.type || 'Variant');
+                        if (!dimGroups[dimName]) dimGroups[dimName] = [];
+                        const childPrice = child.price?.current_retail || child.price?.reg_retail || product.price;
+                        const childImg = child.item?.enrichment?.images?.primary_image_url || '';
+                        const inStock = child.fulfillment?.shipping_options?.availability_status === 'IN_STOCK' ||
+                                        child.fulfillment?.store_options?.[0]?.availability_status === 'IN_STOCK';
+                        if (!dimGroups[dimName].find(v => v.value === dim.value)) {
+                          dimGroups[dimName].push({
+                            value: dim.value,
+                            price: childPrice.toString(),
+                            stock: inStock ? 10 : 0,
+                            image: childImg ? `${childImg}?wid=400&hei=400&fmt=pjpeg` : '',
+                            enabled: true,
+                          });
+                        }
+                      }
+                    }
+                    for (const [dimName, values] of Object.entries(dimGroups)) {
+                      if (values.length > 0) {
+                        product.variations.push({ name: dimName, values });
+                        if (dimName === 'Color') {
+                          const imgMap = {};
+                          values.forEach(v => { if (v.image) imgMap[v.value] = v.image; });
+                          if (Object.keys(imgMap).length) product.variationImages['Color'] = imgMap;
+                        }
+                      }
+                    }
+                    product.hasVariations = product.variations.length > 0;
+                  }
+                }
+              } catch (e) { console.warn('Target variant fetch failed:', e.message); }
+            }
+
+            // Specs
+            const specList = item?.product_description?.bullet_descriptions || [];
+            if (item?.product_description?.soft_bullets?.bullets) {
+              specList.push(...item.product_description.soft_bullets.bullets);
+            }
+            specList.slice(0, 10).forEach((b, i) => {
+              const clean = b.replace(/<[^>]+>/g,'').trim();
+              if (clean) product.aspects[`Feature ${i+1}`] = [clean];
+            });
+
+          } else {
+            // ── HTML fallback — parse __NEXT_DATA__ or raw HTML ─────────
+            const nd = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+            if (nd) {
+              try {
+                const pageData = JSON.parse(nd[1]);
+                // Target Next.js structure varies; try multiple paths
+                const pd = pageData?.props?.pageProps?.initialData?.data?.product ||
+                           pageData?.props?.pageProps?.product;
+                if (pd) {
+                  product.title = pd.item?.product_description?.title || pd.title || '';
+                  product.brand = pd.item?.primary_brand?.name || '';
+                  const pricing = pd.price;
+                  product.price = (pricing?.current_retail || pricing?.reg_retail || '').toString();
+                  const imgs = pd.item?.enrichment?.images;
+                  if (imgs?.primary_image_url) {
+                    product.images = [imgs.primary_image_url, ...(imgs.alternate_image_urls||[])].filter(Boolean).map(i=>`${i}?wid=800&hei=800&fmt=pjpeg`).slice(0,12);
+                  }
+                  product.description = pd.item?.product_description?.long_description?.replace(/<[^>]+>/g,'') || '';
+                }
+              } catch (e) { console.warn('Target __NEXT_DATA__ parse failed:', e.message); }
+            }
+
+            // Raw HTML fallbacks
+            if (!product.title) {
+              const m = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+              if (m) product.title = m[1].replace(/<[^>]+>/g,'').trim();
+            }
+            if (!product.price) {
+              const m = html.match(/\$(\d+\.\d{2})/);
+              if (m) product.price = m[1];
+            }
+            if (!product.images.length) {
+              // Extract scene7 image URLs from HTML
+              const imgMatches = [...html.matchAll(/target\.scene7\.com\/is\/image\/Target\/(GUEST_[a-f0-9-]+)/gi)].map(m =>
+                `https://target.scene7.com/is/image/Target/${m[1]}?wid=800&hei=800&fmt=pjpeg`
+              );
+              product.images = [...new Set(imgMatches)].slice(0, 12);
+            }
+            // Extract sizes from size selector links
+            if (!product.hasVariations) {
+              const sizeMatches = [...html.matchAll(/href="(\/p\/[^"]+\/A-(\d+))"[^>]*>[\s\S]*?<\/a>/g)];
+              const sizeNames = [...html.matchAll(/href="\/p\/[^"]+-([a-z0-9]+)\/-\/A-\d+"/gi)].map(m => m[1].toUpperCase());
+              if (sizeNames.length > 1) {
+                product.variations.push({
+                  name: 'Size',
+                  values: [...new Set(sizeNames)].map(s => ({
+                    value: s, price: product.price, stock: 10, image: '', enabled: true,
+                  })),
+                });
+                product.hasVariations = true;
+              }
+            }
+          }
+
+          // ── Clean up title (remove "Shade & Shore™ Cream XL" size suffix) ──
+          if (product.title) {
+            product.title = product.title.replace(/\s*-\s*[^-]+™[^-]*$/, '').trim() || product.title;
+          }
+
+          // ── Aspect specs from bullet list in HTML ──
+          if (Object.keys(product.aspects).length === 0) {
+            const bullets = [...html.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/g)]
+              .map(m => m[1].replace(/<[^>]+>/g,'').trim())
+              .filter(b => b.length > 10 && b.length < 200);
+            bullets.slice(0, 8).forEach((b, i) => { product.aspects[`Detail ${i+1}`] = [b]; });
+          }
+        }
+
         // ── WEBSTAURANTSTORE ─────────────────────────────────────────────
         else if (url.includes('webstaurantstore.com')) {
           product.source = 'webstaurantstore';
@@ -711,65 +907,6 @@ module.exports = async (req, res) => {
             }
           }
           console.log(`stock: inStock=${product.inStock} oos=${isOOS} addToCart=${hasAddToCart}`);
-        }
-
-        // ── AI ENHANCEMENTS (title + category) ──────────────────────────
-        const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-        if (ANTHROPIC_KEY && product.title) {
-          try {
-            const aiPrompt = `You are an eBay listing optimization expert.
-
-Product title: "${product.title}"
-Category hint: "${product.aspects?.['Item Type'] || product.aspects?.['Type'] || ''}"
-Source URL: "${url}"
-
-Return ONLY a JSON object with exactly these fields:
-{
-  "title": "12-word compelling eBay title, keyword-rich, no brand trademark issues, no ALL CAPS",
-  "categoryId": "single most accurate eBay category ID number as string (e.g. '11554', '9355', '175672')"
-}
-
-For the eBay categoryId, use these common ones:
-- Women's Jeans: 11555, Men's Jeans: 11554
-- Women's Pants/Leggings: 63862, Men's Pants: 57988
-- Women's Tops/Shirts: 15724, Men's Shirts: 57991
-- Hoodies/Sweatshirts (W): 155183, (M): 155202
-- Dresses: 63861, Shorts (W): 11554
-- Yoga/Athletic Pants (W): 63862
-- Coffee Makers: 20671, Blenders: 20676, Cookware Sets: 26672
-- Pressure Cookers: 66956, Air Fryers: 177749
-- Portable Speakers: 14969, Wireless Earbuds: 112529
-- Smart Watches: 178893, Phone Cases: 9394
-- Laptops: 177, Tablets: 171485
-- LED Strip Lights: 183372, Lamps/Shades: 112581
-- Yoga Mats: 26350, Dumbbells: 15273, Resistance Bands: 73986
-- Hair Dryers: 11649, Electric Shavers: 26387
-- Dog Food: 66774, Cat Toys: 177068
-- Children's Books: 11 (nonfiction), 152 (fiction)
-- General (unknown): 9355`;
-
-            const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-              body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 200, messages: [{ role: 'user', content: aiPrompt }] }),
-            });
-            const aiData = await aiRes.json();
-            const aiText = aiData.content?.[0]?.text || '';
-            const jsonMatch = aiText.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-              const parsed = JSON.parse(jsonMatch[0]);
-              if (parsed.title && parsed.title.trim()) {
-                product.originalTitle = product.title;
-                product.title = parsed.title.trim().slice(0, 80);
-              }
-              if (parsed.categoryId && /^\d+$/.test(parsed.categoryId.trim())) {
-                product.categoryId = parsed.categoryId.trim();
-              }
-              console.log(`AI title: "${product.title}" cat: ${product.categoryId}`);
-            }
-          } catch (aiErr) {
-            console.warn('AI enhancement skipped:', aiErr.message);
-          }
         }
 
         // ── IMAGE FALLBACK: replace broken variation images with main photo ──
@@ -1972,6 +2109,57 @@ For the eBay categoryId, use these common ones:
         return res.json({ success: true, mapping: urlMapping });
       } catch (e) {
         return res.json({ success: false, error: 'Could not parse AI response: ' + e.message, raw: text });
+      }
+    }
+
+    // ── AI TITLE + CATEGORY ENHANCEMENT ──────────────────────────────
+    if (action === 'enhanceTitle') {
+      const { title, categoryHint, url: productUrl } = body;
+      if (!title) return res.status(400).json({ error: 'Missing title' });
+      const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+      if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
+
+      const aiPrompt = `You are an eBay listing expert. Given this product, return an optimized title and eBay category ID.
+
+Product title: "${title}"
+Category hint: "${categoryHint || ''}"
+URL: "${productUrl || ''}"
+
+Rules for title: exactly 12 words, keyword-rich for eBay search, compelling for buyers, no ALL CAPS, no trademark issues.
+
+Return ONLY valid JSON, no markdown:
+{"title":"your 12-word title here","categoryId":"number"}
+
+Common eBay category IDs:
+Women Jeans:11555 Men Jeans:11554 Women Pants/Leggings:63862 Men Pants:57988
+Women Tops:15724 Men Shirts:57991 Women Hoodies:155183 Men Hoodies:155202
+Dresses:63861 Women Shorts:15689 Men Shorts:57989 Sneakers:15709
+Coffee Makers:20671 Blenders:20676 Cookware:26672 Pressure Cookers:66956 Air Fryers:177749
+TVs:11071 Earbuds:112529 Smart Watches:178893 Phone Cases:9394 Laptops:177 Tablets:171485
+LED Strips:183372 Lamps:112581 Yoga Mats:26350 Dumbbells:15273 Resistance Bands:73986
+Dog Food:66774 Cat Toys:177068 Baby Clothing:11538 Hair Dryers:11649
+Knives:46742 Mixing Bowls:35030 Bakeware:66596 Storage Containers:36028
+Gaming Headsets:117042 Keyboards:3676 RGB Lighting:183372
+General/Unknown:9355`;
+
+      try {
+        const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 150, messages: [{ role: 'user', content: aiPrompt }] }),
+        });
+        const aiData = await aiRes.json();
+        const aiText = aiData.content?.[0]?.text || '';
+        const jsonMatch = aiText.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) return res.json({ success: false, error: 'No JSON in response', raw: aiText });
+        const parsed = JSON.parse(jsonMatch[0]);
+        return res.json({
+          success: true,
+          title: (parsed.title || '').trim().slice(0, 80),
+          categoryId: /^\d+$/.test((parsed.categoryId || '').trim()) ? parsed.categoryId.trim() : null,
+        });
+      } catch (e) {
+        return res.json({ success: false, error: e.message });
       }
     }
 
