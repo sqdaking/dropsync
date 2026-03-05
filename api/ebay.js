@@ -713,6 +713,87 @@ module.exports = async (req, res) => {
           console.log(`stock: inStock=${product.inStock} oos=${isOOS} addToCart=${hasAddToCart}`);
         }
 
+        // ── AI ENHANCEMENTS (title + category) ──────────────────────────
+        const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+        if (ANTHROPIC_KEY && product.title) {
+          try {
+            const aiPrompt = `You are an eBay listing optimization expert.
+
+Product title: "${product.title}"
+Category hint: "${product.aspects?.['Item Type'] || product.aspects?.['Type'] || ''}"
+Source URL: "${url}"
+
+Return ONLY a JSON object with exactly these fields:
+{
+  "title": "12-word compelling eBay title, keyword-rich, no brand trademark issues, no ALL CAPS",
+  "categoryId": "single most accurate eBay category ID number as string (e.g. '11554', '9355', '175672')"
+}
+
+For the eBay categoryId, use these common ones:
+- Women's Jeans: 11555, Men's Jeans: 11554
+- Women's Pants/Leggings: 63862, Men's Pants: 57988
+- Women's Tops/Shirts: 15724, Men's Shirts: 57991
+- Hoodies/Sweatshirts (W): 155183, (M): 155202
+- Dresses: 63861, Shorts (W): 11554
+- Yoga/Athletic Pants (W): 63862
+- Coffee Makers: 20671, Blenders: 20676, Cookware Sets: 26672
+- Pressure Cookers: 66956, Air Fryers: 177749
+- Portable Speakers: 14969, Wireless Earbuds: 112529
+- Smart Watches: 178893, Phone Cases: 9394
+- Laptops: 177, Tablets: 171485
+- LED Strip Lights: 183372, Lamps/Shades: 112581
+- Yoga Mats: 26350, Dumbbells: 15273, Resistance Bands: 73986
+- Hair Dryers: 11649, Electric Shavers: 26387
+- Dog Food: 66774, Cat Toys: 177068
+- Children's Books: 11 (nonfiction), 152 (fiction)
+- General (unknown): 9355`;
+
+            const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+              body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 200, messages: [{ role: 'user', content: aiPrompt }] }),
+            });
+            const aiData = await aiRes.json();
+            const aiText = aiData.content?.[0]?.text || '';
+            const jsonMatch = aiText.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+              const parsed = JSON.parse(jsonMatch[0]);
+              if (parsed.title && parsed.title.trim()) {
+                product.originalTitle = product.title;
+                product.title = parsed.title.trim().slice(0, 80);
+              }
+              if (parsed.categoryId && /^\d+$/.test(parsed.categoryId.trim())) {
+                product.categoryId = parsed.categoryId.trim();
+              }
+              console.log(`AI title: "${product.title}" cat: ${product.categoryId}`);
+            }
+          } catch (aiErr) {
+            console.warn('AI enhancement skipped:', aiErr.message);
+          }
+        }
+
+        // ── IMAGE FALLBACK: replace broken variation images with main photo ──
+        if (product.variationImages && product.images?.length) {
+          const mainImg = product.images[0];
+          const fixNested = (obj) => {
+            if (!obj || typeof obj !== 'object') return;
+            for (const key of Object.keys(obj)) {
+              if (typeof obj[key] === 'string' && !obj[key].startsWith('http')) {
+                obj[key] = mainImg;
+              } else if (typeof obj[key] === 'object') {
+                fixNested(obj[key]);
+              }
+            }
+          };
+          fixNested(product.variationImages);
+          // Also fix variation value images
+          (product.variations || []).forEach(vg => {
+            (vg.values || []).forEach(v => {
+              if (v.image && !v.image.startsWith('http')) v.image = mainImg;
+            });
+          });
+        }
+
         return res.json({ success: true, product });
       } catch (e) {
         return res.json({ success: false, error: e.message, product });
@@ -1829,20 +1910,28 @@ module.exports = async (req, res) => {
       const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
       if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
 
-      // Fetch images and convert to base64 (max 12 images to stay within context)
-      const imgSlice = images.slice(0, 12);
-      const b64Images = await Promise.all(imgSlice.map(async (url, i) => {
-        try {
-          const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-          if (!r.ok) return null;
-          const buf = await r.arrayBuffer();
-          const b64 = Buffer.from(buf).toString('base64');
-          const ct  = r.headers.get('content-type') || 'image/jpeg';
-          return { index: i, url, b64, ct: ct.split(';')[0] };
-        } catch { return null; }
-      }));
-      const validImgs = b64Images.filter(Boolean);
-      if (!validImgs.length) return res.status(400).json({ error: 'Could not fetch any images' });
+      // Accept either base64 images (from browser) or URLs
+      // Browser sends: { images: [{url, b64, ct}], colors: [...] }
+      // Legacy: { images: ['url1', 'url2'], colors: [...] }
+      let validImgs = [];
+      if (images[0] && typeof images[0] === 'object' && images[0].b64) {
+        // Base64 from browser
+        validImgs = images.slice(0, 20).map((img, i) => ({ index: i, url: img.url, b64: img.b64, ct: img.ct || 'image/jpeg' }));
+      } else {
+        // Try to fetch URLs (may fail for Amazon)
+        const fetched = await Promise.all(images.slice(0, 12).map(async (url, i) => {
+          try {
+            const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+            if (!r.ok) return null;
+            const buf = await r.arrayBuffer();
+            const b64 = Buffer.from(buf).toString('base64');
+            const ct  = r.headers.get('content-type') || 'image/jpeg';
+            return { index: i, url, b64, ct: ct.split(';')[0] };
+          } catch { return null; }
+        }));
+        validImgs = fetched.filter(Boolean);
+      }
+      if (!validImgs.length) return res.status(400).json({ error: 'Could not load any images' });
 
       // Build message for Claude
       const content2 = [
