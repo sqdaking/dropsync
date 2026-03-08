@@ -95,60 +95,7 @@ module.exports = async (req, res) => {
     // SCRAPE — full variation + image + price extraction
     // ═══════════════════════════════════════════════════════════
     // Parent snippet — checks what's on the parent ASIN page
-    if (action === 'parent') {
-      let url = req.query.url || body.url;
-      if (!url) return res.json({ error: 'No URL' });
-      const asinM = url.match(/\/dp\/([A-Z0-9]{10})/);
-      if (!asinM) return res.json({ error: 'No ASIN found' });
-      // First fetch landing to get parentAsin
-      const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36';
-      const r1 = await fetch(`https://www.amazon.com/dp/${asinM[1]}`, { headers: { 'User-Agent': ua, 'Accept': 'text/html', 'Accept-Language': 'en-US,en;q=0.9' } });
-      const h1 = await r1.text();
-      const pM = h1.match(/parentAsin[=:&"']+([A-Z0-9]{10})/);
-      const parentAsin = pM ? pM[1] : null;
-      if (!parentAsin) return res.json({ error: 'No parentAsin found', landingSize: h1.length });
-      // Fetch parent page
-      const r2 = await fetch(`https://www.amazon.com/dp/${parentAsin}`, { headers: { 'User-Agent': ua, 'Accept': 'text/html', 'Accept-Language': 'en-US,en;q=0.9' } });
-      const h2 = await r2.text();
-      const snippets = {};
-      for (const key of ['updateDivLists','asinVariationValues','priceToAsinList','colorImages','variationValues','unavailableAsinSet']) {
-        const idx = h2.indexOf(key);
-        snippets[key] = idx >= 0 ? h2.slice(idx, idx + 2000) : 'NOT FOUND';
-      }
-      return res.json({ parentAsin, landingSize: h1.length, parentSize: h2.length, snippets });
-    }
-
-    // Snippet action — dumps raw HTML around key Amazon data blocks
-    if (action === 'snippet') {
-      let url = req.query.url || body.url;
-      if (!url) return res.json({ error: 'No URL' });
-      if (url.includes('amazon.com')) {
-        const m = url.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/);
-        if (m) url = `https://www.amazon.com/dp/${m[1]}`;
-      }
-      const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
-      const r = await fetch(url, { headers: { 'User-Agent': ua, 'Accept-Language': 'en-US,en;q=0.9', 'Accept': 'text/html' } });
-      const html = await r.text();
-      const snippets = {};
-      // Find 500 chars around each key term
-      for (const key of ['asinVariationValues','asinToDimension','colorImages','priceToAsinList','unavailableAsinSet','inStockAsinSet','variationValues','twister-js-init','dimensionValuesData']) {
-        const idx = html.indexOf(key);
-        if (idx >= 0) snippets[key] = html.slice(Math.max(0,idx-20), idx+500);
-        else snippets[key] = 'NOT FOUND';
-      }
-      return res.json({ snippets, htmlLength: html.length });
-    }
-
-    // Debug action — returns raw extracted product data including _debug info
-    if (action === 'debug') {
-      const url = req.query.url || body.url;
-      if (!url) return res.json({ error: 'No URL provided. Add ?url=https://amazon.com/dp/...' });
-      // Reuse scrape action
-      req.query.action = 'scrape';
-      // Fall through to scrape below — handled by returning full product with _debug
-    }
-
-    if (action === 'scrape' || action === 'debug') {
+    if (action === 'scrape') {
       let url = body.url || req.query.url;
       if (!url) return res.status(400).json({ error: 'No URL' });
 
@@ -1474,54 +1421,45 @@ module.exports = async (req, res) => {
     }
 
 
-    // ── PRICE & STOCK CHECK — monitor published listings ──────────────────────
+    // ── PRICE & STOCK CHECK — Amazon only (every 15 min) ──────────────────────
     if (action === 'price-check') {
       const { products = [] } = req.body;
       if (!products.length) return res.json({ updates: [] });
       const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
       const updates = [];
 
-      for (const item of products.slice(0, 15)) {
+      for (const item of products.slice(0, 20)) {
         const { id, sourceUrl } = item;
-        if (!sourceUrl || !sourceUrl.startsWith('http')) continue;
+        if (!sourceUrl?.includes('amazon.com')) continue;
         try {
           const r = await Promise.race([
-            fetch(sourceUrl, { headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9', Accept: 'text/html,*/*' }, redirect: 'follow' }),
-            new Promise((_,rej) => setTimeout(() => rej(new Error('timeout')), 14000))
+            fetch(sourceUrl, {
+              headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9', Accept: 'text/html,*/*', 'Cache-Control': 'no-cache' },
+              redirect: 'follow'
+            }),
+            new Promise((_,rej) => setTimeout(() => rej(new Error('timeout')), 12000))
           ]);
           const html = await r.text();
-          const low  = html.toLowerCase();
-          let price = null, inStock = null;
-
-          if (sourceUrl.includes('amazon.com')) {
-            const pm = html.match(/"priceAmount"\s*:\s*([\d.]+)/) ||
-                       html.match(/"displayPrice"\s*:\s*"\$([\d.]+)/) ||
-                       html.match(/id="priceblock_ourprice"[^>]*>[^$]*\$([\d.]+)/);
-            if (pm) price = parseFloat(pm[1]);
-            inStock = !low.includes('currently unavailable') && !low.includes('out of stock') &&
-                      (html.includes('add-to-cart-button') || html.includes('addToCart'));
-          } else if (sourceUrl.includes('walmart.com')) {
-            const nd = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-            if (nd) { try { const d = JSON.parse(nd[1])?.props?.pageProps?.initialData?.data?.product; if (d) { price = parseFloat(d.priceInfo?.currentPrice?.price) || null; inStock = d.availabilityStatus === 'IN_STOCK'; } } catch {} }
-          } else if (sourceUrl.includes('target.com')) {
-            const nd = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-            if (nd) { try { const pd = JSON.parse(nd[1])?.props?.pageProps?.initialData?.data?.product; price = parseFloat((pd?.item||pd||{}).price?.current_retail || '') || null; inStock = low.includes('ships free') && !low.includes('not available'); } catch {} }
-          } else if (sourceUrl.includes('aliexpress')) {
-            const rp = html.match(/window\.runParams\s*=\s*(\{[\s\S]*?\});\s*\n/);
-            if (rp) { try { const d = JSON.parse(rp[1]); const pc = d?.data?.productInfoComponent?.priceComponent; if (pc) price = parseFloat((pc.discountPrice||pc.originalPrice||{}).formatedAmount?.replace(/[^0-9.]/g,'')) || null; inStock = !!d?.data?.productInfoComponent?.subject; } catch {} }
-          } else if (sourceUrl.includes('webstaurantstore.com')) {
-            const pm2 = html.match(/\$([\d,]+\.\d{2})/);
-            if (pm2) price = parseFloat(pm2[1].replace(/,/g,''));
-            inStock = low.includes('add to cart') && !low.includes('out of stock');
+          if (html.includes('Type the characters') || html.includes('robot check')) {
+            console.warn('price-check CAPTCHA:', sourceUrl.slice(0,60));
+            continue;
           }
-
-          if (price !== null || inStock !== null) updates.push({ id, price, inStock, checkedAt: new Date().toISOString() });
+          let price = null, inStock = null;
+          const pm = html.match(/"priceAmount"\s*:\s*([\d.]+)/) ||
+                     html.match(/"displayPrice"\s*:\s*"\$([\d.]+)/) ||
+                     html.match(/class="a-price-whole"[^>]*>([\d,]+)/) ||
+                     html.match(/id="priceblock_ourprice"[^>]*>[^$]*\$([\d.]+)/);
+          if (pm) price = parseFloat(pm[1].replace(/,/g,''));
+          const low = html.toLowerCase();
+          inStock = !low.includes('currently unavailable') && !low.includes('out of stock') &&
+                    (html.includes('add-to-cart-button') || html.includes('addToCart') || html.includes('buy-now-button'));
+          if (price !== null || inStock !== null)
+            updates.push({ id, price, inStock, checkedAt: new Date().toISOString() });
         } catch (e) { console.warn('price-check:', sourceUrl.slice(0,60), e.message); }
-        await new Promise(r => setTimeout(r, 380));
+        await new Promise(r => setTimeout(r, 300));
       }
       return res.json({ updates });
     }
-
     // ── BESTSELLERS: scrape Amazon best seller pages for fresh hot products ──
 
     if (action === 'bestsellers') {
@@ -1866,7 +1804,7 @@ module.exports = async (req, res) => {
 
     // ── AI TITLE + CATEGORY ENHANCEMENT ──────────────────────────────
     if (action === 'enhanceTitle') {
-      const { title, categoryHint, url: productUrl } = body;
+      const { title, categoryHint, url: productUrl, variations, images } = body;
       if (!title) return res.status(400).json({ error: 'Missing title' });
       const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
       if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
@@ -1905,11 +1843,63 @@ General/Unknown:9355`;
         const jsonMatch = aiText.match(/\{[\s\S]*\}/);
         if (!jsonMatch) return res.json({ success: false, error: 'No JSON in response', raw: aiText });
         const parsed = JSON.parse(jsonMatch[0]);
-        return res.json({
+        const result = {
           success: true,
           title: (parsed.title || '').trim().slice(0, 80),
           categoryId: /^\d+$/.test((parsed.categoryId || '').trim()) ? parsed.categoryId.trim() : null,
-        });
+        };
+
+        // ── AI variation image assignment ────────────────────────────
+        // If caller provides variations + images, AI picks best image per color variation
+        const colorGroup = (variations || []).find(vg =>
+          /color|colour/i.test(vg.name) && vg.values?.length > 0
+        );
+        if (colorGroup && images?.length >= 2) {
+          try {
+            const colorNames = colorGroup.values.map(v => v.value);
+            // Fetch up to 8 images as base64
+            const fetched = await Promise.all(images.slice(0, 8).map(async (imgUrl, idx) => {
+              try {
+                const r = await Promise.race([
+                  fetch(imgUrl, { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.amazon.com/' } }),
+                  new Promise((_,rej) => setTimeout(()=>rej(new Error('timeout')), 6000)),
+                ]);
+                if (!r.ok) return null;
+                const buf = await r.arrayBuffer();
+                const ct = r.headers.get('content-type')?.split(';')[0] || 'image/jpeg';
+                return { url: imgUrl, b64: Buffer.from(buf).toString('base64'), ct, idx };
+              } catch { return null; }
+            }));
+            const validImgs = fetched.filter(Boolean);
+
+            if (validImgs.length >= 2) {
+              const imgContent = [
+                { type: 'text', text: `Match these product color variations to the numbered images below.\n\nColors: ${colorNames.map((c,i)=>`[${i+1}] "${c}"`).join(', ')}\nImages: numbered 1 to ${validImgs.length}\n\nRespond ONLY with JSON: {"ColorName": imageNumber, ...}\nEvery color must get a number. Pick the closest match.` },
+                ...validImgs.map(img => ({ type: 'image', source: { type: 'base64', media_type: img.ct, data: img.b64 } }))
+              ];
+              const imgRes = await fetch('https://api.anthropic.com/v1/messages', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+                body: JSON.stringify({ model: 'claude-opus-4-5', max_tokens: 300, messages: [{ role: 'user', content: imgContent }] }),
+              });
+              const imgData = await imgRes.json();
+              const imgText = imgData.content?.[0]?.text || '';
+              const imgJson = imgText.match(/\{[\s\S]*\}/);
+              if (imgJson) {
+                const mapping = JSON.parse(imgJson[0]);
+                const urlMapping = {};
+                for (const [color, imgIdx] of Object.entries(mapping)) {
+                  const img = validImgs[parseInt(imgIdx) - 1];
+                  if (img) urlMapping[color] = img.url;
+                }
+                result.variationImageMap = urlMapping; // { "Black": "https://...", "Red": "https://..." }
+                console.log('AI variation image map:', Object.keys(urlMapping));
+              }
+            }
+          } catch(e) { console.warn('AI var image pick failed:', e.message); }
+        }
+
+        return res.json(result);
       } catch (e) {
         return res.json({ success: false, error: e.message });
       }
