@@ -340,27 +340,51 @@ module.exports = async (req, res) => {
           const asinPrice = {};
           const asinStock = {};
 
-          // priceToAsinList: {"19.99":["B0XX","B0YY"]}
-          const p2aBlock = extractBlock(workHtml, 'priceToAsinList', '{') || extractBlock(html, 'priceToAsinList', '{');
-          if (p2aBlock) {
+          // ── Extract ALL per-ASIN prices from the page HTML ───────────────────
+          // Format 1 (object): "priceToAsinList":{"25.49":["B0XX","B0YY"]}
+          const p2aObjBlock = extractBlock(workHtml, 'priceToAsinList', '{') || extractBlock(html, 'priceToAsinList', '{');
+          if (p2aObjBlock) {
             try {
-              const p2a = JSON.parse(p2aBlock);
+              const p2a = JSON.parse(p2aObjBlock);
               for (const [price, asins] of Object.entries(p2a))
                 if (Array.isArray(asins)) asins.forEach(a => { if (!asinPrice[a]) asinPrice[a] = price; });
+              console.log(`priceToAsinList (obj): ${Object.keys(asinPrice).length} prices`);
             } catch {}
           }
 
-          // Inline price map pattern: "B0XXXXX":{"price":"19.99"}
+          // Format 2 (array): "priceToAsinList":[{"asin":"B0XX","price":"25.49"},...]
+          if (!Object.keys(asinPrice).length) {
+            const p2aArrBlock = extractBlock(workHtml, 'priceToAsinList', '[') || extractBlock(html, 'priceToAsinList', '[');
+            if (p2aArrBlock) {
+              try {
+                const arr = JSON.parse(p2aArrBlock);
+                arr.forEach(item => { if (item.asin && item.price && !asinPrice[item.asin]) asinPrice[item.asin] = item.price; });
+                console.log(`priceToAsinList (arr): ${Object.keys(asinPrice).length} prices`);
+              } catch {}
+            }
+          }
+
+          // Format 3: inline "B0XXXXX":{"price":"19.99"} patterns
           for (const m of (workHtml + html).matchAll(/"([A-Z0-9]{10})"\s*:\s*\{"price"\s*:\s*"([\d.]+)"/g))
             if (!asinPrice[m[1]]) asinPrice[m[1]] = m[2];
 
-          // Stock sets
+          // Format 4: generic ASIN price map "B0X":19.99 or "B0X":"19.99"
+          if (Object.keys(asinPrice).length < 3) {
+            for (const m of (workHtml + html).matchAll(/"([A-Z0-9]{10})"\s*:\s*([\d.]{4,8})(?:[,}\s])/g)) {
+              const val = parseFloat(m[2]);
+              if (val > 0.5 && val < 10000 && !asinPrice[m[1]]) asinPrice[m[1]] = m[2];
+            }
+          }
+
+          console.log(`Total ASIN prices extracted: ${Object.keys(asinPrice).length} for ${Object.keys(asinDimVals).length} ASINs`);
+
+          // ── Stock sets ────────────────────────────────────────────────────────
           const unavailBlock = extractBlock(workHtml + html, 'unavailableAsinSet', '[');
           if (unavailBlock) { try { JSON.parse(unavailBlock).forEach(a => { asinStock[a] = false; }); } catch {} }
           const inStockBlock = extractBlock(workHtml + html, 'inStockAsinSet', '[');
           if (inStockBlock) { try { JSON.parse(inStockBlock).forEach(a => { asinStock[a] = true; }); } catch {} }
 
-          // ── Images
+          // ── Images ────────────────────────────────────────────────────────────
           const allImages = [];
           const colorImgMap = {};
 
@@ -371,36 +395,52 @@ module.exports = async (req, res) => {
               if (!allImages.includes(m[1])) allImages.push(m[1]);
           }
 
-          // Map color→ASIN→image using asinDimVals
+          // ── Map ASIN → color (using color_name dimension) ─────────────────────
+          // dimOrder can be [size_name, color_name] OR [color_name, size_name]
           const ci = dimOrder.indexOf('color_name');
+          const si = dimOrder.indexOf('size_name');
           const asinToColor = {};
+          const asinToSize = {};
           for (const [asin, dimVals] of Object.entries(asinDimVals)) {
             if (ci >= 0 && Array.isArray(dimVals) && dimVals[ci]) asinToColor[asin] = dimVals[ci];
+            if (si >= 0 && Array.isArray(dimVals) && dimVals[si]) asinToSize[asin] = dimVals[si];
           }
 
-          // Fetch one ASIN per color for images (max 6 fetches)
+          // ── Determine which ASINs to actually fetch for images + missing prices
+          // Only fetch from COLOR dimension (one ASIN per unique color) for main product images
           const colorToAsin = {};
           for (const [asin, color] of Object.entries(asinToColor))
             if (!colorToAsin[color]) colorToAsin[color] = asin;
 
-          // Also fetch ASINs with missing prices (max 8 total)
-          const needImg = Object.values(colorToAsin).slice(0, 5);
-          const needPrice = Object.keys(asinDimVals).filter(a => !asinPrice[a]).slice(0, 3);
-          const toFetch = [...new Set([...needImg, ...needPrice])].slice(0, 8);
+          // How many prices are we missing?
+          const missingPrices = Object.keys(asinDimVals).filter(a => !asinPrice[a]);
+          const priceCoverage = Object.keys(asinPrice).length;
+
+          // Fetch strategy: fetch one ASIN per color (for images), skip price fetches if we have >70% coverage
+          const needImg = Object.values(colorToAsin).slice(0, 8);
+          const needPrice = priceCoverage < Object.keys(asinDimVals).length * 0.7 ? missingPrices.slice(0, 5) : [];
+          const toFetch = [...new Set([...needImg, ...needPrice])].slice(0, 12);
 
           await Promise.all(toFetch.map(async asin => {
             try {
               const h = await fetchPage(`https://www.amazon.com/dp/${asin}`);
               if (!h) return;
-              for (const pat of [
-                /class="a-price-whole"[^>]*>\s*(\d[\d,]*)<\/span><span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/,
-                /"priceAmount"\s*:\s*([\d.]+)/,
-                /class="a-offscreen"[^>]*>\$([\d,]+\.\d{2})/,
-              ]) {
-                const m = h.match(pat);
-                if (m) { asinPrice[asin] = m[2] ? `${m[1].replace(/,/g,'')}.${m[2]}` : m[1].replace(/,/g,''); break; }
+
+              // Extract price
+              if (!asinPrice[asin]) {
+                for (const pat of [
+                  /class="a-price-whole"[^>]*>\s*(\d[\d,]*)<\/span><span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/,
+                  /"priceAmount"\s*:\s*([\d.]+)/,
+                  /class="a-offscreen"[^>]*>\$([\d,]+\.\d{2})/,
+                  /"buyingPrice"\s*:\s*([\d.]+)/,
+                ]) {
+                  const m = h.match(pat);
+                  if (m) { asinPrice[asin] = m[2] ? `${m[1].replace(/,/g,'')}.${m[2]}` : m[1].replace(/,/g,''); break; }
+                }
               }
               asinStock[asin] = !(h.includes('Currently unavailable') || h.includes('currently unavailable'));
+
+              // Extract image for this color
               const color = asinToColor[asin];
               const img = h.match(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/);
               if (img) {
@@ -410,8 +450,10 @@ module.exports = async (req, res) => {
             } catch {}
           }));
 
+          console.log(`After per-ASIN fetches: prices=${Object.keys(asinPrice).length}, images=${allImages.length}, colorImgs=${Object.keys(colorImgMap).length}`);
+
           product.images = [...new Set(allImages)].slice(0, 12);
-          // variationImages as nested: { Color: { Red: 'url', Blue: 'url' } }
+          // variationImages keyed by COLOR name (not size)
           if (Object.keys(colorImgMap).length) product.variationImages['Color'] = colorImgMap;
 
           // ── Build variation groups
@@ -1929,6 +1971,23 @@ General/Unknown:9355`;
       const token = req.query.access_token || body.access_token;
       const r = await fetch(`${EBAY_API}/sell/inventory/v1/offer?limit=100`, { headers: { Authorization:`Bearer ${token}` } });
       return res.json(await r.json());
+    }
+
+    // Debug: show what HTML Vercel fetches from Amazon
+    if (action === 'debug-scrape') {
+      const { url: dUrl } = body;
+      if (!dUrl) return res.status(400).json({ error: 'url required' });
+      try {
+        const h = await fetchPage(dUrl);
+        if (!h) return res.json({ error: 'fetch failed' });
+        const hasPriceToAsin = h.includes('priceToAsinList');
+        const hasDimData = h.includes('dimensionValuesDisplayData');
+        const hasCaptcha = h.toLowerCase().includes('captcha') || h.toLowerCase().includes('robot check');
+        const price = h.match(/class="a-price-whole"[^>]*>\s*(\d[\d,]*)<\/span>\s*<span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/);
+        const p2aIdx = h.indexOf('priceToAsinList');
+        const p2aSnippet = p2aIdx >= 0 ? h.slice(p2aIdx, p2aIdx+500) : null;
+        return res.json({ htmlLen: h.length, hasPriceToAsin, hasDimData, hasCaptcha, price: price ? `${price[1]}.${price[2]}` : null, p2aSnippet });
+      } catch(e) { return res.json({ error: e.message }); }
     }
 
     return res.status(400).json({ error: `Unknown action: ${action}` });
