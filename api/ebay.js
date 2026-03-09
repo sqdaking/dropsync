@@ -1255,7 +1255,9 @@ module.exports = async (req, res) => {
       return res.json(await r.json());
     }
 
-    // ── SYNC: re-check Amazon price/stock, update eBay offers accordingly ──
+    // ── SYNC: receive frontend price/stock data, push changes to eBay ──────────
+    // The frontend (_runPriceStockCheck) already scraped Amazon and computed new prices.
+    // This action just takes those computed values and updates eBay accordingly.
     if (action === 'sync') {
       const { access_token, products } = body;
       if (!access_token || !products?.length) return res.status(400).json({ error: 'Missing fields' });
@@ -1263,153 +1265,170 @@ module.exports = async (req, res) => {
       const results = [];
 
       for (const product of products) {
-        if (!product.sourceUrl || !product.ebaySku) { results.push({ id: product.id, skipped: true }); continue; }
+        if (!product.ebaySku) { results.push({ id: product.id, skipped: true, reason: 'no sku' }); continue; }
 
         try {
-          // 1. Re-scrape Amazon for current price & stock
-          const scrapeRes = await fetch(`${req.headers.origin||'https://'+req.headers.host}/api/ebay?action=scrape`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: product.sourceUrl }),
-          });
-          const scrapeData = await scrapeRes.json();
-          const fresh = scrapeData.product;
-          if (!fresh) { results.push({ id: product.id, error: 'scrape failed' }); continue; }
+          const authHeader = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' };
+          const groupSku = product.ebaySku;
 
-          const oldPrice  = parseFloat(product.sourcePrice || product.price || 0);
-          const newPrice  = parseFloat(fresh.price || 0);
-
-          // ── Stock: trust the scraper's top-level inStock flag ──
-          // Scraper sets product.inStock = false only on hard OOS signals (Currently unavailable, no Add to Cart)
-          // Default is true when page loads normally
-          let inStock;
-          if (typeof fresh.inStock === 'boolean') {
-            inStock = fresh.inStock;
-          } else {
-            inStock = true; // scraper didn't detect OOS = assume in stock
+          // ── Step 1: fetch current group to get all variant SKUs ──────────
+          let varSkus = [];
+          const grpRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(groupSku)}`, { headers: authHeader });
+          if (grpRes.ok) {
+            const grpData = await grpRes.json();
+            varSkus = grpData.variantSKUs || [];
           }
 
-          const wasOOS    = product.syncStatus === 'oos';
-          const backInStock = wasOOS && inStock;
-          const originalQty = product.quantity > 0 ? product.quantity : 10;
-          const margin    = oldPrice > 0 ? (parseFloat(product.price) - oldPrice) / oldPrice : 0;
-          const newEbayPrice = newPrice > 0 ? (newPrice * (1 + margin)).toFixed(2) : product.price;
+          const isSimple = varSkus.length === 0;
+          let updated = 0;
+          let priceChanged = false;
+          let stockChanged = false;
+          let imagesChanged = false;
 
-          const priceChanged = newPrice > 0 && Math.abs(newPrice - oldPrice) > 0.01;
-          const stockChanged = !inStock;
+          // ── Step 2: build a map of variation value → { price, stock, image } ──
+          // from the frontend's product.variations (which already have updated prices/stock)
+          // Key format: "Color:Black", "Size:XL" etc — matches eBay aspect values
+          const varMap = {}; // "value" → { price, stock, inStock }
+          (product.variations || []).forEach(vg => {
+            (vg.values || []).forEach(v => {
+              varMap[v.value.toLowerCase()] = {
+                price:   parseFloat(v.price || product.price || 0),
+                stock:   v.inStock === false || v.stock === 0 ? 0 : (v.stock || 10),
+                inStock: v.inStock !== false && v.stock !== 0,
+                image:   v.image || '',
+              };
+            });
+          });
 
-          // Check if main images changed
-          const oldImgs = (product.images || []).slice(0, 3).join(',');
-          const newImgs = (fresh.images || []).slice(0, 3).join(',');
-          const imagesChanged = newImgs && newImgs !== oldImgs;
+          const hasVariations = product.hasVariations && (product.variations||[]).length > 0;
 
-          const authHeader  = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' };
+          // ── Step 3: For simple (non-variation) listings ──────────────────
+          if (isSimple || !hasVariations) {
+            const newPrice = parseFloat(product.price || 0);
+            const newQty   = product.quantity ?? 10;
 
-          if (!priceChanged && inStock && !imagesChanged && !backInStock) { results.push({ id: product.id, unchanged: true }); continue; }
-
-          // If only images changed — update group and inventory items images (skip if locked)
-          if (imagesChanged && product.ebaySku && !product.ebayLocked) {
-            console.log(`sync [${product.id}]: images changed, updating group`);
-            // Update inventory item group images
-            const grpRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(product.ebaySku)}`, { headers: authHeader });
-            if (grpRes.ok) {
-              const grpData = await grpRes.json();
-              grpData.imageUrls = (fresh.images || []).slice(0, 12);
-              await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(product.ebaySku)}`, {
-                method: 'PUT', headers: authHeader,
-                body: JSON.stringify(grpData),
-              });
-              // Update each variant's single image too
-              const varSkus = grpData.variantSKUs || [];
-              for (let i = 0; i < varSkus.length; i += 10) {
-                await Promise.all(varSkus.slice(i, i+10).map(async varSku => {
-                  const ivRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(varSku)}`, { headers: authHeader });
-                  if (!ivRes.ok) return;
-                  const iv = await ivRes.json();
-                  // Pick variant-specific image if available, else first fresh image
-                  const varImg = (fresh.variationImages && iv.product?.aspects)
-                    ? Object.entries(fresh.variationImages || {}).reduce((found, [dim, map]) => {
-                        const val = (iv.product.aspects[dim] || [])[0];
-                        return found || (val && map[val]) || null;
-                      }, null)
-                    : null;
-                  iv.product = iv.product || {};
-                  iv.product.imageUrls = varImg ? [varImg] : [(fresh.images || [])[0]].filter(Boolean);
-                  await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(varSku)}`, {
-                    method: 'PUT', headers: authHeader,
-                    body: JSON.stringify(iv),
+            // Find the single offer for this SKU
+            const offRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(groupSku)}&limit=1`, { headers: authHeader });
+            if (offRes.ok) {
+              const offData = await offRes.json();
+              const offer = offData.offers?.[0];
+              if (offer) {
+                const oldPrice = parseFloat(offer.pricingSummary?.price?.value || 0);
+                const oldQty   = offer.availableQuantity ?? 10;
+                priceChanged = Math.abs(newPrice - oldPrice) > 0.01;
+                stockChanged = newQty !== oldQty;
+                if (priceChanged || stockChanged) {
+                  const updateBody = { ...offer };
+                  if (priceChanged) updateBody.pricingSummary = { price: { value: newPrice.toFixed(2), currency: 'USD' } };
+                  updateBody.availableQuantity = Math.max(0, newQty);
+                  const upRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}`, {
+                    method: 'PUT', headers: authHeader, body: JSON.stringify(updateBody),
                   });
-                }));
+                  if (upRes.ok || upRes.status === 204) {
+                    // Also update inventory item qty
+                    await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(groupSku)}`, {
+                      method: 'PUT', headers: authHeader,
+                      body: JSON.stringify({ availability: { shipToLocationAvailability: { quantity: Math.max(0, newQty) } }, condition: 'NEW' }),
+                    });
+                    updated++;
+                  }
+                } else {
+                  results.push({ id: product.id, unchanged: true }); continue;
+                }
               }
             }
           }
 
-          // 2. Get all offer IDs for this group SKU
-          const offersRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(product.ebaySku)}&limit=1`, { headers: authHeader });
-          const offersData = await offersRes.json();
-
-          // Try bulk-fetch all offers by iterating inventory items under this group
-          let offerIds = [];
-          const groupRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(product.ebaySku)}`, { headers: authHeader });
-          if (groupRes.ok) {
-            const groupData = await groupRes.json();
-            const varSkus = groupData.variantSKUs || [];
-            // Get offer IDs for each variant SKU in batches
+          // ── Step 4: For variation listings — update each variant's offer + inventory ──
+          if (hasVariations && varSkus.length > 0) {
+            // Fetch all offers for all variant SKUs in batches of 20
+            const offerList = [];
             for (let i = 0; i < varSkus.length; i += 20) {
               const batch = varSkus.slice(i, i + 20);
               const bRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${batch.map(s=>encodeURIComponent(s)).join(',')}&limit=20`, { headers: authHeader });
               if (bRes.ok) {
                 const bData = await bRes.json();
-                (bData.offers || []).forEach(o => offerIds.push({ offerId: o.offerId, sku: o.sku }));
+                (bData.offers || []).forEach(o => offerList.push(o));
               }
             }
-          }
 
-          // 3. Update each offer — price and/or qty
-          let updated = 0;
-          for (const { offerId, sku } of offerIds) {
-            // Get current offer
-            const offerRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerId}`, { headers: authHeader });
-            if (!offerRes.ok) continue;
-            const offer = await offerRes.json();
+            // For each offer, match to a variation value via its SKU's inventory item aspects
+            // We process in batches of 5 to avoid rate limits
+            for (let i = 0; i < offerList.length; i += 5) {
+              await Promise.all(offerList.slice(i, i+5).map(async (offer) => {
+                try {
+                  // Fetch inventory item to get its aspects (Color=Black, Size=XL etc)
+                  const ivRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(offer.sku)}`, { headers: authHeader });
+                  if (!ivRes.ok) return;
+                  const iv = await ivRes.json();
+                  const aspects = iv.product?.aspects || {};
 
-            const updateBody = { ...offer };
-            if (priceChanged) updateBody.pricingSummary = { price: { value: String(newEbayPrice), currency: 'USD' } };
-            if (!inStock) updateBody.availableQuantity = 0;
-            if (backInStock) updateBody.availableQuantity = originalQty;
+                  // Find matching variation value from our map
+                  let matchedVar = null;
+                  for (const [dim, vals] of Object.entries(aspects)) {
+                    const val = Array.isArray(vals) ? vals[0] : vals;
+                    if (val && varMap[val.toLowerCase()]) {
+                      matchedVar = varMap[val.toLowerCase()];
+                      break;
+                    }
+                  }
 
-            const upRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerId}`, {
-              method: 'PUT', headers: authHeader,
-              body: JSON.stringify(updateBody),
-            });
+                  // Fall back to overall product price/stock if no match
+                  const newPrice = matchedVar ? matchedVar.price : parseFloat(product.price || 0);
+                  const newQty   = matchedVar ? matchedVar.stock : (product.quantity ?? 10);
+                  const varImg   = matchedVar?.image || '';
 
-            // Sync inventory item quantity
-            if (!inStock || backInStock) {
-              const restoreQty = backInStock ? originalQty : 0;
-              await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
-                method: 'PUT', headers: authHeader,
-                body: JSON.stringify({
-                  availability: { shipToLocationAvailability: { quantity: restoreQty } },
-                  condition: offer.condition || 'NEW',
-                }),
-              });
-              console.log(`sync qty [${sku}]: ${restoreQty} (backInStock=${backInStock}, inStock=${inStock})`);
+                  const oldPrice = parseFloat(offer.pricingSummary?.price?.value || 0);
+                  const oldQty   = offer.availableQuantity ?? 10;
+                  const thisChanged = Math.abs(newPrice - oldPrice) > 0.01 || newQty !== oldQty;
+
+                  if (thisChanged) {
+                    priceChanged = priceChanged || Math.abs(newPrice - oldPrice) > 0.01;
+                    stockChanged = stockChanged || (newQty === 0 && oldQty > 0) || (newQty > 0 && oldQty === 0);
+
+                    // Update offer price + quantity
+                    const updateBody = {
+                      ...offer,
+                      pricingSummary: { price: { value: newPrice.toFixed(2), currency: 'USD' } },
+                      availableQuantity: Math.max(0, newQty),
+                    };
+                    const upRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}`, {
+                      method: 'PUT', headers: authHeader, body: JSON.stringify(updateBody),
+                    });
+
+                    // Update inventory item quantity + image
+                    const ivUpdate = {
+                      availability: { shipToLocationAvailability: { quantity: Math.max(0, newQty) } },
+                      condition: iv.condition || 'NEW',
+                      product: { ...iv.product },
+                    };
+                    if (varImg) ivUpdate.product.imageUrls = [varImg];
+                    await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(offer.sku)}`, {
+                      method: 'PUT', headers: authHeader, body: JSON.stringify(ivUpdate),
+                    });
+
+                    if (upRes.ok || upRes.status === 204) updated++;
+                    console.log(`sync var [${offer.sku}]: $${oldPrice}→$${newPrice}, qty ${oldQty}→${newQty}`);
+                  }
+                } catch(e2) { console.warn('var sync error:', offer.sku, e2.message); }
+              }));
             }
-            if (upRes.ok || upRes.status === 204) updated++;
+
+            // Update group images if changed
+            const oldImgs = (product.images || []).slice(0,3).join(',');
+            // We don't have fresh images here — frontend handles image detection
+            // Only update group-level images if product.images changed (frontend detects this)
           }
 
+          const topInStock = product.quantity > 0;
           results.push({
-            id: product.id,
-            updated,
-            priceChanged,
-            stockChanged,
-            imagesChanged,
-            backInStock,
-            newSourcePrice: newPrice,
-            newEbayPrice: parseFloat(newEbayPrice),
-            newImages: imagesChanged ? (fresh.images||[]) : undefined,
-            inStock,
+            id: product.id, updated, priceChanged, stockChanged, imagesChanged,
+            inStock: topInStock,
+            backInStock: product.syncStatus === 'oos' && topInStock,
+            newSourcePrice: parseFloat(product.sourcePrice || 0),
+            newEbayPrice: parseFloat(product.price || 0),
           });
-          console.log(`sync [${product.id}]: price ${oldPrice}→${newPrice}, inStock:${inStock}, backInStock:${backInStock}, updated ${updated} offers`);
+          console.log(`sync [${product.id}]: updated=${updated} priceChanged=${priceChanged} stockChanged=${stockChanged}`);
 
         } catch(e) {
           console.error('sync error for', product.id, e.message);
