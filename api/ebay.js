@@ -591,8 +591,9 @@ module.exports = async (req, res) => {
     // PUSH TO EBAY
     // ═══════════════════════════════════════════════════════════
     if (action === 'push') {
-      const { access_token, product } = body;
+      const { access_token, product, fulfillmentPolicyId, paymentPolicyId, returnPolicyId } = body;
       if (!access_token || !product) return res.status(400).json({ error: 'Missing fields' });
+      console.log(`[push] "${(product.title||'').slice(0,60)}" hasVariations=${product.hasVariations} category=${product.categoryId||'none'} fps=${fulfillmentPolicyId||'none'}`);
 
       // ── AUTO CATEGORY DETECTION ──────────────────────────────────────
       // Maps product title/aspects to correct eBay category ID
