@@ -874,6 +874,67 @@ module.exports = async (req, res) => {
       };
       const authHeader = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
 
+      // ── Ensure valid return policy exists (errorId 25009 fix) ──────────────
+      // Always re-verify returnPolicyId even if provided — it may be stale or invalid.
+      // Three-step: 1) Use provided ID  2) Fetch existing  3) Auto-create
+      const resolveReturnPolicy = async () => {
+        // Step 1: Validate provided ID by verifying it exists on eBay
+        if (policies.returnPolicyId) {
+          try {
+            const check = await fetch(`${EBAY_API}/sell/account/v1/return_policy/${policies.returnPolicyId}`, { headers: authHeader });
+            if (check.ok) {
+              console.log('[push] validated returnPolicyId:', policies.returnPolicyId);
+              return; // good, keep it
+            }
+            console.warn('[push] provided returnPolicyId invalid, fetching fresh one');
+            policies.returnPolicyId = '';
+          } catch(e) { console.warn('[push] returnPolicyId check error:', e.message); }
+        }
+        // Step 2: Fetch all return policies and pick one that accepts returns
+        try {
+          const rpList = await fetch(`${EBAY_API}/sell/account/v1/return_policy?marketplace_id=EBAY_US`, { headers: authHeader });
+          const rpData = await rpList.json();
+          console.log('[push] return policies on account:', JSON.stringify(rpData).slice(0,300));
+          const best = (rpData.returnPolicies||[])
+            .find(p => p.returnsAccepted === true && p.returnPeriod)
+            || (rpData.returnPolicies||[]).find(p => p.returnsAccepted === true)
+            || (rpData.returnPolicies||[])[0];
+          if (best?.returnPolicyId) {
+            policies.returnPolicyId = best.returnPolicyId;
+            console.log('[push] using existing return policy:', best.returnPolicyId, best.name);
+            return;
+          }
+        } catch(e) { console.warn('[push] return policy list failed:', e.message); }
+        // Step 3: Create a new 30-day return policy
+        try {
+          const rpNew = await fetch(`${EBAY_API}/sell/account/v1/return_policy`, {
+            method: 'POST', headers: authHeader,
+            body: JSON.stringify({
+              name: 'DropSync Returns', marketplaceId: 'EBAY_US',
+              categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
+              returnsAccepted: true,
+              returnPeriod: { value: 30, unit: 'DAY' },
+              returnShippingCostPayer: 'BUYER',
+              refundMethod: 'MONEY_BACK',
+            }),
+          });
+          const rpNewData = await rpNew.json();
+          console.log('[push] created return policy:', JSON.stringify(rpNewData).slice(0,300));
+          if (rpNewData.returnPolicyId) {
+            policies.returnPolicyId = rpNewData.returnPolicyId;
+            return;
+          }
+          // If creation also failed, log the exact error so it's visible in Vercel logs
+          console.error('[push] FAILED to create return policy. eBay said:', JSON.stringify(rpNewData));
+        } catch(e) { console.error('[push] return policy create exception:', e.message); }
+      };
+      await resolveReturnPolicy();
+
+      if (!policies.returnPolicyId) {
+        return res.status(400).json({ error: 'Could not resolve a return policy for this eBay account. Please create one in eBay Seller Hub (Business Policies) and re-connect in DropSync Settings.', errorId: 25009 });
+      }
+      console.log('[push] policies resolved:', JSON.stringify(policies));
+
       // Simple listing — no variations
       if (!product.hasVariations || !product.variations?.length) {
         const invRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(groupSku)}`, {
@@ -1146,27 +1207,7 @@ module.exports = async (req, res) => {
       } catch(e) { console.log('location error:', e.message); }
       console.log('merchantLocationKey:', merchantLocationKey);
 
-      // ── STEP 5: Get/create return policy ─────────────────────────────
-      let validReturnPolicyId = policies.returnPolicyId;
-      try {
-        const rpList = await fetch(`${EBAY_API}/sell/account/v1/return_policy?marketplace_id=EBAY_US`, { headers: authHeader });
-        const rpData = await rpList.json();
-        const existing = (rpData.returnPolicies||[]).find(p => p.name === 'DropSync Auto Policy');
-        if (existing) {
-          validReturnPolicyId = existing.returnPolicyId;
-        } else {
-          const rpNew = await fetch(`${EBAY_API}/sell/account/v1/return_policy`, {
-            method: 'POST', headers: authHeader,
-            body: JSON.stringify({
-              name: 'DropSync Auto Policy', marketplaceId: 'EBAY_US',
-              categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
-              returnsAccepted: false,
-            }),
-          });
-          const rpNewData = await rpNew.json();
-          if (rpNewData.returnPolicyId) validReturnPolicyId = rpNewData.returnPolicyId;
-        }
-      } catch(e) { console.log('return policy error:', e.message); }
+      // ── STEP 5 (was): Return policy now resolved at top of push action ──
 
       // ── STEP 6: bulkCreateOffer — one per CHILD variant ──────────────
       // Each child offer has: sku, price, availableQuantity, policies
@@ -1174,7 +1215,7 @@ module.exports = async (req, res) => {
       const listingPolicies = {};
       if (policies.fulfillmentPolicyId) listingPolicies.fulfillmentPolicyId = policies.fulfillmentPolicyId;
       if (policies.paymentPolicyId)     listingPolicies.paymentPolicyId     = policies.paymentPolicyId;
-      if (validReturnPolicyId)          listingPolicies.returnPolicyId      = validReturnPolicyId;
+      if (policies.returnPolicyId)      listingPolicies.returnPolicyId      = policies.returnPolicyId;
 
       const offerRequests = createdSkus.map((varSku) => {
         const c = comboList.find(x => x.varSku === varSku);
@@ -2008,6 +2049,11 @@ function buildOffer(sku, product, policies = {}, merchantLocationKey = 'default'
   if (policies.paymentPolicyId)     lp.paymentPolicyId     = policies.paymentPolicyId;
   if (policies.returnPolicyId)      lp.returnPolicyId      = policies.returnPolicyId;
   if (Object.keys(lp).length) p.listingPolicies = lp;
+  // eBay requires a return policy (errorId 25009). If no returnPolicyId resolved, block the push
+  // to surface the error clearly rather than sending a bad offer.
+  if (!lp.returnPolicyId) {
+    console.warn('[buildOffer] WARNING: no returnPolicyId — offer will likely fail with 25009');
+  }
   return p;
 }
 
