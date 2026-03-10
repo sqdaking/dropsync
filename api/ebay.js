@@ -1316,6 +1316,7 @@ module.exports = async (req, res) => {
     if (action === 'fetchMyListings') {
       const { access_token } = body;
       if (!access_token) return res.status(400).json({ error: 'Missing access_token' });
+      const EBAY_API = getEbayUrls(false).EBAY_API;
       const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
 
       // Paginate through all active offers
