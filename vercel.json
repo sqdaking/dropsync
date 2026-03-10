@@ -1,0 +1,6 @@
+{
+  "routes": [
+    { "src": "/", "dest": "/dropsync.html" },
+    { "src": "/api/ebay(.*)", "dest": "/api/ebay.js" }
+  ]
+}
