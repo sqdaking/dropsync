@@ -402,6 +402,21 @@ module.exports = async (req, res) => {
       return res.json({ access_token: d.access_token, expires_in: d.expires_in, expiry: Date.now() + ((d.expires_in||7200)-120)*1000 });
     }
 
+    // ── TEST CREDS ───────────────────────────────────────────────────────────
+    if (action === 'test_creds') {
+      const sandbox = req.query.sandbox === 'true';
+      const E = getEbayUrls(sandbox);
+      // Try client credentials grant to verify client_id/secret work
+      const creds = Buffer.from(`${E.CLIENT_ID}:${E.CLIENT_SECRET}`).toString('base64');
+      const r = await fetch(E.EBAY_TOK, {
+        method: 'POST',
+        headers: { Authorization: `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `grant_type=client_credentials&scope=${encodeURIComponent('https://api.ebay.com/oauth/api_scope')}`,
+      });
+      const d = await r.json();
+      return res.json({ sandbox, client_id: E.CLIENT_ID, has_secret: !!E.CLIENT_SECRET, result: d });
+    }
+
     // ── POLICIES ─────────────────────────────────────────────────────────────
     if (action === 'policies') {
       const token = body.access_token || req.query.access_token;
