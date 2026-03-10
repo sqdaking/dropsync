@@ -736,6 +736,26 @@ module.exports = async (req, res) => {
       delete rawAspects['Color']; delete rawAspects['color'];
       delete rawAspects['Size'];  delete rawAspects['size'];
       const aspects = rawAspects;
+
+      // Fetch required item specifics for this category and fill missing ones
+      try {
+        const catMeta = await fetch(
+          `${EBAY_API}/commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category?category_id=${categoryId}`,
+          { headers: { Authorization: `Bearer ${access_token}`, 'Accept-Language': 'en-US' } }
+        ).then(r => r.json()).catch(() => ({}));
+        for (const aspect of (catMeta.aspects || [])) {
+          const name = aspect.aspectConstraint?.aspectRequired ? aspect.localizedAspectName : null;
+          if (!name) continue;
+          if (aspects[name]) continue; // already have it
+          // Try to find a value from product title/description
+          const vals = (aspect.aspectValues || []).map(v => v.localizedValue);
+          if (!vals.length) continue;
+          const titleLower = (product.title || '').toLowerCase();
+          const match = vals.find(v => titleLower.includes(v.toLowerCase())) || vals[0];
+          aspects[name] = [match];
+          console.log(`[aspects] auto-filled required "${name}" = "${match}"`);
+        }
+      } catch(e) { console.warn('[aspects] fetch failed:', e.message); }
       console.log(`[push] cat=${categoryId} "${listingTitle.slice(0,50)}"`);
 
       // Merchant location
