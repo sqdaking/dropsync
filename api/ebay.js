@@ -57,10 +57,91 @@ function extractPrice(html) {
   return null;
 }
 
-// ── Extract first hi-res image ────────────────────────────────────────────────
+// ── Extract first hi-res image from an ASIN page ─────────────────────────────
 function extractMainImage(html) {
+  // colorImages initial[0] is always the hero product shot
+  const block = extractBlock(html, 'colorImages');
+  if (block) {
+    const m = block.match(/'initial'\s*:\s*\[\s*\{\s*(?:[^{}]*?)"hiRes"\s*:\s*"(https:[^"]+\.jpg)"/);
+    if (m) return m[1];
+  }
   const m = html.match(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/);
   return m ? m[1] : null;
+}
+
+// ── Bracket-counting block extractor ─────────────────────────────────────────
+// Properly handles nested objects, strings with apostrophes, escape sequences
+function extractBlock(html, searchStr) {
+  const idx = html.indexOf(searchStr);
+  if (idx === -1) return null;
+  let i = idx + searchStr.length;
+  while (i < html.length && html[i] !== '{' && html[i] !== '[') i++;
+  if (i >= html.length) return null;
+  const openChar = html[i], closeChar = openChar === '{' ? '}' : ']';
+  let depth = 0, inStr = false, strChar = '', escaped = false;
+  const start = i;
+  for (; i < Math.min(html.length, start + 500000); i++) {
+    const c = html[i];
+    if (escaped) { escaped = false; continue; }
+    if (c === '\\') { escaped = true; continue; }
+    if (inStr) { if (c === strChar) inStr = false; continue; }
+    if (c === '"' || c === "'") { inStr = true; strChar = c; continue; }
+    if (c === openChar) depth++;
+    else if (c === closeChar) { depth--; if (depth === 0) return html.slice(start, i + 1); }
+  }
+  return null;
+}
+
+// ── Extract color→image map from colorImages block ────────────────────────────
+// Handles: 'Ivory': [...], "L'Special": [...], 'Brown-Checkered': [...]
+function extractColorImgMap(html) {
+  const map = {};
+  const block = extractBlock(html, 'colorImages');
+  if (!block) return map;
+  // Two passes: single-quoted keys, then double-quoted keys
+  const patterns = [
+    /'((?:[^'\\]|\\.)*)'\s*:\s*\[\s*\{[^[\]]*?"hiRes"\s*:\s*"(https:[^"]+\.jpg)"/g,
+    /"((?:[^"\\]|\\.)*)"\s*:\s*\[\s*\{[^[\]]*?"hiRes"\s*:\s*"(https:[^"]+\.jpg)"/g,
+  ];
+  const skip = new Set(['initial','hiRes','thumb','main','large','small']);
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(block)) !== null) {
+      const name = m[1].replace(/\\'/g, "'").replace(/\\"/g, '"').trim();
+      if (!skip.has(name) && name.length > 0 && !map[name]) map[name] = m[2];
+    }
+  }
+  return map;
+}
+
+// ── Extract ASIN→price map from priceToAsinList ───────────────────────────────
+function extractAsinPrices(html) {
+  const prices = {};
+  const block = extractBlock(html, '"priceToAsinList"');
+  if (!block) return prices;
+  try {
+    const list = JSON.parse(block);
+    for (const entry of list) {
+      const p = parseFloat(entry.price);
+      if (p > 0) for (const asin of (entry.asins || [])) prices[asin] = p;
+    }
+  } catch {}
+  return prices;
+}
+
+// ── Extract color→ASIN map from dimensionToAsinMap ───────────────────────────
+function extractColorToAsin(html) {
+  // Try double-quoted key first (most common in embedded JSON)
+  for (const key of ['"dimensionToAsinMap"', 'dimensionToAsinMap']) {
+    const block = extractBlock(html, key);
+    if (!block) continue;
+    try {
+      const d = JSON.parse(block);
+      const map = d.color_name || d.Color || d.colour_name || null;
+      if (map && Object.keys(map).length > 0) return map;
+    } catch {}
+  }
+  return {};
 }
 
 // ── eBay Taxonomy API: get leaf category suggestions ─────────────────────────
@@ -332,36 +413,33 @@ module.exports = async (req, res) => {
       }
 
       // ── Variation data ────────────────────────────────────────────────────
-      // 1) variationValues — gives us all color/size names
+      // Extract ALL data from the main page HTML — no extra ASIN fetches needed
+
+      // 1. Per-color images from colorImages (proven bracket-counting parser)
+      const colorImgMap = extractColorImgMap(html);
+      console.log(`[scrape] colorImages: ${Object.keys(colorImgMap).length} color entries`);
+
+      // 2. ASIN→price from priceToAsinList (embedded full price map)
+      const asinPrices = extractAsinPrices(html);
+      console.log(`[scrape] priceToAsinList: ${Object.keys(asinPrices).length} ASINs priced`);
+
+      // 3. Color→ASIN from dimensionToAsinMap
+      const colorToAsin = extractColorToAsin(html);
+      console.log(`[scrape] colorToAsin: ${Object.keys(colorToAsin).length} entries`);
+
+      // 4. Fallback: build colorToAsin from inline ASIN dimension blobs if needed
+      if (!Object.keys(colorToAsin).length) {
+        for (const [, a, b] of html.matchAll(/"([A-Z0-9]{10})"\s*:\s*\{([^}]{5,400})\}/g)) {
+          const cM = b.match(/"color_name"\s*:\s*"([^"]{1,80})"/);
+          if (cM && !colorToAsin[cM[1]]) colorToAsin[cM[1]] = a;
+        }
+        console.log(`[scrape] colorToAsin fallback: ${Object.keys(colorToAsin).length} entries`);
+      }
+
+      // 5. Color+size names list from variationValues
       let varVals = null;
-      const vvM = html.match(/"variationValues"\s*:\s*(\{"[a-z_]+"\s*:\s*\[[^\]]+\][^}]*\})/);
+      const vvM = html.match(/"variationValues"\s*:\s*(\{"[a-z_]+"[^}]{5,2000}\})/);
       if (vvM) try { varVals = JSON.parse(vvM[1]); } catch {}
-
-      // 2) ASIN → {color, size} mapping from HTML
-      const asinMap = {};  // asin → { color, size }
-      const dimMatches = [...html.matchAll(/"([A-Z0-9]{10})"\s*:\s*\{([^}]{0,300})\}/g)];
-      for (const [, a, body] of dimMatches) {
-        const cM = body.match(/"color_name"\s*:\s*"([^"]+)"/);
-        const sM = body.match(/"size_name"\s*:\s*"([^"]+)"/);
-        if (cM || sM) asinMap[a] = { color: cM?.[1]||null, size: sM?.[1]||null };
-      }
-
-      // 3) colorToAsin from data-asin attributes on swatch buttons
-      const colorToAsin = {};
-      const swatchRe = /data-dp-url[^>]*th=([A-Z0-9]{10})[^>]*(?:title|alt)="([^"]+)"/g;
-      for (const [, a, name] of [...html.matchAll(swatchRe)]) {
-        if (name && name.length < 60 && !colorToAsin[name]) colorToAsin[name] = a;
-      }
-      // Also try: id="color_name_X_B0XXXXXX" style elements
-      const swRe2 = /data-asin="([A-Z0-9]{10})"[^>]*data-dp-url/g;
-      // And from the ASIN map
-      for (const [a, dims] of Object.entries(asinMap)) {
-        if (dims.color && !colorToAsin[dims.color]) colorToAsin[dims.color] = a;
-      }
-
-      // Also look for explicit colorToAsin JSON object
-      const ctaM = html.match(/"colorToAsin"\s*:\s*(\{[^}]{0,2000}\})/);
-      if (ctaM) try { Object.assign(colorToAsin, JSON.parse(ctaM[1])); } catch {}
 
       const hasVar = !!(varVals && (varVals.color_name?.length || varVals.size_name?.length));
       product.hasVariations = hasVar;
@@ -370,31 +448,46 @@ module.exports = async (req, res) => {
         const colors = varVals.color_name || [];
         const sizes  = varVals.size_name  || [];
 
-        // Resolve which ASIN to fetch for each color
-        const colorASINs = colors.map(c => ({ color: c, asin: colorToAsin[c] || null })).filter(x => x.asin);
+        // Build colorData: each color gets its image + price from page-level data
+        const colorData = {};
+        for (const c of colors) {
+          const cAsin = colorToAsin[c] || null;
+          colorData[c] = {
+            asin:    cAsin,
+            price:   cAsin ? (asinPrices[cAsin] || 0) : 0,
+            image:   colorImgMap[c] || '',
+            inStock: true,
+          };
+        }
 
-        console.log(`[scrape] ${colors.length} colors, ${sizes.length} sizes, ${colorASINs.length} ASINs to fetch`);
-
-        // Fetch each color's ASIN page → get image + price
-        const colorData = {}; // color → { image, price, inStock }
-        if (colorASINs.length) {
-          await Promise.all(colorASINs.slice(0, 15).map(async ({ color, asin }) => {
-            const h = await fetchPage(`https://www.amazon.com/dp/${asin}`, ua);
+        // For colors still missing images: fetch their ASIN page (up to 10 parallel)
+        const needImg = colors.filter(c => !colorData[c].image && colorData[c].asin);
+        if (needImg.length) {
+          console.log(`[scrape] fetching ${Math.min(needImg.length, 10)} ASIN pages for missing images`);
+          await Promise.all(needImg.slice(0, 10).map(async c => {
+            const h = await fetchPage(`https://www.amazon.com/dp/${colorData[c].asin}`, ua);
             if (!h) return;
             const img   = extractMainImage(h);
             const price = extractPrice(h);
             const stock = !h.toLowerCase().includes('currently unavailable');
-            colorData[color] = { image: img || '', price: price || 0, inStock: stock };
-            if (img && !product.images.includes(img)) product.images.push(img);
+            if (img)   colorData[c].image   = img;
+            if (price && !colorData[c].price) colorData[c].price = price;
+            colorData[c].inStock = stock;
           }));
         }
 
-        // Fallback: if we couldn't fetch ASINs, use page images in order
-        if (!Object.keys(colorData).length && product.images.length) {
-          colors.forEach((c, i) => {
-            colorData[c] = { image: product.images[i] || product.images[0] || '', price: product.price, inStock: true };
-          });
+        // Collect all color images into product.images (deduped)
+        for (const c of colors) {
+          const img = colorData[c].image;
+          if (img && !product.images.includes(img)) product.images.push(img);
         }
+        // Fallback: any color still missing an image gets assigned from page images
+        colors.filter(c => !colorData[c].image).forEach((c, i) => {
+          colorData[c].image = product.images[i] || product.images[0] || '';
+        });
+
+        console.log(`[scrape] colors with images: ${colors.filter(c => colorData[c].image).length}/${colors.length}`);
+        console.log(`[scrape] colors with prices: ${colors.filter(c => colorData[c].price > 0).length}/${colors.length}`);
 
         // Build variation groups
         if (colors.length) {
@@ -402,14 +495,14 @@ module.exports = async (req, res) => {
             name: 'Color',
             values: colors.map(c => ({
               value:   c,
-              price:   colorData[c]?.price   || product.price || 0,
-              image:   colorData[c]?.image   || '',
-              inStock: colorData[c]?.inStock ?? true,
+              price:   colorData[c].price || product.price || 0,
+              image:   colorData[c].image || '',
+              inStock: colorData[c].inStock,
               enabled: true,
             })),
           });
           product.variationImages['Color'] = Object.fromEntries(
-            Object.entries(colorData).map(([c, d]) => [c, d.image]).filter(([, img]) => img)
+            colors.map(c => [c, colorData[c].image]).filter(([, img]) => img)
           );
         }
         if (sizes.length) {
@@ -422,13 +515,15 @@ module.exports = async (req, res) => {
           });
         }
 
-        // Set product price to minimum color price
-        const colorPrices = colors.map(c => colorData[c]?.price).filter(Boolean);
-        if (colorPrices.length && !product.price) product.price = Math.min(...colorPrices);
+        // Set product base price = cheapest color
+        const colorPrices = colors.map(c => colorData[c].price).filter(x => x > 0);
+        if (colorPrices.length) product.price = Math.min(...colorPrices);
       }
-
-      console.log(`[scrape] OK "${product.title.slice(0,50)}" price=$${product.price} colors=${product.variations.find(v=>v.name==='Color')?.values.length||0} imgs=${product.images.length}`);
-      return res.json({ success: true, product });
+      const colorGrp = product.variations.find(v=>v.name==='Color');
+      const pricesFound = colorGrp ? colorGrp.values.filter(v=>v.price>0).length : 0;
+      const imagesFound = colorGrp ? colorGrp.values.filter(v=>v.image).length : 0;
+      console.log(`[scrape] OK "${product.title.slice(0,50)}" price=$${product.price} colors=${colorGrp?.values.length||0} prices=${pricesFound} images=${imagesFound} imgs=${product.images.length}`);
+      return res.json({ success: true, product, _debug: { pricesFound, imagesFound, totalColors: colorGrp?.values.length||0 } });
     }
 
     // ── PUSH: create eBay listing ─────────────────────────────────────────────
