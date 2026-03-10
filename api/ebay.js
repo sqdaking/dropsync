@@ -94,54 +94,51 @@ function extractBlock(html, searchStr) {
 
 // ── Extract color→image map from colorImages block ────────────────────────────
 // Handles: 'Ivory': [...], "L'Special": [...], 'Brown-Checkered': [...]
-function extractColorImgMap(html) {
+// ── Extract color→image from swatch img elements in raw HTML ─────────────────
+// Confirmed from live Amazon page: swatch imgs have alt="ColorName" src="...._SS64_.jpg"
+function extractSwatchImages(html) {
   const map = {};
-  const block = extractBlock(html, 'colorImages');
-  if (!block) return map;
-  // Two passes: single-quoted keys, then double-quoted keys
-  const patterns = [
-    /'((?:[^'\\]|\\.)*)'\s*:\s*\[\s*\{[^[\]]*?"hiRes"\s*:\s*"(https:[^"]+\.jpg)"/g,
-    /"((?:[^"\\]|\\.)*)"\s*:\s*\[\s*\{[^[\]]*?"hiRes"\s*:\s*"(https:[^"]+\.jpg)"/g,
-  ];
-  const skip = new Set(['initial','hiRes','thumb','main','large','small']);
-  for (const re of patterns) {
-    let m;
-    while ((m = re.exec(block)) !== null) {
-      const name = m[1].replace(/\\'/g, "'").replace(/\\"/g, '"').trim();
-      if (!skip.has(name) && name.length > 0 && !map[name]) map[name] = m[2];
+  const re = /alt="([^"]{2,60})"[^>]{0,200}src="(https:\/\/m\.media-amazon\.com\/images\/I\/[^"_]+\._SS\d+_\.jpg)"/g;
+  const seen = new Set();
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const name = m[1].trim();
+    if (!seen.has(name) && name.length > 1 && !name.toLowerCase().includes('brand')) {
+      seen.add(name);
+      map[name] = m[2].replace(/\._SS\d+_\.jpg$/, '._SL1500_.jpg');
     }
   }
+  console.log('[images] swatch map:', Object.keys(map).length, 'colors');
   return map;
 }
 
-// ── Extract ASIN→price map from priceToAsinList ───────────────────────────────
-function extractAsinPrices(html) {
-  const prices = {};
-  const block = extractBlock(html, '"priceToAsinList"');
-  if (!block) return prices;
-  try {
-    const list = JSON.parse(block);
-    for (const entry of list) {
-      const p = parseFloat(entry.price);
-      if (p > 0) for (const asin of (entry.asins || [])) prices[asin] = p;
+// ── Extract colorToAsin + sizeToAsin from "colorToAsin" JSON ─────────────────
+// Real format: {"Airy Blue 50\"x60\"": {"asin": "B0XXXXX"}, ...}
+function extractColorAsinMaps(html) {
+  const colorToAsin = {};
+  const sizeToAsin  = {};
+  const block = extractBlock(html, '"colorToAsin"');
+  if (!block) return { colorToAsin, sizeToAsin };
+  let data = {};
+  try { data = JSON.parse(block); } catch { return { colorToAsin, sizeToAsin }; }
+  for (const [key, val] of Object.entries(data)) {
+    const asin = val?.asin || (typeof val === 'string' ? val : null);
+    if (!asin || asin.length !== 10) continue;
+    // Keys: "Color 50\"x60\"" — literal backslash-quotes. After JSON.parse still have \\"
+    const cleaned = key.replace(/\\"/g, '"').replace(/\\'/g, "'");
+    // Match: ColorName + space + dimensions like 50"x60" or 60"x80"
+    const sizeM = cleaned.match(/^(.+?)\s+(\d+(?:\.\d+)?"[×x]\d+(?:\.\d+)?"?)\s*$/i);
+    if (sizeM) {
+      const color = sizeM[1].trim();
+      const size  = sizeM[2].trim();
+      if (!colorToAsin[color]) colorToAsin[color] = asin;
+      if (!sizeToAsin[size])   sizeToAsin[size]   = asin;
+    } else {
+      if (!colorToAsin[cleaned]) colorToAsin[cleaned] = asin;
     }
-  } catch {}
-  return prices;
-}
-
-// ── Extract color→ASIN map from dimensionToAsinMap ───────────────────────────
-function extractColorToAsin(html) {
-  // Try double-quoted key first (most common in embedded JSON)
-  for (const key of ['"dimensionToAsinMap"', 'dimensionToAsinMap']) {
-    const block = extractBlock(html, key);
-    if (!block) continue;
-    try {
-      const d = JSON.parse(block);
-      const map = d.color_name || d.Color || d.colour_name || null;
-      if (map && Object.keys(map).length > 0) return map;
-    } catch {}
   }
-  return {};
+  console.log('[colorToAsin] colors:', Object.keys(colorToAsin).length, 'sizes:', Object.keys(sizeToAsin).length);
+  return { colorToAsin, sizeToAsin };
 }
 
 // ── eBay Taxonomy API: get leaf category suggestions ─────────────────────────
@@ -413,30 +410,18 @@ module.exports = async (req, res) => {
       }
 
       // ── Variation data ────────────────────────────────────────────────────
-      // Extract ALL data from the main page HTML — no extra ASIN fetches needed
+      // CONFIRMED APPROACH from live Amazon page analysis:
+      // - Images: swatch <img alt="ColorName" src="...._SS64_.jpg"> (RELIABLE)
+      // - Color→ASIN: "colorToAsin" JSON {"Color Size":{asin}} (RELIABLE)
+      // - Prices: fetch one ASIN per size (only 6 sizes max) for price data
 
-      // 1. Per-color images from colorImages (proven bracket-counting parser)
-      const colorImgMap = extractColorImgMap(html);
-      console.log(`[scrape] colorImages: ${Object.keys(colorImgMap).length} color entries`);
+      // 1. Swatch images from HTML (the only reliable per-color image source)
+      const swatchImgMap = extractSwatchImages(html);
 
-      // 2. ASIN→price from priceToAsinList (embedded full price map)
-      const asinPrices = extractAsinPrices(html);
-      console.log(`[scrape] priceToAsinList: ${Object.keys(asinPrices).length} ASINs priced`);
+      // 2. Color→ASIN and Size→ASIN from colorToAsin JSON
+      const { colorToAsin, sizeToAsin } = extractColorAsinMaps(html);
 
-      // 3. Color→ASIN from dimensionToAsinMap
-      const colorToAsin = extractColorToAsin(html);
-      console.log(`[scrape] colorToAsin: ${Object.keys(colorToAsin).length} entries`);
-
-      // 4. Fallback: build colorToAsin from inline ASIN dimension blobs if needed
-      if (!Object.keys(colorToAsin).length) {
-        for (const [, a, b] of html.matchAll(/"([A-Z0-9]{10})"\s*:\s*\{([^}]{5,400})\}/g)) {
-          const cM = b.match(/"color_name"\s*:\s*"([^"]{1,80})"/);
-          if (cM && !colorToAsin[cM[1]]) colorToAsin[cM[1]] = a;
-        }
-        console.log(`[scrape] colorToAsin fallback: ${Object.keys(colorToAsin).length} entries`);
-      }
-
-      // 5. Color+size names list from variationValues
+      // 3. Color+size names from variationValues
       let varVals = null;
       const vvM = html.match(/"variationValues"\s*:\s*(\{"[a-z_]+"[^}]{5,2000}\})/);
       if (vvM) try { varVals = JSON.parse(vvM[1]); } catch {}
@@ -448,48 +433,68 @@ module.exports = async (req, res) => {
         const colors = varVals.color_name || [];
         const sizes  = varVals.size_name  || [];
 
-        // Build colorData: each color gets its image + price from page-level data
+        // 4. Per-size prices: fetch ONE representative ASIN per size (max 6 fetches)
+        const sizePrices = {};  // size → price
+        const sizeKeys = Object.keys(sizeToAsin);
+        if (sizeKeys.length) {
+          await Promise.all(sizeKeys.slice(0, 6).map(async size => {
+            const sAsin = sizeToAsin[size];
+            const h = await fetchPage(`https://www.amazon.com/dp/${sAsin}`, ua);
+            if (!h) return;
+            const p = extractPrice(h);
+            const s = !h.toLowerCase().includes('currently unavailable');
+            if (p) { sizePrices[size] = p; console.log(`[price] ${size}=$${p}`); }
+          }));
+        }
+        // If all size fetches failed, use main page price for everything
+        if (!Object.keys(sizePrices).length && product.price) {
+          sizes.forEach(s => sizePrices[s] = product.price);
+        }
+
+        // 5. Build colorData per color
         const colorData = {};
         for (const c of colors) {
           const cAsin = colorToAsin[c] || null;
+          // Price: find this color's size price (use first size as default)
+          // For color-only products: all same price. For color+size: per-size pricing
+          const defaultPrice = sizes.length > 0
+            ? (sizePrices[sizes[0]] || product.price || 0)
+            : (product.price || 0);
           colorData[c] = {
             asin:    cAsin,
-            price:   cAsin ? (asinPrices[cAsin] || 0) : 0,
-            image:   colorImgMap[c] || '',
+            price:   defaultPrice,
+            image:   swatchImgMap[c] || '',
             inStock: true,
           };
         }
 
-        // For colors still missing images: fetch their ASIN page (up to 10 parallel)
+        // 6. For any color still missing an image: fetch its ASIN page as last resort
         const needImg = colors.filter(c => !colorData[c].image && colorData[c].asin);
-        if (needImg.length) {
-          console.log(`[scrape] fetching ${Math.min(needImg.length, 10)} ASIN pages for missing images`);
-          await Promise.all(needImg.slice(0, 10).map(async c => {
+        if (needImg.length > 0) {
+          console.log(`[scrape] fetching ${Math.min(needImg.length, 8)} pages for missing images`);
+          await Promise.all(needImg.slice(0, 8).map(async c => {
             const h = await fetchPage(`https://www.amazon.com/dp/${colorData[c].asin}`, ua);
             if (!h) return;
-            const img   = extractMainImage(h);
-            const price = extractPrice(h);
-            const stock = !h.toLowerCase().includes('currently unavailable');
-            if (img)   colorData[c].image   = img;
-            if (price && !colorData[c].price) colorData[c].price = price;
-            colorData[c].inStock = stock;
+            const img = extractMainImage(h);
+            if (img) colorData[c].image = img;
           }));
         }
 
-        // Collect all color images into product.images (deduped)
+        // 7. Collect all color images into product.images (deduped)
         for (const c of colors) {
           const img = colorData[c].image;
           if (img && !product.images.includes(img)) product.images.push(img);
         }
-        // Fallback: any color still missing an image gets assigned from page images
-        colors.filter(c => !colorData[c].image).forEach((c, i) => {
-          colorData[c].image = product.images[i] || product.images[0] || '';
-        });
+        // Final fallback: assign remaining page images sequentially
+        let fallbackIdx = 0;
+        for (const c of colors.filter(c => !colorData[c].image)) {
+          colorData[c].image = product.images[fallbackIdx++ % Math.max(1, product.images.length)] || '';
+        }
 
-        console.log(`[scrape] colors with images: ${colors.filter(c => colorData[c].image).length}/${colors.length}`);
-        console.log(`[scrape] colors with prices: ${colors.filter(c => colorData[c].price > 0).length}/${colors.length}`);
+        console.log(`[scrape] colors with images: ${colors.filter(c=>colorData[c].image).length}/${colors.length}`);
+        console.log(`[scrape] size prices:`, JSON.stringify(sizePrices).slice(0,200));
 
-        // Build variation groups
+        // 8. Build variation groups
         if (colors.length) {
           product.variations.push({
             name: 'Color',
@@ -509,16 +514,18 @@ module.exports = async (req, res) => {
           product.variations.push({
             name: 'Size',
             values: sizes.map(s => ({
-              value: s, price: product.price || 0,
-              image: '', inStock: true, enabled: true,
+              value:   s,
+              price:   sizePrices[s] || product.price || 0,
+              image:   '', inStock: true, enabled: true,
             })),
           });
         }
 
-        // Set product base price = cheapest color
-        const colorPrices = colors.map(c => colorData[c].price).filter(x => x > 0);
-        if (colorPrices.length) product.price = Math.min(...colorPrices);
+        // Set product base price = cheapest size price
+        const allSizePrices = Object.values(sizePrices).filter(p => p > 0);
+        if (allSizePrices.length) product.price = Math.min(...allSizePrices);
       }
+
       const colorGrp = product.variations.find(v=>v.name==='Color');
       const pricesFound = colorGrp ? colorGrp.values.filter(v=>v.price>0).length : 0;
       const imagesFound = colorGrp ? colorGrp.values.filter(v=>v.image).length : 0;
