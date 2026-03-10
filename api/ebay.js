@@ -727,8 +727,37 @@ module.exports = async (req, res) => {
       console.log(`[push] ${final.length} variants`);
 
       // PUT each inventory_item (batched)
-      let okInv = 0;
-      for (let i = 0; i < final.length; i += 8) {
+      // Test with a single item first to catch 401 before running 240 requests
+      let tokenInvalid = false;
+      {
+        const testV = final[0];
+        const testAsp = { ...aspects };
+        if (testV.color) testAsp['Color'] = [testV.color];
+        if (testV.size)  testAsp['Size']  = [testV.size];
+        const testR = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(testV.sku)}`, {
+          method: 'PUT', headers: auth,
+          body: JSON.stringify({
+            availability: { shipToLocationAvailability: { quantity: testV.qty } },
+            condition: 'NEW',
+            product: {
+              title: listingTitle, description: product.description || listingTitle,
+              imageUrls: [testV.image, ...product.images.filter(x => x !== testV.image)].filter(Boolean).slice(0, 12),
+              aspects: testAsp,
+            },
+          }),
+        });
+        if (testR.status === 401) {
+          tokenInvalid = true;
+          console.warn('[push] 401 on inventory — token missing sell.inventory scope. Full re-auth required.');
+          return res.status(401).json({
+            error: 'eBay token missing inventory permission. Go to Settings → Force Reconnect (fix 401) and re-authorize.',
+            code: 'INVENTORY_401',
+          });
+        }
+      }
+
+      let okInv = 1; // count the test PUT above
+      for (let i = 1; i < final.length; i += 8) {
         await Promise.all(final.slice(i, i+8).map(async v => {
           const asp = { ...aspects };
           if (v.color) asp['Color'] = [v.color];
