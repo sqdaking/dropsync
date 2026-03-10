@@ -15,35 +15,76 @@ function getEbayUrls(sandbox) {
 }
 
 const UA_LIST = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
 ];
 const randUA = () => UA_LIST[Math.floor(Math.random() * UA_LIST.length)];
 
-// ── Amazon page fetcher with retry + CAPTCHA detection ────────────────────────
+// ── Amazon page fetcher: direct + proxy fallbacks ─────────────────────────────
 async function fetchPage(url, ua) {
+  const isBlocked = (html) =>
+    !html ||
+    html.includes('Type the characters') ||
+    html.includes('robot check') ||
+    html.includes('Enter the characters') ||
+    html.includes('automated access') ||
+    html.includes('api-services-support@amazon.com') ||
+    (html.length < 8000 && !html.includes('productTitle'));
+
+  const directHeaders = (agent) => ({
+    'User-Agent': agent || ua || randUA(),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Cache-Control': 'max-age=0',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Sec-CH-UA': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    'Sec-CH-UA-Mobile': '?0',
+    'Sec-CH-UA-Platform': '"Windows"',
+  });
+
+  // Strategy 1-3: direct fetch with different UAs and URL variants
+  const urlVariants = [url, url.replace('?th=1','?psc=1'), url.replace('?th=1','')];
   for (let i = 0; i < 3; i++) {
     try {
-      if (i > 0) await sleep(1500 * i);
-      const r = await fetch(url, {
-        headers: {
-          'User-Agent': ua || randUA(),
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Cache-Control': 'no-cache',
-          'Upgrade-Insecure-Requests': '1',
-        },
-        redirect: 'follow',
-      });
+      if (i > 0) await sleep(600 + i * 800);
+      const r = await fetch(urlVariants[i] || url, { headers: directHeaders(UA_LIST[i % UA_LIST.length]), redirect: 'follow' });
       const html = await r.text();
-      if (html.includes('Type the characters') || html.includes('robot check')) {
-        if (i < 2) continue;
-        return '';
-      }
-      return html;
-    } catch (e) { if (i === 2) return ''; }
+      if (!isBlocked(html)) { console.log(`[fetch] direct ok attempt ${i+1} len=${html.length}`); return html; }
+      console.warn(`[fetch] direct attempt ${i+1} blocked (${html.length}b)`);
+    } catch (e) { console.warn(`[fetch] direct attempt ${i+1} error: ${e.message}`); }
   }
+
+  // Strategy 4: allorigins proxy (free CORS proxy that relays the page)
+  try {
+    await sleep(1000);
+    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+    const r = await fetch(proxyUrl, { headers: { 'User-Agent': randUA() } });
+    const d = await r.json();
+    const html = d.contents || '';
+    if (!isBlocked(html)) { console.log(`[fetch] allorigins ok len=${html.length}`); return html; }
+    console.warn(`[fetch] allorigins blocked (${html.length}b)`);
+  } catch (e) { console.warn(`[fetch] allorigins error: ${e.message}`); }
+
+  // Strategy 5: scraperapi free tier (no key needed for basic requests)
+  try {
+    await sleep(800);
+    const scraperUrl = `https://api.scraperapi.com/?url=${encodeURIComponent(url)}&render=false`;
+    const r = await fetch(scraperUrl, { headers: { 'User-Agent': randUA() } });
+    const html = await r.text();
+    if (!isBlocked(html)) { console.log(`[fetch] scraperapi ok len=${html.length}`); return html; }
+    console.warn(`[fetch] scraperapi blocked (${html.length}b)`);
+  } catch (e) { console.warn(`[fetch] scraperapi error: ${e.message}`); }
+
   return '';
 }
 
@@ -484,11 +525,22 @@ module.exports = async (req, res) => {
       const asinM = url.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/);
       const asinP = url.match(/[?&]asin=([A-Z0-9]{10})/i);
       const asin  = asinM?.[1] || asinP?.[1];
-      if (asin) url = `https://www.amazon.com/dp/${asin}`;
+      // Use ?th=1 to force variant page and avoid redirects
+      if (asin) url = `https://www.amazon.com/dp/${asin}?th=1`;
 
       const ua   = randUA();
-      const html = await fetchPage(url, ua);
-      if (!html) return res.json({ success: false, error: 'Could not load page — Amazon may be rate limiting. Try again in 1 min.' });
+      let html = await fetchPage(url, ua);
+      // If first attempt blocked, try alternate URL formats
+      if (!html && asin) {
+        await sleep(1500);
+        html = await fetchPage(`https://www.amazon.com/dp/${asin}?psc=1`, ua);
+      }
+      if (!html && asin) {
+        await sleep(2000);
+        // Try with a product slug placeholder 
+        html = await fetchPage(`https://www.amazon.com/product/dp/${asin}`, ua);
+      }
+      if (!html) return res.json({ success: false, error: 'Amazon is blocking requests right now. Wait 1-2 minutes and try again.' });
 
       const product = {
         url, source: 'amazon', asin: asin || '',
@@ -743,6 +795,9 @@ module.exports = async (req, res) => {
       const pricesFound = colorGrp ? colorGrp.values.filter(v=>v.price>0).length : 0;
       const imagesFound = colorGrp ? colorGrp.values.filter(v=>v.image).length : 0;
       console.log(`[scrape] OK "${product.title.slice(0,50)}" price=$${product.price} colors=${colorGrp?.values.length||0} prices=${pricesFound} images=${imagesFound} imgs=${product.images.length}`);
+      if (!product.title) {
+        return res.json({ success: false, error: 'Amazon blocked the request (bot detection). Wait 30 seconds and try again, or paste the URL directly.' });
+      }
       return res.json({ success: true, product, _debug: { pricesFound, imagesFound, totalColors: colorGrp?.values.length||0 } });
     }
 
