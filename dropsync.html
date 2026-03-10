@@ -152,6 +152,7 @@ const DEFAULT_STATE = {
 
 let S = { ...DEFAULT_STATE };
 try { const saved = JSON.parse(localStorage.getItem(KEY)||'{}'); S = { ...S, ...saved }; } catch {}
+// bulkLoadState called lazily in renderBulk
 const save = () => localStorage.setItem(KEY, JSON.stringify(S));
 
 // ── Price Calc ────────────────────────────────────────
@@ -594,290 +595,327 @@ async function doPush() {
 // ══════════════════════════════════════════════════════
 // PRODUCTS VIEW
 // ══════════════════════════════════════════════════════
-// ── BULK IMPORT ────────────────────────────────────────────────────────────────
+// ── BULK IMPORT (Today's Deals) ───────────────────────────────────────────────
 let BULK = {
-  sourceUrl: '',       // original URL pasted by user
-  seedAsin: '',
-  batchAsins: [],      // current batch of 15 ASINs
-  allScrapedAsins: new Set(), // every ASIN ever scraped (dedup)
-  queue: [],           // scraped products waiting to be pushed
-  pushing: false,
+  usedAsins: new Set(),      // all ASINs ever fetched/imported (persisted)
+  queue: [],                 // products scraped & ready to push
   scraping: false,
+  pushing: false,
+  lastFetchCount: 0,
 };
 
+// Persist used ASINs across page loads
+function bulkLoadState() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('ds_bulk')||'{}');
+    BULK.usedAsins = new Set(saved.usedAsins||[]);
+  } catch {}
+  // Also add all existing product ASINs so we never re-import
+  (S.products||[]).forEach(p => { if (p.asin) BULK.usedAsins.add(p.asin); });
+}
+function bulkSaveState() {
+  try { localStorage.setItem('ds_bulk', JSON.stringify({ usedAsins: [...BULK.usedAsins] })); } catch {}
+}
+
 function renderBulk() {
-  const draftCount  = (S.products||[]).filter(p=>p.status==='draft' && p._bulk).length;
-  const listedCount = (S.products||[]).filter(p=>p.status==='listed' && p._bulk).length;
-  const queueCount  = BULK.queue.length;
+  bulkLoadState();
+  const draftBulk  = (S.products||[]).filter(p=>p.status==='draft'  && p._bulk).length;
+  const listedBulk = (S.products||[]).filter(p=>p.status==='listed' && p._bulk).length;
+  const qLen = BULK.queue.length;
 
   $('topbar-actions').innerHTML = '';
   $('content').innerHTML = `
-    <div style="max-width:700px;margin:0 auto;display:flex;flex-direction:column;gap:16px">
+    <div style="max-width:720px;margin:0 auto;display:flex;flex-direction:column;gap:16px;padding-bottom:32px">
 
-      <!-- Source URL input -->
+      <!-- Header card -->
       <div class="card">
-        <div class="card-header"><span class="card-title">📦 Bulk Import from Amazon</span></div>
+        <div class="card-header">
+          <span class="card-title">🔥 Today's Deals — Bulk Import</span>
+          <div style="font-size:11px;color:var(--text3)">${BULK.usedAsins.size} ASINs used · ${listedBulk} live listings</div>
+        </div>
         <div class="card-body" style="display:flex;flex-direction:column;gap:12px">
-          <div>
-            <label style="font-size:11px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.05em">Amazon Product URL</label>
-            <div style="display:flex;gap:8px;margin-top:4px">
-              <input class="input" id="bulk-url" placeholder="https://www.amazon.com/dp/B0XXXXXX"
-                value="${BULK.sourceUrl}"
-                style="flex:1" oninput="BULK.sourceUrl=this.value">
-              <button class="btn btn-primary" id="bulk-fetch-btn" onclick="bulkFetchAsins()" ${BULK.scraping?'disabled':''}>
-                ${BULK.scraping ? '⏳ Finding…' : BULK.allScrapedAsins.size > 0 ? '🔄 Find 15 More' : '🔍 Find 15 Products'}
-              </button>
-            </div>
-            <div style="font-size:11px;color:var(--text3);margin-top:4px">Paste any Amazon product URL — we'll find 15 related products to import as drafts</div>
+          <div style="font-size:13px;color:var(--text2);line-height:1.6">
+            Automatically finds <b>25 random products</b> from <a href="https://www.amazon.com/deals" target="_blank" style="color:var(--accent)">Amazon Today's Deals</a>, 
+            skips VeRO brands &amp; digital items, imports them as drafts, then lets you push all to eBay. 
+            After publishing, fetch the next 25 — no duplicates ever.
           </div>
-
-          ${BULK.batchAsins.length ? `
-          <div style="padding:10px;background:var(--bg);border-radius:8px;font-size:12px;color:var(--text2)">
-            ✅ Found <b>${BULK.batchAsins.length} ASINs</b> from seed <code style="font-size:11px">${BULK.seedAsin}</code>
-            · ${BULK.allScrapedAsins.size} total scraped so far
-          </div>` : ''}
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+            ${qLen === 0 ? `
+            <button class="btn btn-primary" id="bulk-fetch-btn" onclick="bulkFetchDeals()" ${BULK.scraping?'disabled':''} style="min-width:200px">
+              ${BULK.scraping 
+                ? '<span style="display:inline-flex;align-items:center;gap:6px"><div class="spinner" style="width:12px;height:12px"></div> Scanning deals…</span>' 
+                : BULK.usedAsins.size > 0 ? '🔄 Fetch Next 25 Deals' : '🔍 Fetch 25 Deals'}
+            </button>` : `
+            <button class="btn btn-success" id="bulk-push-btn" onclick="bulkPushAll()" ${BULK.pushing?'disabled':''} style="min-width:220px">
+              ${BULK.pushing 
+                ? '<span style="display:inline-flex;align-items:center;gap:6px"><div class="spinner" style="width:12px;height:12px"></div> Pushing to eBay…</span>' 
+                : `🚀 Publish All ${qLen} to eBay`}
+            </button>
+            <button class="btn btn-primary" id="bulk-fetch-btn" onclick="bulkFetchDeals()" ${BULK.scraping||BULK.pushing?'disabled':''}>
+              ${BULK.scraping ? '⏳ Scanning…' : '+ Queue 25 More'}
+            </button>`}
+            ${BULK.usedAsins.size > 0 ? `<button class="btn btn-ghost btn-sm" style="font-size:11px;color:var(--text3)" onclick="bulkReset()">↺ Reset history</button>` : ''}
+          </div>
+          ${!S.token ? `<div style="font-size:12px;color:#f59e0b">⚠️ Connect eBay in Settings to push listings</div>` : ''}
         </div>
       </div>
 
-      <!-- Queue / Drafts status -->
-      ${BULK.queue.length || draftCount ? `
+      <!-- Queue list -->
+      ${qLen > 0 ? `
       <div class="card">
         <div class="card-header">
-          <span class="card-title">📋 Import Queue (${BULK.queue.length} ready · ${draftCount} drafts · ${listedCount} listed)</span>
-          <div style="display:flex;gap:8px">
-            ${BULK.queue.length && S.token ? `<button class="btn btn-success btn-sm" onclick="bulkPushAll()" ${BULK.pushing?'disabled':''}>
-              ${BULK.pushing ? '⏳ Pushing…' : `🚀 Push All ${BULK.queue.length} to eBay`}
-            </button>` : ''}
-            ${draftCount ? `<button class="btn btn-outline btn-sm" onclick="nav('products')">View Drafts →</button>` : ''}
-          </div>
+          <span class="card-title">📋 Ready to Push (${qLen})</span>
+          <button class="btn btn-ghost btn-sm" style="font-size:11px;color:var(--red)" onclick="BULK.queue=[];renderBulk()">Clear queue</button>
         </div>
-        <div id="bulk-queue-list" style="max-height:360px;overflow-y:auto">
-          ${renderBulkQueue()}
+        <div style="max-height:340px;overflow-y:auto">
+          ${BULK.queue.map((p,i) => {
+            const img = p.images?.[0]||'';
+            const vc = p.hasVariations ? (p.variations?.reduce((s,g)=>s+g.values.filter(v=>v.enabled!==false).length,0)||'?') : 1;
+            return `<div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--border)">
+              ${img ? `<img src="${img}" style="width:44px;height:44px;border-radius:6px;object-fit:cover;flex-shrink:0">` 
+                    : `<div style="width:44px;height:44px;border-radius:6px;background:var(--bg);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">📦</div>`}
+              <div style="flex:1;min-width:0">
+                <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${p.ebayTitle||p.title||p.asin}</div>
+                <div style="font-size:11px;color:var(--text3)">${p.asin} · ${vc} variants · <span style="color:var(--green)">$${(p.myPrice||0).toFixed(2)}</span></div>
+              </div>
+              <span class="badge badge-amber">Draft</span>
+            </div>`;
+          }).join('')}
         </div>
       </div>` : ''}
 
-      <!-- Progress / log -->
-      <div id="bulk-log" style="font-size:12px;color:var(--text2);display:flex;flex-direction:column;gap:4px"></div>
-
+      <!-- Activity log -->
+      <div id="bulk-log" style="font-size:12px;display:flex;flex-direction:column;gap:3px"></div>
     </div>`;
-}
-
-function renderBulkQueue() {
-  if (!BULK.queue.length) return '<div style="padding:16px;text-align:center;color:var(--text3);font-size:13px">No products in queue yet</div>';
-  return BULK.queue.map((p, i) => {
-    const img = p.images?.[0] || '';
-    const vc = p.hasVariations ? p.variations?.reduce((s,g)=>s+g.values.filter(v=>v.enabled!==false).length,0) : 1;
-    return `<div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--border)">
-      ${img ? `<img src="${img}" style="width:44px;height:44px;border-radius:6px;object-fit:cover;flex-shrink:0">` : `<div style="width:44px;height:44px;border-radius:6px;background:var(--bg);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">📦</div>`}
-      <div style="flex:1;min-width:0">
-        <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${p.ebayTitle || p.title}</div>
-        <div style="font-size:11px;color:var(--text3)">${p.asin} · ${vc} variants · <span style="color:var(--green)">$${(p.myPrice||0).toFixed(2)}</span></div>
-      </div>
-      <span class="badge badge-amber">Draft</span>
-    </div>`;
-  }).join('');
 }
 
 function bulkLog(msg, type='info') {
   const el = $('bulk-log');
   if (!el) return;
-  const colors = { info: 'var(--text2)', success: 'var(--green)', error: 'var(--red)', warn: '#f59e0b' };
-  const icons  = { info: 'ℹ️', success: '✅', error: '❌', warn: '⚠️' };
-  el.innerHTML = `<div style="color:${colors[type]}">${icons[type]} ${msg}</div>` + el.innerHTML;
+  const colors = { info:'var(--text2)', success:'var(--green)', error:'var(--red)', warn:'#f59e0b' };
+  const icons  = { info:'ℹ️', success:'✅', error:'❌', warn:'⚠️' };
+  el.innerHTML = `<div style="color:${colors[type]};padding:2px 0">${icons[type]} ${msg}</div>` + el.innerHTML;
 }
 
-async function bulkFetchAsins() {
-  const url = BULK.sourceUrl.trim();
-  if (!url) { toast('Paste an Amazon URL first', 'error'); return; }
-  if (!S.backendUrl) { toast('Set Backend URL in Settings', 'error'); nav('settings'); return; }
+function bulkReset() {
+  if (!confirm('Reset import history? This allows re-importing previously fetched products.')) return;
+  BULK.usedAsins = new Set();
+  BULK.queue = [];
+  bulkSaveState();
+  renderBulk();
+  toast('History cleared', 'success');
+}
 
+// VeRO + digital skip list (client-side filtering)
+const VERO_BRANDS = new Set([
+  'samsung','apple','nike','adidas','sony','microsoft','lg','bose',
+  'beats','dyson','lego','gucci','louis vuitton','chanel','rolex',
+  'prada','versace','burberry','yeezy','jordan','off-white','supreme',
+  'north face','ugg','timberland','new balance','under armour','reebok',
+  'puma','vans','converse','dr. martens','crocs','birkenstock',
+  'kindle','echo','ring','roomba','nespresso','keurig','instant pot',
+  'nintendo','playstation','xbox','fitbit','garmin','gopro',
+  'turbotax','doordash','uber','instacart','grubhub',
+  'pokemon','disney','marvel','dc comics','star wars','harry potter',
+  'larnmern','artisans bazaar',
+]);
+const SKIP_KEYWORDS = [
+  'ebook','kindle edition','gift card','egift','digital code','game download',
+  'app purchase','audible','prime video','rolling balls','brain games',
+  "alpha's bride",'design home','iq boost','training brain','free 3d game',
+  'gift-card','e-gift',
+];
+function isVeRO(title) {
+  const t = (title||'').toLowerCase();
+  for (const b of VERO_BRANDS) if (t.includes(b)) return true;
+  for (const k of SKIP_KEYWORDS) if (t.includes(k)) return true;
+  return false;
+}
+
+async function fetchDealsAsins() {
+  // Use backend dealsScrape action — it has proper fetch/proxy infrastructure
+  bulkLog('Scanning Amazon Today\'s Deals…');
+
+  const usedSet = new Set([...BULK.usedAsins, ...(S.products||[]).map(p=>p.asin).filter(Boolean)]);
+
+  const r = await fetch(`${S.backendUrl}/api/ebay?action=dealsScrape`, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ exclude: [...usedSet], count: 40 }) // ask for 40 so we have buffer after VeRO filter
+  });
+  const d = await r.json();
+  if (!d.success) throw new Error(d.error || 'Deals scrape failed');
+
+  const products = (d.products || []).filter(p => p.asin && !usedSet.has(p.asin) && !isVeRO(p.title));
+  bulkLog(`Found ${d.totalFound || '?'} products on deals page · ${products.length} new after filters`);
+
+  // Shuffle and take 25
+  for (let i = products.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [products[i], products[j]] = [products[j], products[i]];
+  }
+  return products.slice(0, 25);
+}
+
+async function bulkFetchDeals() {
+  if (!S.backendUrl) { toast('Set Backend URL in Settings first', 'error'); nav('settings'); return; }
+  if (BULK.scraping) return;
   BULK.scraping = true;
   renderBulk();
-  bulkLog('Finding related products…');
 
   try {
-    const r = await fetch(`${S.backendUrl}/api/ebay?action=bulkScrapeAsins`, {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ url, limit: 20 })
-    });
-    const d = await r.json();
-    if (!d.success) throw new Error(d.error || 'Failed to find ASINs');
-
-    BULK.seedAsin = d.seedAsin;
-
-    // Filter out ASINs already scraped or already in products
-    const existingAsins = new Set((S.products||[]).map(p=>p.asin));
-    const newAsins = d.asins.filter(a => !BULK.allScrapedAsins.has(a) && !existingAsins.has(a));
-
-    if (!newAsins.length) {
-      bulkLog('All found products already imported. Try a different seed URL.', 'warn');
+    // Step 1: Get 25 fresh ASINs from deals page (browser-side)
+    const products = await fetchDealsAsins();
+    
+    if (!products.length) {
+      bulkLog('No new products found — all deals already imported. Try resetting history or wait for new deals.', 'warn');
       BULK.scraping = false;
       renderBulk();
       return;
     }
 
-    BULK.batchAsins = newAsins.slice(0, 15);
-    bulkLog(`Found ${BULK.batchAsins.length} new products to import`, 'success');
+    // Mark as used immediately
+    products.forEach(p => BULK.usedAsins.add(p.asin));
+    bulkSaveState();
 
-    // Now scrape each ASIN
-    await bulkScrapeAll(BULK.batchAsins);
+    // Step 2: Scrape each ASIN via backend
+    let ok = 0, skipped = 0;
+    for (let i = 0; i < products.length; i++) {
+      const { asin, title: hintTitle } = products[i];
+      const btnEl = $('bulk-fetch-btn');
+      if (btnEl) btnEl.innerHTML = `<span style="display:inline-flex;align-items:center;gap:6px"><div class="spinner" style="width:12px;height:12px"></div> ${i+1}/${products.length}: ${asin}…</span>`;
 
+      try {
+        const sr = await fetch(`${S.backendUrl}/api/ebay?action=scrape`, {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ url: `https://www.amazon.com/dp/${asin}?th=1` })
+        });
+        const sd = await sr.json();
+        if (!sd.success || !sd.product?.title) {
+          bulkLog(`${asin}: skipped — ${sd.error || 'no data'}`, 'warn');
+          skipped++;
+          await new Promise(res=>setTimeout(res,300));
+          continue;
+        }
+
+        const p = sd.product;
+        const markup = S.markup || 35;
+        const calcP = cost => { const c=parseFloat(cost)||0; return c ? Math.ceil(((c+2)*(1+markup/100)/(1-0.1335)+0.30)*100)/100 : 0; };
+        p.myPrice = calcP(p.price);
+        if (p.variations) p.variations.forEach(g => g.values.forEach(v => { if(v.price) v.myPrice=calcP(v.price); }));
+
+        // AI title optimization (non-blocking)
+        try {
+          const tr = await fetch(`${S.backendUrl}/api/ebay?action=optimizeTitle`, {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ title: p.title, breadcrumbs: p.breadcrumbs||[] })
+          });
+          const td = await tr.json();
+          if (td.success && td.optimizedTitle) p.ebayTitle = td.optimizedTitle;
+        } catch {}
+
+        const prod = {
+          id: uid(), sourceUrl: `https://www.amazon.com/dp/${asin}`,
+          source: 'amazon', asin: p.asin||asin,
+          title: p.title||hintTitle||'', ebayTitle: p.ebayTitle||'',
+          price: p.price||0, myPrice: p.myPrice||0, markup: S.markup||35,
+          images: p.images||[], description: p.description||'',
+          bullets: p.bullets||[], descriptionPara: p.descriptionPara||'',
+          aspects: p.aspects||{}, breadcrumbs: p.breadcrumbs||[],
+          variations: JSON.parse(JSON.stringify(p.variations||[])),
+          variationImages: JSON.parse(JSON.stringify(p.variationImages||{})),
+          hasVariations: p.hasVariations||false,
+          quantity: S.quantity||10, inStock: p.inStock!==false,
+          status: 'draft', ebaySku: '', ebayListingId: '',
+          createdAt: new Date().toISOString(), lastSynced: null,
+          comboAsin: p.comboAsin||{}, sizePrices: p.sizePrices||{}, comboPrices: p.comboPrices||{},
+          _bulk: true,
+        };
+
+        BULK.queue.push(prod);
+        if (!S.products) S.products=[];
+        S.products.push(prod);
+        save();
+        ok++;
+        bulkLog(`✓ ${asin}: "${(p.ebayTitle||p.title).slice(0,50)}"`, 'success');
+      } catch(e) {
+        bulkLog(`${asin}: error — ${e.message}`, 'error');
+        skipped++;
+      }
+      if (i < products.length-1) await new Promise(res=>setTimeout(res,500));
+    }
+
+    bulkLog(`Done! ${ok} products ready to push, ${skipped} skipped`, ok>0?'success':'warn');
   } catch(e) {
     bulkLog('Error: ' + e.message, 'error');
-  } finally {
-    BULK.scraping = false;
-    renderBulk();
   }
-}
 
-async function bulkScrapeAll(asins) {
-  let ok = 0, fail = 0;
-  for (let i = 0; i < asins.length; i++) {
-    const asin = asins[i];
-    bulkLog(`Importing ${i+1}/${asins.length}: ${asin}…`);
-    try {
-      const r = await fetch(`${S.backendUrl}/api/ebay?action=scrape`, {
-        method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ url: `https://www.amazon.com/dp/${asin}?th=1` })
-      });
-      const d = await r.json();
-      if (!d.success || !d.product?.title) {
-        bulkLog(`${asin}: skipped — ${d.error || 'no data'}`, 'warn');
-        fail++;
-        continue;
-      }
-      BULK.allScrapedAsins.add(asin);
-
-      const p = d.product;
-      p.url = `https://www.amazon.com/dp/${asin}`;
-      p.markup = S.markup;
-      // Apply markup to variation prices
-      const markup = S.markup || 35;
-      const calcP = (cost) => {
-        const c = parseFloat(cost)||0;
-        if (!c) return 0;
-        return Math.ceil(((c+2)*(1+markup/100)/(1-0.1335)+0.30)*100)/100;
-      };
-      p.myPrice = calcP(p.price);
-      if (p.variations) p.variations.forEach(g => g.values.forEach(v => { if(v.price) v.myPrice = calcP(v.price); }));
-
-      // Auto-optimize title (non-blocking, best effort)
-      try {
-        const tr = await fetch(`${S.backendUrl}/api/ebay?action=optimizeTitle`, {
-          method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ title: p.title, breadcrumbs: p.breadcrumbs||[] })
-        });
-        const td = await tr.json();
-        if (td.success && td.optimizedTitle) p.ebayTitle = td.optimizedTitle;
-      } catch {}
-
-      // Build product and add to queue + save as draft
-      const prod = {
-        id: uid(),
-        sourceUrl: p.url,
-        source: 'amazon',
-        asin: p.asin || asin,
-        title: p.title || '',
-        ebayTitle: p.ebayTitle || '',
-        price: p.price || 0,
-        myPrice: p.myPrice || 0,
-        markup: S.markup,
-        images: p.images || [],
-        description: p.description || '',
-        bullets: p.bullets || [],
-        descriptionPara: p.descriptionPara || '',
-        aspects: p.aspects || {},
-        breadcrumbs: p.breadcrumbs || [],
-        variations: JSON.parse(JSON.stringify(p.variations || [])),
-        variationImages: JSON.parse(JSON.stringify(p.variationImages || {})),
-        hasVariations: p.hasVariations || false,
-        quantity: S.quantity || 10,
-        inStock: p.inStock !== false,
-        status: 'draft',
-        ebaySku: '', ebayListingId: '',
-        createdAt: new Date().toISOString(), lastSynced: null,
-        comboAsin: p.comboAsin || {},
-        sizePrices: p.sizePrices || {},
-        comboPrices: p.comboPrices || {},
-        _bulk: true,  // mark as bulk-imported
-      };
-
-      BULK.queue.push(prod);
-      // Save as draft immediately
-      if (!S.products) S.products = [];
-      S.products.push(prod);
-      save();
-      ok++;
-      bulkLog(`✓ ${asin}: "${(p.ebayTitle||p.title).slice(0,45)}"`, 'success');
-
-      // Small delay to avoid hammering
-      if (i < asins.length - 1) await new Promise(res => setTimeout(res, 400));
-    } catch(e) {
-      bulkLog(`${asin}: error — ${e.message}`, 'error');
-      fail++;
-    }
-  }
-  bulkLog(`Import complete: ${ok} imported, ${fail} skipped`, ok>0?'success':'warn');
+  BULK.scraping = false;
   renderBulk();
 }
 
 async function bulkPushAll() {
-  if (!S.token) { toast('Connect eBay first in Settings', 'error'); return; }
+  if (!S.token) { toast('Connect eBay in Settings first', 'error'); return; }
   if (BULK.pushing) return;
   BULK.pushing = true;
   renderBulk();
 
-  const toPush = BULK.queue.filter(p => p.status === 'draft');
-  let pushed = 0, failed = 0;
+  const toPush = [...BULK.queue]; // snapshot
+  let pushed=0, failed=0;
 
-  for (let i = 0; i < toPush.length; i++) {
+  for (let i=0; i<toPush.length; i++) {
     const p = toPush[i];
+    // Dedup: skip if already live
+    const stored = S.products.find(x=>x.id===p.id);
+    if (stored?.status==='listed' && stored?.ebayListingId) {
+      BULK.queue = BULK.queue.filter(x=>x.id!==p.id);
+      continue;
+    }
+    const btnEl = $('bulk-push-btn');
+    if (btnEl) btnEl.innerHTML = `<span style="display:inline-flex;align-items:center;gap:6px"><div class="spinner" style="width:12px;height:12px"></div> ${i+1}/${toPush.length}: ${p.asin}…</span>`;
     bulkLog(`Pushing ${i+1}/${toPush.length}: ${p.asin}…`);
+
     try {
       const token = await ensureToken();
       const r = await fetch(`${S.backendUrl}/api/ebay?action=push`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({
           access_token: token, product: p, sandbox: S.sandboxMode||false,
-          fulfillmentPolicyId: S.sandboxMode ? '' : S.fulfillmentPolicyId,
-          paymentPolicyId: S.sandboxMode ? '' : S.paymentPolicyId,
-          returnPolicyId: S.sandboxMode ? '' : S.returnPolicyId,
+          fulfillmentPolicyId: S.sandboxMode?'':S.fulfillmentPolicyId,
+          paymentPolicyId:     S.sandboxMode?'':S.paymentPolicyId,
+          returnPolicyId:      S.sandboxMode?'':S.returnPolicyId,
         })
       });
       const d = await r.json();
       if (!d.success) {
-        let msg = d.error || 'Push failed';
-        if (d.details) msg += ': ' + d.details;
-        bulkLog(`${p.asin} FAILED: ${msg.slice(0,80)}`, 'error');
+        bulkLog(`${p.asin} failed: ${(d.error||'push failed').slice(0,70)}`, 'error');
         failed++;
+        await new Promise(res=>setTimeout(res, 800));
         continue;
       }
-      // Update product status
-      const stored = S.products.find(x => x.id === p.id);
-      if (stored) {
-        stored.status = 'listed';
-        stored.ebaySku = d.sku;
-        stored.ebayListingId = d.listingId;
-        stored.lastSynced = new Date().toISOString();
-      }
-      // Remove from queue
-      BULK.queue = BULK.queue.filter(x => x.id !== p.id);
+      if (stored) { stored.status='listed'; stored.ebaySku=d.sku; stored.ebayListingId=d.listingId; stored.lastSynced=new Date().toISOString(); }
+      BULK.queue = BULK.queue.filter(x=>x.id!==p.id);
       save();
-      addLog('push', `Bulk listed: ${(p.ebayTitle||p.title).slice(0,45)}`, `eBay ID ${d.listingId}`, { productId: p.id, ebayId: d.listingId });
-      bulkLog(`✓ ${p.asin} listed as ${d.listingId}`, 'success');
+      addLog('push', `Bulk listed: ${(p.ebayTitle||p.title).slice(0,45)}`, `eBay ID ${d.listingId}`, {productId:p.id, ebayId:d.listingId});
+      bulkLog(`✓ ${p.asin} → eBay ${d.listingId}`, 'success');
       pushed++;
-
-      if (i < toPush.length - 1) await new Promise(res => setTimeout(res, 800));
     } catch(e) {
       bulkLog(`${p.asin}: error — ${e.message}`, 'error');
       failed++;
     }
+    if (i<toPush.length-1) await new Promise(res=>setTimeout(res, 1000));
   }
 
   BULK.pushing = false;
-  bulkLog(`Push complete: ${pushed} listed, ${failed} failed`, pushed>0?'success':'warn');
+  if (pushed > 0) {
+    bulkLog(`🎉 Published ${pushed} listings! Click "Fetch Next 25 Deals" for a fresh batch with no duplicates.`, 'success');
+    toast(`🎉 ${pushed} listings live on eBay!`, 'success', 5000);
+    // Sync the products tab badge
+    const navEl = $('nav-products');
+    if (navEl) navEl.style.position = 'relative';
+  } else {
+    bulkLog(`Push complete: ${pushed} listed, ${failed} failed`, pushed>0?'success':'warn');
+  }
   renderBulk();
-  if (pushed) renderProducts();
 }
 
 function renderProducts() {
