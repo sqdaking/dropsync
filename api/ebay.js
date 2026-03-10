@@ -897,13 +897,16 @@ module.exports = async (req, res) => {
         const colorUrlList = Object.values(colorImgUrls).filter(Boolean).slice(0,12);
         const groupImageUrls = colorUrlList.length ? colorUrlList : product.images.slice(0, 12);
         const variesBySpecs = Object.entries(varAspects).map(([name, values]) => ({ name, values }));
+        // aspects on the group = non-variation aspects only (Color/Size go in variesBy)
+        const groupAspects = { ...aspects };
+        delete groupAspects['Color']; delete groupAspects['Size'];
         const groupBody = {
             inventoryItemGroupKey: groupSku,
             title: listingTitle,
             description: product.description || listingTitle,
             imageUrls: groupImageUrls,
             variantSKUs: final.map(v => v.sku),
-            aspects: varAspects,
+            aspects: groupAspects,
             variesBy: {
               aspectsImageVariesBy: colorGroup ? ['Color'] : [],
               specifications: variesBySpecs,
