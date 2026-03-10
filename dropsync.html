@@ -307,6 +307,10 @@ async function doScrape() {
     const priceNote = dbg.pricesFound > 0 ? ` · 💰 ${dbg.pricesFound}/${dbg.totalColors} prices` : dbg.totalColors > 0 ? ' · ⚠️ prices unavailable (will use base price)' : '';
     const imgNote   = dbg.imagesFound  > 0 ? ` · 🖼 ${dbg.imagesFound}/${dbg.totalColors} images` : '';
     setStatus(`✅ Imported "${IMP.title.slice(0,50)}" — ${vc} variants${priceNote}${imgNote}${S.token ? ' · scroll down to push →' : ' · connect eBay in Settings'}`, 'success');
+    // Auto-optimize title in background (non-blocking)
+    if (S.backendUrl && !IMP.ebayTitle) {
+      aiOptimizeTitle().catch(() => {});
+    }
   } catch (e) {
     _scraping = false;
     renderImport();
@@ -345,7 +349,14 @@ function renderPreview() {
       <div class="card-header" style="display:flex;align-items:center;gap:12px">
         ${img0 ? `<img src="${img0}" style="width:48px;height:48px;object-fit:contain;border-radius:6px;background:var(--bg)">` : ''}
         <div style="flex:1;min-width:0">
-          <div style="font-weight:700;font-size:14px;margin-bottom:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${IMP.title}</div>
+          <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+            <input id="imp-title-input"
+              value="${IMP.ebayTitle || IMP.title || ''}"
+              style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-size:13px;font-weight:600;color:var(--text);min-width:0"
+              oninput="IMP.ebayTitle=this.value"
+              placeholder="eBay listing title...">
+            <button id="ai-title-btn" class="btn btn-outline btn-sm" style="flex-shrink:0;font-size:11px;white-space:nowrap" onclick="aiOptimizeTitle()">✨ AI Title</button>
+          </div>
           <div style="font-size:11px;color:var(--text3);font-family:var(--font-mono)">${IMP.breadcrumbs?.join(' › ') || 'amazon.com'}</div>
         </div>
         <div style="display:flex;gap:8px;flex-shrink:0">
@@ -467,7 +478,8 @@ function buildProd() {
     sourceUrl: IMP.url || '',
     source: 'amazon',
     asin: IMP.asin || '',
-    title: IMP.title || '',
+    title: IMP.title || '',        // raw Amazon title (kept for reference)
+    ebayTitle: IMP.ebayTitle || '', // user-set or AI-optimized title for eBay
     price: IMP.price || 0,
     myPrice: IMP.myPrice || calcPrice(IMP.price||0, IMP.markup||S.markup),
     markup: IMP.markup || S.markup,
@@ -488,6 +500,28 @@ function buildProd() {
     sizePrices:  IMP.sizePrices  || {},
     comboPrices: IMP.comboPrices || {},
   };
+}
+
+async function aiOptimizeTitle() {
+  if (!IMP) return;
+  const btn = $('ai-title-btn');
+  const inp = $('imp-title-input');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Optimizing…'; }
+  try {
+    const r = await fetch(`${S.backendUrl}/api/ebay?action=optimizeTitle`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: IMP.title, breadcrumbs: IMP.breadcrumbs || [], aspects: IMP.aspects || {} }),
+    });
+    const d = await r.json();
+    if (!d.success) throw new Error(d.error || 'AI title failed');
+    IMP.ebayTitle = d.optimizedTitle;
+    if (inp) inp.value = d.optimizedTitle;
+    toast(`✨ Title optimized: "${d.optimizedTitle.slice(0,50)}"`, 'success');
+  } catch (e) {
+    toast('AI title failed: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '✨ AI Title'; }
+  }
 }
 
 async function doPush() {
