@@ -731,7 +731,11 @@ module.exports = async (req, res) => {
       const ai = await aiEnrich(product.title, product.breadcrumbs || [], product.aspects || {}, suggestions);
       const categoryId = ai?.categoryId || suggestions[0]?.id || '11450';
       const listingTitle = (ai?.title || product.title || 'Product').slice(0, 80);
-      const aspects = { ...(product.aspects || {}), ...(ai?.aspects || {}) };
+      // Strip Color/Size from base aspects — variants will set their own single values
+      const rawAspects = { ...(product.aspects || {}), ...(ai?.aspects || {}) };
+      delete rawAspects['Color']; delete rawAspects['color'];
+      delete rawAspects['Size'];  delete rawAspects['size'];
+      const aspects = rawAspects;
       console.log(`[push] cat=${categoryId} "${listingTitle.slice(0,50)}"`);
 
       // Merchant location
