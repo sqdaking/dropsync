@@ -598,8 +598,8 @@ module.exports = async (req, res) => {
 
         console.log(`[var] fetching ${Object.keys(sizeToFetchAsin).length} size prices via "${fullColor}"`);
 
-        // 5. Fetch one page per size to get the real prices (6 fetches max)
-        const sizePrices = {};  // sizeName → price
+        // 5a. Fetch per-size prices via fullColor's ASINs (fast, 6 fetches)
+        const sizePrices = {};  // sizeName → price (fallback)
         await Promise.all(
           Object.entries(sizeToFetchAsin).map(async ([size, asin]) => {
             if (!asin) return;
@@ -610,6 +610,31 @@ module.exports = async (req, res) => {
             else     console.log(`[price] "${size}" FAILED (${asin})`);
           })
         );
+
+        // 5b. Build comboPrices: unique ASINs → price (per-combo accuracy)
+        //     Batch fetch only ASINs not already covered by sizePrices
+        const asinToPrice = {}; // ASIN → price (from size fetches above)
+        for (const [size, asin] of Object.entries(sizeToFetchAsin)) {
+          if (sizePrices[size] && asin) asinToPrice[asin] = sizePrices[size];
+        }
+        // Find unique ASINs that have a different price than their size bucket
+        const uniqueAsins = [...new Set(Object.values(comboAsin))].filter(a => !asinToPrice[a]);
+        const BATCH = 5;
+        for (let i = 0; i < uniqueAsins.length; i += BATCH) {
+          await Promise.all(uniqueAsins.slice(i, i+BATCH).map(async asin => {
+            const h = await fetchPage(`https://www.amazon.com/dp/${asin}`, ua);
+            if (!h) return;
+            const p = extractPrice(h);
+            if (p) asinToPrice[asin] = p;
+          }));
+          if (i + BATCH < uniqueAsins.length) await sleep(300);
+        }
+        // comboPrices: "Color|Size" → price
+        const comboPrices = {};
+        for (const [key, asin] of Object.entries(comboAsin)) {
+          comboPrices[key] = asinToPrice[asin] || sizePrices[key.split('|')[1]] || 0;
+        }
+        console.log(`[var] comboPrices: ${Object.keys(comboPrices).length} combos, asinToPrice: ${Object.keys(asinToPrice).length} asins`);
 
         // Fallback: if all fetches failed, use main page price for all sizes
         const mainPrice = product.price || 0;
@@ -698,6 +723,7 @@ module.exports = async (req, res) => {
         // Store on product for push step
         product.comboAsin  = comboAsin;
         product.sizePrices = sizePrices;
+        product.comboPrices = comboPrices || {};
 
         // Product base price = cheapest available size
         const allP = Object.values(sizePrices).filter(p => p > 0);
@@ -799,41 +825,60 @@ module.exports = async (req, res) => {
       const defaultQty = parseInt(product.quantity) || 10;
       // comboAsin:  "Color|Size" → ASIN  (only combos that exist on Amazon)
       // sizePrices: sizeName → price (fetched from best-coverage color, applies to all colors at that size)
-      const comboAsin  = product.comboAsin  || {};
-      const sizePrices = product.sizePrices || {};
-      console.log(`[push] comboAsin entries=${Object.keys(comboAsin).length} sizePrices entries=${Object.keys(sizePrices).length}`);
+      const comboAsin   = product.comboAsin   || {};
+      const sizePrices  = product.sizePrices  || {};
+      const comboPrices = product.comboPrices || {}; // "Color|Size" → amazon price
+      const markupPct   = parseFloat(product.markup || 35);
+      const handling    = 2; // $2 handling cost
+      const ebayFee     = 0.1335;
+      const applyMarkup = (cost) => {
+        const c = parseFloat(cost) || 0;
+        if (c <= 0) return c;
+        return Math.ceil(((c + handling) * (1 + markupPct / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
+      };
+      console.log(`[push] comboAsin entries=${Object.keys(comboAsin).length} comboPrices entries=${Object.keys(comboPrices).length} markup=${markupPct}%`);
 
       if (colorGroup && sizeGroup) {
         for (const cv of colorGroup.values.filter(v => v.enabled !== false)) {
           for (const sv of sizeGroup.values.filter(v => v.enabled !== false)) {
-            // Only push combos that actually exist on Amazon
             const key = `${cv.value}|${sv.value}`;
-            if (Object.keys(comboAsin).length > 0 && !comboAsin[key]) continue;
-            // Price comes from sizePrices (size determines price on this product type)
-            const price = parseFloat(sizePrices[sv.value] || sv.price || basePrice).toFixed(2);
+            const hasCombo = Object.keys(comboAsin).length === 0 || !!comboAsin[key];
+            // Use comboPrices (per-combo) → sizePrices (per-size) → basePrice fallback
+            const amazonPrice = comboPrices[key]
+                             || sizePrices[sv.value]
+                             || parseFloat(sv.price || basePrice);
+            const price = applyMarkup(amazonPrice).toFixed(2);
+            // qty=0 means out-of-stock on eBay (combo doesn't exist on Amazon)
+            const qty = hasCombo ? defaultQty : 0;
             variants.push({
               sku:   mkSku([cv.value, sv.value]),
               color: cv.value, size: sv.value,
-              price,
+              price, qty,
               image: colorImgs[cv.value] || product.images[0] || '',
-              qty:   defaultQty,
+              inStock: hasCombo,
             });
           }
         }
       } else if (colorGroup) {
         for (const cv of colorGroup.values.filter(v => v.enabled !== false)) {
+          const key = `${cv.value}|`;
+          const hasCombo = Object.keys(comboAsin).length === 0 || !!comboAsin[key];
+          const amazonPrice = comboPrices[key] || parseFloat(cv.price || basePrice);
           variants.push({
             sku:   mkSku([cv.value]), color: cv.value, size: null,
-            price: parseFloat(sizePrices[''] || cv.price || basePrice).toFixed(2),
+            price: applyMarkup(amazonPrice).toFixed(2),
             image: colorImgs[cv.value] || product.images[0] || '',
-            qty:   defaultQty,
+            qty:   hasCombo ? defaultQty : 0,
+            inStock: hasCombo,
           });
         }
       } else if (sizeGroup) {
         for (const sv of sizeGroup.values.filter(v => v.enabled !== false)) {
+          const key = `|${sv.value}`;
+          const amazonPrice = comboPrices[key] || sizePrices[sv.value] || parseFloat(sv.price || basePrice);
           variants.push({
             sku:   mkSku([sv.value]), color: null, size: sv.value,
-            price: parseFloat(sizePrices[sv.value] || sv.price || basePrice).toFixed(2),
+            price: applyMarkup(amazonPrice).toFixed(2),
             image: product.images[0] || '',
             qty:   defaultQty,
           });
