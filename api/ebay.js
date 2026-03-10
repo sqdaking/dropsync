@@ -1395,6 +1395,48 @@ module.exports = async (req, res) => {
     }
 
     // ── END LISTING ───────────────────────────────────────────────────────────
+    // ── BULK SCRAPE: extract related ASINs from a product page ─────────────────
+    if (action === 'bulkScrapeAsins') {
+      const { url, limit = 15 } = body;
+      if (!url) return res.status(400).json({ error: 'url required' });
+      const asinM = url.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/);
+      const seedAsin = asinM?.[1];
+      if (seedAsin) {
+        const seedUrl = `https://www.amazon.com/dp/${seedAsin}?th=1`;
+        const html = await fetchPage(seedUrl, randUA());
+        if (!html) return res.json({ success: false, error: 'Could not load page — Amazon may be blocking. Try again.' });
+
+        const foundAsins = new Set();
+        // Always include seed ASIN itself
+        foundAsins.add(seedAsin);
+
+        // Extract ASINs from all JS data on the page (carousels, related, sponsored)
+        const asinPatterns = [
+          // Standard ASIN references in JSON data
+          /"asin"\s*:\s*"([B][0-9A-Z]{9})"/g,
+          // dp URLs
+          /\/dp\/([B][0-9A-Z]{9})/g,
+          // data-asin attributes
+          /data-asin="([B][0-9A-Z]{9})"/g,
+          // ASIN in JSON strings
+          /"([B][0-9A-Z]{9})"/g,
+        ];
+
+        for (const pat of asinPatterns) {
+          for (const m of html.matchAll(pat)) {
+            if (m[1] && m[1] !== seedAsin) foundAsins.add(m[1]);
+            if (foundAsins.size >= limit + 5) break;
+          }
+          if (foundAsins.size >= limit + 5) break;
+        }
+
+        const asins = [...foundAsins].slice(0, limit);
+        console.log(`[bulkScrape] seed=${seedAsin} found ${asins.length} ASINs`);
+        return res.json({ success: true, seedAsin, asins });
+      }
+      return res.json({ success: false, error: 'Could not extract ASIN from URL' });
+    }
+
     if (action === 'optimizeTitle') {
       const { title, breadcrumbs = [], aspects = {} } = body;
       if (!title) return res.status(400).json({ error: 'title required' });
