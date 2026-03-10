@@ -563,72 +563,61 @@ function renderProducts() {
     <div class="card">
       <div class="card-header">
         <span class="card-title">Products (${prods.length})</span>
-        <div style="display:flex;gap:6px">
-          <input class="input" id="prod-search" placeholder="Search…" style="width:180px;font-size:12px" oninput="filterProducts()">
-        </div>
+        <input class="input" id="prod-search" placeholder="Search…" style="width:180px;font-size:12px" oninput="filterProducts()">
       </div>
-      <div style="overflow-x:auto">
-        <table class="products-table" id="prod-table">
-          <thead><tr>
-            <th>Product</th><th>Source Price</th><th>Sell Price</th>
-            <th>Variants</th><th>Status</th><th style="min-width:180px;text-align:right">Actions</th>
-          </tr></thead>
-          <tbody id="prod-tbody"></tbody>
-        </table>
-      </div>
+      <div id="prod-list"></div>
     </div>`;
   renderProdRows(prods);
 }
 
 function filterProducts() {
   const q = ($('prod-search')?.value || '').toLowerCase();
-  const prods = (S.products||[]).filter(p => !q || p.title.toLowerCase().includes(q) || p.sourceUrl.includes(q));
+  const prods = (S.products||[]).filter(p => !q || p.title.toLowerCase().includes(q) || (p.sourceUrl||'').includes(q));
   renderProdRows(prods);
 }
 
 function renderProdRows(prods) {
-  const tbody = $('prod-tbody');
-  if (!tbody) return;
-  tbody.innerHTML = prods.map(p => {
+  const list = $('prod-list');
+  if (!list) return;
+  list.innerHTML = prods.map(p => {
     const img = p.images?.[0] || '';
-    const variants = p.hasVariations ? p.variations.reduce((sum, g) => Math.max(sum, g.values.filter(v=>v.enabled!==false).length), 0) : 1;
+    const variants = p.hasVariations ? p.variations?.reduce((sum, g) => sum + g.values.filter(v=>v.enabled!==false).length, 0) : 1;
     const statusBadge = {
       draft: '<span class="badge badge-amber">Draft</span>',
       listed: '<span class="badge badge-green">Live</span>',
       ended: '<span class="badge badge-red">Ended</span>',
     }[p.status] || '';
-    const syncAge = p.lastSynced ? `<div style="font-size:10px;color:var(--text3);margin-top:2px">Synced ${timeAgo(p.lastSynced)}</div>` : '';
+    const syncAge = p.lastSynced ? `<span style="font-size:10px;color:var(--text3)">· synced ${timeAgo(p.lastSynced)}</span>` : '';
 
-    return `<tr>
-      <td style="display:flex;align-items:center;gap:10px;min-width:0">
-        ${img ? `<img src="${img}" class="prod-thumb">` : `<div class="prod-thumb" style="display:flex;align-items:center;justify-content:center;font-size:20px">📦</div>`}
-        <div style="min-width:0">
-          <div class="prod-title" title="${p.title}">${p.title}</div>
-          <div class="prod-meta">
-            ${p.sourceUrl ? `<a href="${p.sourceUrl}" target="_blank" style="color:var(--accent);text-decoration:none" title="View on Amazon">↗ Amazon</a> · ` : ''}${p.source} · ${p.asin || ''}
-          </div>
+    const actionBtns = p.status==='listed' ? `
+      <button class="btn btn-outline btn-sm" onclick="syncOne('${p.id}')">🔄 Sync</button>
+      <a href="https://www.ebay.com/itm/${p.ebayListingId}" target="_blank" class="btn btn-outline btn-sm">eBay ↗</a>
+      <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="confirmEnd('${p.id}')">End</button>
+    ` : p.status==='draft' ? `
+      <button class="btn btn-outline btn-sm" onclick="reImport('${p.id}')">↩ Edit</button>
+      ${S.token ? `<button class="btn btn-success btn-sm" onclick="pushExisting('${p.id}')">🚀 Push</button>` : ''}
+    ` : `
+      <button class="btn btn-outline btn-sm" onclick="reImport('${p.id}')">↩ Edit</button>
+    `;
+
+    return `<div style="display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--border)">
+      ${img ? `<img src="${img}" style="width:52px;height:52px;border-radius:8px;object-fit:cover;flex-shrink:0">` : `<div style="width:52px;height:52px;border-radius:8px;background:var(--bg);display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0">📦</div>`}
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${p.title}">${p.title}</div>
+        <div style="font-size:11px;color:var(--text3);margin-top:2px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          ${p.sourceUrl ? `<a href="${p.sourceUrl}" target="_blank" style="color:var(--accent);text-decoration:none">↗ Amazon</a>` : ''}
+          <span>${p.asin||''}</span>
+          <span style="color:var(--green);font-family:var(--font-mono)">$${(p.myPrice||0).toFixed(2)}</span>
+          <span style="color:var(--text3);font-family:var(--font-mono)">(cost $${(p.price||0).toFixed(2)})</span>
+          <span>${variants} variants</span>
+          ${statusBadge} ${syncAge}
         </div>
-      </td>
-      <td class="pmono">$${(p.price||0).toFixed(2)}</td>
-      <td class="pmono" style="color:var(--green)">$${(p.myPrice||0).toFixed(2)}</td>
-      <td class="pmono">${variants}</td>
-      <td>${statusBadge}${syncAge}</td>
-      <td style="text-align:right">
-        <div style="display:flex;gap:5px;justify-content:flex-end;align-items:center;flex-wrap:nowrap">
-          ${p.status==='listed' ? `
-            <button class="btn btn-outline btn-sm" style="font-size:11px" onclick="syncOne('${p.id}')">🔄 Sync</button>
-            <a href="https://www.ebay.com/itm/${p.ebayListingId}" target="_blank" class="btn btn-outline btn-sm" style="font-size:11px">eBay ↗</a>
-            <button class="btn btn-ghost btn-sm" style="color:var(--red);font-size:11px" onclick="confirmEnd('${p.id}')">End</button>
-          ` : p.status==='draft' ? `
-            <button class="btn btn-outline btn-sm" style="font-size:11px" onclick="reImport('${p.id}')">↩ Edit</button>
-            ${S.token ? `<button class="btn btn-success btn-sm" style="font-size:11px" onclick="pushExisting('${p.id}')">🚀 Push</button>` : ''}
-          ` : `
-            <button class="btn btn-outline btn-sm" style="font-size:11px" onclick="reImport('${p.id}')">↩ Edit</button>
-          `}
-          <button class="btn btn-ghost btn-sm" style="color:var(--red);font-size:16px;padding:2px 6px;line-height:1" onclick="deleteProduct('${p.id}')">🗑</button>
-        </div>
-      </td>
-    </tr>`;
+      </div>
+      <div style="display:flex;gap:6px;align-items:center;flex-shrink:0">
+        ${actionBtns}
+        <button style="background:none;border:none;cursor:pointer;font-size:18px;padding:4px;color:var(--text3);line-height:1" onclick="deleteProduct('${p.id}')" title="Delete">🗑</button>
+      </div>
+    </div>`;
   }).join('');
 }
 
@@ -759,7 +748,7 @@ async function endListing(pid, deleteAfter = false) {
     const sandbox = S.sandboxMode || false;
     const r = await fetch(`${S.backendUrl}/api/ebay?action=endListing`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, sandbox }),
+      body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId, sandbox }),
     });
     const d = await r.json();
     if (!d.success) throw new Error(d.error || 'End listing failed');
