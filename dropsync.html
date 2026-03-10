@@ -112,6 +112,9 @@ label{display:block;font-size:11px;font-weight:700;color:var(--text3);margin-bot
   <div class="nav-item" onclick="nav('products')" id="nav-products">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>My Products
   </div>
+  <div class="nav-item" onclick="nav('ebayimport')" id="nav-ebayimport">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>eBay Import
+  </div>
   <div class="nav-item" onclick="nav('logs')" id="nav-logs">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>Activity Log
   </div>
@@ -247,7 +250,7 @@ function nav(view) {
   const titles = { import: 'Import Product', products: 'My Products', logs: 'Activity Log', settings: 'Settings' };
   document.getElementById('topbar-title').textContent = titles[view] || view;
   document.getElementById('topbar-actions').innerHTML = '';
-  const renders = { import: renderImport, bulk: renderBulk, products: renderProducts, logs: renderLogs, settings: renderSettings };
+  const renders = { import: renderImport, bulk: renderBulk, ebayimport: renderEbayImport, products: renderProducts, logs: renderLogs, settings: renderSettings };
   renders[view]?.();
 }
 const $ = id => document.getElementById(id);
@@ -678,7 +681,7 @@ function renderBulk() {
                 <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${p.ebayTitle||p.title||p.asin}</div>
                 <div style="font-size:11px;color:var(--text3)">${p.asin} · ${vc} variants · <span style="color:var(--green)">$${(p.myPrice||0).toFixed(2)}</span></div>
               </div>
-              <span class="badge badge-amber">Draft</span>
+              <button onclick="bulkRemove('${p.id}')" title="Remove from queue" style="background:none;border:none;cursor:pointer;color:var(--text3);font-size:18px;line-height:1;padding:4px 6px;border-radius:4px;flex-shrink:0" onmouseover="this.style.color='var(--red)';this.style.background='rgba(239,68,68,0.1)'" onmouseout="this.style.color='var(--text3)';this.style.background='none'">✕</button>
             </div>`;
           }).join('')}
         </div>
@@ -695,6 +698,14 @@ function bulkLog(msg, type='info') {
   const colors = { info:'var(--text2)', success:'var(--green)', error:'var(--red)', warn:'#f59e0b' };
   const icons  = { info:'ℹ️', success:'✅', error:'❌', warn:'⚠️' };
   el.innerHTML = `<div style="color:${colors[type]};padding:2px 0">${icons[type]} ${msg}</div>` + el.innerHTML;
+}
+
+function bulkRemove(id) {
+  // Remove from queue and from S.products (draft only)
+  BULK.queue = BULK.queue.filter(p => p.id !== id);
+  S.products = (S.products||[]).filter(p => !(p.id === id && p.status === 'draft'));
+  save();
+  renderBulk();
 }
 
 function bulkReset() {
@@ -917,6 +928,247 @@ async function bulkPushAll() {
   }
   renderBulk();
 }
+
+// ── EBAY LISTING IMPORT ────────────────────────────────────────────────────────
+let EI = {
+  listings: [],       // raw fetched from eBay
+  filtered: [],       // after search filter
+  loading: false,
+  searchQ: '',
+  pendingUrls: {},    // listingId → sourceUrl (before save)
+  selected: new Set(), // listingIds checked for import
+};
+
+function renderEbayImport() {
+  $('topbar-actions').innerHTML = '';
+  const alreadyImported = new Set((S.products||[]).map(p=>p.ebayListingId).filter(Boolean));
+  const fresh = EI.listings.filter(l => !alreadyImported.has(l.ebayListingId));
+  const imported = EI.listings.filter(l => alreadyImported.has(l.ebayListingId));
+
+  $('content').innerHTML = `
+    <div style="max-width:800px;margin:0 auto;display:flex;flex-direction:column;gap:16px;padding-bottom:32px">
+
+      <!-- Header -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">📥 Import Existing eBay Listings</span>
+          <button class="btn btn-primary" onclick="eiFetch()" ${EI.loading||!S.token?'disabled':''} style="min-width:160px">
+            ${EI.loading
+              ? '<span style="display:inline-flex;align-items:center;gap:6px"><div class="spinner" style="width:12px;height:12px"></div> Loading…</span>'
+              : EI.listings.length ? '🔄 Refresh' : '📥 Load My Listings'}
+          </button>
+        </div>
+        <div class="card-body" style="padding-top:0">
+          <p style="font-size:13px;color:var(--text2);margin:0 0 10px">
+            Pull all your active eBay listings into DropSync so they can be tracked, synced, and monitored.
+            Optionally add an Amazon source URL to enable price monitoring &amp; auto-sync.
+          </p>
+          ${!S.token ? `<div style="padding:10px;background:rgba(245,158,11,.1);border-radius:8px;font-size:12px;color:#f59e0b">⚠️ Connect eBay in Settings first</div>` : ''}
+          ${EI.listings.length ? `
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <input class="input" placeholder="Search listings…" style="flex:1;min-width:160px;font-size:12px"
+              value="${EI.searchQ}" oninput="EI.searchQ=this.value;eiFilter();renderEbayImportList()">
+            <span style="font-size:12px;color:var(--text3)">${fresh.length} new · ${imported.length} already in DropSync</span>
+          </div>` : ''}
+        </div>
+      </div>
+
+      <!-- List -->
+      <div id="ei-list"></div>
+      <div id="ei-import-bar" style="display:none;position:sticky;bottom:16px;z-index:10"></div>
+    </div>`;
+
+  eiFilter();
+  renderEbayImportList();
+}
+
+function eiFilter() {
+  const q = EI.searchQ.toLowerCase();
+  EI.filtered = q
+    ? EI.listings.filter(l => l.title.toLowerCase().includes(q) || l.ebaySku.toLowerCase().includes(q) || l.ebayListingId.includes(q))
+    : [...EI.listings];
+}
+
+function renderEbayImportList() {
+  const el = $('ei-list');
+  if (!el) return;
+  const alreadyImported = new Set((S.products||[]).map(p=>p.ebayListingId).filter(Boolean));
+
+  if (!EI.listings.length && !EI.loading) {
+    el.innerHTML = '';
+    return;
+  }
+
+  if (!EI.filtered.length) {
+    el.innerHTML = `<div style="text-align:center;padding:32px;color:var(--text3);font-size:13px">No listings match your search</div>`;
+    return;
+  }
+
+  el.innerHTML = `<div class="card">
+    <div class="card-header" style="padding:10px 14px">
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer">
+        <input type="checkbox" id="ei-select-all" onchange="eiToggleAll(this.checked)"
+          ${EI.selected.size === EI.filtered.filter(l=>!alreadyImported.has(l.ebayListingId)).length && EI.filtered.filter(l=>!alreadyImported.has(l.ebayListingId)).length > 0 ? 'checked' : ''}>
+        Select all new (${EI.filtered.filter(l=>!alreadyImported.has(l.ebayListingId)).length})
+      </label>
+      <span style="font-size:11px;color:var(--text3)">${EI.filtered.length} listings shown</span>
+    </div>
+    <div style="max-height:560px;overflow-y:auto">
+      ${EI.filtered.map(l => {
+        const isImported = alreadyImported.has(l.ebayListingId);
+        const checked = EI.selected.has(l.ebayListingId);
+        const urlVal = EI.pendingUrls[l.ebayListingId] !== undefined
+          ? EI.pendingUrls[l.ebayListingId]
+          : ((S.products||[]).find(p=>p.ebayListingId===l.ebayListingId)?.sourceUrl || '');
+        return `<div style="display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border-bottom:1px solid var(--border);${isImported?'opacity:.55':''}">
+          <input type="checkbox" style="margin-top:3px;flex-shrink:0" ${checked?'checked':''} ${isImported?'disabled':''}
+            onchange="eiToggle('${l.ebayListingId}', this.checked)">
+          ${l.image ? `<img src="${l.image}" style="width:48px;height:48px;border-radius:6px;object-fit:cover;flex-shrink:0">` 
+                    : `<div style="width:48px;height:48px;border-radius:6px;background:var(--bg);display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0">🛒</div>`}
+          <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:6px">
+            <div style="font-size:12px;font-weight:600;line-height:1.4">${l.title || l.ebaySku || l.ebayListingId}</div>
+            <div style="display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--text3)">
+              <span>ID: <a href="${l.ebayUrl}" target="_blank" style="color:var(--accent)">${l.ebayListingId}</a></span>
+              <span>SKU: ${l.ebaySku || '—'}</span>
+              <span style="color:var(--green)">$${l.price.toFixed(2)}</span>
+              <span>Qty: ${l.quantity}</span>
+              ${isImported ? `<span style="color:var(--green);font-weight:600">✓ In DropSync</span>` : ''}
+            </div>
+            <!-- Source URL input -->
+            <div style="display:flex;gap:6px;align-items:center">
+              <input class="input" placeholder="Amazon source URL (optional — enables sync &amp; monitoring)"
+                style="font-size:11px;padding:5px 8px;flex:1;${urlVal?'border-color:var(--accent)':''}"
+                value="${urlVal}"
+                oninput="EI.pendingUrls['${l.ebayListingId}']=this.value;this.style.borderColor=this.value?'var(--accent)':''"
+                ${isImported?'':''}
+              >
+              ${urlVal ? `<button onclick="eiSaveUrl('${l.ebayListingId}')" class="btn btn-outline btn-sm" style="font-size:11px;padding:4px 8px;white-space:nowrap">💾 Save</button>` : ''}
+            </div>
+          </div>
+        </div>`;
+      }).join('')}
+    </div>
+  </div>`;
+
+  eiUpdateImportBar();
+}
+
+function eiToggle(id, checked) {
+  if (checked) EI.selected.add(id);
+  else EI.selected.delete(id);
+  eiUpdateImportBar();
+  // Update select-all checkbox
+  const alreadyImported = new Set((S.products||[]).map(p=>p.ebayListingId).filter(Boolean));
+  const newCount = EI.filtered.filter(l=>!alreadyImported.has(l.ebayListingId)).length;
+  const sa = $('ei-select-all');
+  if (sa) sa.checked = EI.selected.size === newCount && newCount > 0;
+}
+
+function eiToggleAll(checked) {
+  const alreadyImported = new Set((S.products||[]).map(p=>p.ebayListingId).filter(Boolean));
+  EI.filtered.filter(l => !alreadyImported.has(l.ebayListingId)).forEach(l => {
+    if (checked) EI.selected.add(l.ebayListingId);
+    else EI.selected.delete(l.ebayListingId);
+  });
+  eiUpdateImportBar();
+}
+
+function eiUpdateImportBar() {
+  const bar = $('ei-import-bar');
+  if (!bar) return;
+  if (EI.selected.size === 0) { bar.style.display = 'none'; return; }
+  bar.style.display = 'block';
+  bar.innerHTML = `<div style="background:var(--accent);color:#fff;border-radius:12px;padding:12px 20px;display:flex;align-items:center;justify-content:space-between;box-shadow:0 4px 20px rgba(0,0,0,.3)">
+    <span style="font-weight:600;font-size:13px">${EI.selected.size} listing${EI.selected.size>1?'s':''} selected</span>
+    <button onclick="eiImportSelected()" class="btn" style="background:#fff;color:var(--accent);font-weight:700;font-size:12px;padding:6px 16px">
+      📥 Import to DropSync
+    </button>
+  </div>`;
+}
+
+function eiSaveUrl(listingId) {
+  const url = EI.pendingUrls[listingId] || '';
+  const prod = (S.products||[]).find(p => p.ebayListingId === listingId);
+  if (prod) {
+    prod.sourceUrl = url;
+    save();
+    toast('Source URL saved', 'success');
+    renderEbayImportList();
+  }
+}
+
+async function eiFetch() {
+  if (!S.token || EI.loading) return;
+  EI.loading = true;
+  EI.selected = new Set();
+  renderEbayImport();
+
+  try {
+    const token = await ensureToken();
+    const r = await fetch(`${S.backendUrl}/api/ebay?action=fetchMyListings`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ access_token: token })
+    });
+    const d = await r.json();
+    if (!d.success) throw new Error(d.error || 'Failed to fetch listings');
+    EI.listings = d.listings || [];
+    eiFilter();
+    toast(`Loaded ${EI.listings.length} listings from eBay`, 'success');
+  } catch(e) {
+    toast('Error: ' + e.message, 'error', 6000);
+  }
+
+  EI.loading = false;
+  renderEbayImport();
+}
+
+async function eiImportSelected() {
+  if (!EI.selected.size) return;
+  const alreadyImported = new Set((S.products||[]).map(p=>p.ebayListingId).filter(Boolean));
+  const toImport = EI.listings.filter(l => EI.selected.has(l.ebayListingId) && !alreadyImported.has(l.ebayListingId));
+  if (!toImport.length) { toast('All selected already imported', 'warn'); return; }
+
+  let count = 0;
+  for (const l of toImport) {
+    const sourceUrl = EI.pendingUrls[l.ebayListingId] || '';
+    const prod = {
+      id: uid(),
+      sourceUrl,
+      source: sourceUrl.includes('amazon') ? 'amazon' : 'ebay',
+      asin: sourceUrl.match(/\/dp\/([A-Z0-9]{10})/)?.[1] || '',
+      title: l.title || '',
+      ebayTitle: l.title || '',
+      price: 0,
+      myPrice: l.price || 0,
+      markup: S.markup || 35,
+      images: l.image ? [l.image] : [],
+      description: '',
+      bullets: [], descriptionPara: '',
+      aspects: l.aspects || {},
+      breadcrumbs: [],
+      variations: [], variationImages: {},
+      hasVariations: false,
+      quantity: l.quantity || 10,
+      inStock: true,
+      status: 'listed',
+      ebaySku: l.ebaySku || '',
+      ebayListingId: l.ebayListingId,
+      createdAt: new Date().toISOString(),
+      lastSynced: null,
+      comboAsin: {}, sizePrices: {}, comboPrices: {},
+      _imported: true,
+    };
+    if (!S.products) S.products = [];
+    S.products.push(prod);
+    count++;
+  }
+  save();
+  EI.selected = new Set();
+  toast(`✅ Imported ${count} listing${count>1?'s':''} into DropSync`, 'success', 5000);
+  addLog('import', `Imported ${count} existing eBay listing${count>1?'s':''}`, '', {});
+  renderEbayImport();
+}
+
 
 function renderProducts() {
   const prods = S.products || [];
