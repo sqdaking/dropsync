@@ -150,7 +150,8 @@ function extractColorAsinMaps(html) {
 }
 
 // ── eBay Taxonomy API: get leaf category suggestions ─────────────────────────
-async function getCategories(title, token) {
+async function getCategories(title, token, sandbox=false) {
+  const EBAY_API = getEbayUrls(sandbox).EBAY_API;
   try {
     const r = await fetch(
       `${EBAY_API}/commerce/taxonomy/v1/category_tree/0/get_category_suggestions?q=${encodeURIComponent(title.slice(0,80))}`,
@@ -213,7 +214,8 @@ CRITICAL: categoryId MUST be a LEAF category from the suggestions list. Never pi
 }
 
 // ── Resolve all 3 eBay policies, auto-create if missing ───────────────────────
-async function resolvePolicies(token, supplied) {
+async function resolvePolicies(token, supplied, sandbox=false) {
+  const EBAY_API = getEbayUrls(sandbox).EBAY_API;
   const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
   const p = {
     fulfillmentPolicyId: (supplied.fulfillmentPolicyId || '').trim(),
@@ -293,7 +295,8 @@ async function resolvePolicies(token, supplied) {
 }
 
 // ── Ensure merchant location exists ──────────────────────────────────────────
-async function ensureLocation(auth) {
+async function ensureLocation(auth, sandbox=false) {
+  const EBAY_API = getEbayUrls(sandbox).EBAY_API;
   const r = await fetch(`${EBAY_API}/sell/inventory/v1/location`, { headers: auth }).then(r => r.json()).catch(() => ({}));
   if ((r.locations || []).length) return r.locations[0].merchantLocationKey;
   const key = 'MainWarehouse';
@@ -421,6 +424,8 @@ module.exports = async (req, res) => {
     if (action === 'policies') {
       const token = body.access_token || req.query.access_token;
       if (!token) return res.status(400).json({ error: 'No token' });
+      const sandbox = body.sandbox === true || body.sandbox === 'true' || req.query.sandbox === 'true';
+      const EBAY_API = getEbayUrls(sandbox).EBAY_API;
       const auth = { Authorization: `Bearer ${token}`, 'Accept-Language': 'en-US' };
       const [fp, pp, rp] = await Promise.all([
         fetch(`${EBAY_API}/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US`, { headers: auth }).then(r => r.json()),
@@ -684,12 +689,14 @@ module.exports = async (req, res) => {
       const { access_token, product, fulfillmentPolicyId, paymentPolicyId, returnPolicyId } = body;
       if (!access_token || !product) return res.status(400).json({ error: 'Missing access_token or product' });
 
+      const sandbox = body.sandbox === true || body.sandbox === 'true';
+      const EBAY_API = getEbayUrls(sandbox).EBAY_API;
       const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
       console.log(`[push] "${product.title?.slice(0,60)}" hasVariations=${product.hasVariations}`);
 
       // Resolve policies
       let policies;
-      try { policies = await resolvePolicies(access_token, { fulfillmentPolicyId, paymentPolicyId, returnPolicyId }); }
+      try { policies = await resolvePolicies(access_token, { fulfillmentPolicyId, paymentPolicyId, returnPolicyId }, sandbox); }
       catch (e) { return res.status(400).json({ error: e.message }); }
 
       // AI category + aspects
@@ -701,7 +708,7 @@ module.exports = async (req, res) => {
       console.log(`[push] cat=${categoryId} "${listingTitle.slice(0,50)}"`);
 
       // Merchant location
-      const locationKey = await ensureLocation(auth);
+      const locationKey = await ensureLocation(auth, sandbox);
       const basePrice   = parseFloat(product.price || 0).toFixed(2);
       const groupSku    = `DS-${Date.now()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`;
 
