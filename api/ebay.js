@@ -613,17 +613,38 @@ module.exports = async (req, res) => {
         let dtaMap = {};
         try { dtaMap = JSON.parse(dtaBlock); } catch {}
 
+        // Read "dimensions" array to know correct index order (e.g. ["size_name","color_name"] or ["color_name","size_name"])
+        let dimOrder = null;
+        // Try multiline-safe regex
+        const dimM = html.match(/"dimensions"\s*:\s*(\[[^\]]{0,200}\])/s);
+        if (dimM) try { dimOrder = JSON.parse(dimM[1]); } catch {}
+        // Fallback: infer from variationValues key order (colors first is most common)
+        if (!dimOrder) {
+          const vvKeys = Object.keys(varVals || {});
+          dimOrder = vvKeys.length ? vvKeys : ['color_name', 'size_name'];
+        }
+        // Find which dimension index corresponds to color vs size
+        const colorDimIdx = dimOrder.indexOf('color_name');
+        const sizeDimIdx  = dimOrder.indexOf('size_name');
+        // If neither found, default: 0=color, 1=size
+        const effectiveColorIdx = colorDimIdx >= 0 ? colorDimIdx : 0;
+        const effectiveSizeIdx  = sizeDimIdx  >= 0 ? sizeDimIdx  : 1;
+        console.log(`[var] dimensions: ${JSON.stringify(dimOrder)} colorAt=${effectiveColorIdx} sizeAt=${effectiveSizeIdx}`);
+
         // Build lookup tables
         const comboAsin    = {};  // "Color|Size" → ASIN
         const colorSizeMap = {};  // colorName → { sizeName → ASIN }
 
         for (const [code, asin] of Object.entries(dtaMap)) {
-          const parts = code.split('_');
-          if (parts.length !== 2) continue;
-          const ci = parseInt(parts[0]), si = parseInt(parts[1]);
-          const color = colors[ci], size = sizes[si];
+          const parts = code.split('_').map(Number);
+          if (parts.length < 1) continue;
+          // Extract color/size indices based on dimension order
+          const ci = parts[effectiveColorIdx];
+          const si = parts[effectiveSizeIdx];
+          const color = colors[ci];
+          const size  = (si !== undefined && sizes[si]) ? sizes[si] : (sizes[0] || '');
           if (!color) continue;
-          comboAsin[`${color}|${size || ''}`] = asin;
+          comboAsin[`${color}|${size}`] = asin;
           if (!colorSizeMap[color]) colorSizeMap[color] = {};
           colorSizeMap[color][size] = asin;
         }
