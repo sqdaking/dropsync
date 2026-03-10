@@ -436,18 +436,17 @@ module.exports = async (req, res) => {
       }
 
       // ── Variation data ────────────────────────────────────────────────────
-      // KEY INSIGHT (confirmed from live page):
-      //  - COLOR is primary: defines image, price, stock.
-      //  - SIZE is secondary: toggle-only selector, no independent price/stock.
-      //  - dimensionToAsinMap["ci_si"] → ASIN: only existing combos are listed.
-      //    If a combo is in this map → it EXISTS and is IN STOCK. Period.
-      //  - Each COLOR's price = fetched from that color's representative ASIN page.
-      //  - No size-level price fetching (sizes don't have independent prices in eBay).
+      // CONFIRMED from live Amazon page analysis:
+      //  - dimensionToAsinMap: "ci_si" → ASIN (only combos that exist & are buyable)
+      //  - Each ASIN is a unique combo — prices vary per size AND per color
+      //  - STRATEGY: find a "full color" (has all sizes), fetch 1 page per size (6 fetches)
+      //    → gives us all 6 size prices. Apply size price to each color+size combo.
+      //  - Stock: if combo key exists in dimensionToAsinMap → IN STOCK. Period.
 
-      // 1. Swatch images from HTML
+      // 1. Swatch images
       const swatchImgMap = extractSwatchImages(html);
 
-      // 2. variationValues → ordered arrays of color & size names
+      // 2. variationValues → ordered color/size name arrays
       let varVals = null;
       const vvM = html.match(/"variationValues"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})/);
       if (vvM) try { varVals = JSON.parse(vvM[1]); } catch {}
@@ -459,16 +458,14 @@ module.exports = async (req, res) => {
         const colors = varVals.color_name || [];
         const sizes  = varVals.size_name  || [];
 
-        // 3. Build comboAsin from dimensionToAsinMap: "ci_si" → ASIN
-        //    colorRepAsin["ColorName"] = one ASIN for that color (at smallest available size)
-        //    Stock = if ANY combo exists for the color → IN STOCK
+        // 3. Parse dimensionToAsinMap
         const dtaBlock = extractBlock(html, '"dimensionToAsinMap"');
         let dtaMap = {};
         try { dtaMap = JSON.parse(dtaBlock); } catch {}
 
-        const comboAsin = {};     // "Color|Size" → ASIN
-        const colorRepAsin = {};  // colorName → one ASIN (smallest size or first available)
-        const colorSizes = {};    // colorName → [sizeNames that exist]
+        // Build lookup tables
+        const comboAsin    = {};  // "Color|Size" → ASIN
+        const colorSizeMap = {};  // colorName → { sizeName → ASIN }
 
         for (const [code, asin] of Object.entries(dtaMap)) {
           const parts = code.split('_');
@@ -476,70 +473,83 @@ module.exports = async (req, res) => {
           const ci = parseInt(parts[0]), si = parseInt(parts[1]);
           const color = colors[ci], size = sizes[si];
           if (!color) continue;
-          const key = `${color}|${size || ''}`;
-          comboAsin[key] = asin;
-          if (!colorSizes[color]) colorSizes[color] = [];
-          colorSizes[color].push(size || '');
-          // Use smallest size index as representative (cheapest = best for price display)
-          if (!colorRepAsin[color] || (size && si < (colorSizes[color]._minSi ?? 999))) {
-            colorRepAsin[color] = asin;
-            if (!colorSizes[color]._minSi || si < colorSizes[color]._minSi) {
-              colorSizes[color]._minSi = si;
-            }
-          }
+          comboAsin[`${color}|${size || ''}`] = asin;
+          if (!colorSizeMap[color]) colorSizeMap[color] = {};
+          colorSizeMap[color][size] = asin;
         }
 
-        // Fallback: if DTA map empty (CAPTCHA block), use colorToAsin
+        // Fallback: if DTA empty (CAPTCHA block), use colorToAsin
         if (!Object.keys(comboAsin).length) {
           const { colorToAsin: ctaMap } = extractColorAsinMaps(html);
-          for (const [color, asin] of Object.entries(ctaMap)) {
-            comboAsin[`${color}|`] = asin;
-            colorRepAsin[color] = asin;
+          for (const [c, asin] of Object.entries(ctaMap)) {
+            comboAsin[`${c}|`] = asin;
+            colorSizeMap[c] = { '': asin };
           }
         }
 
         console.log(`[var] combos=${Object.keys(comboAsin).length} colors=${colors.length} sizes=${sizes.length}`);
 
-        // 4. Per-COLOR prices: fetch each color's representative ASIN page
-        //    Limit to 8 parallel fetches; remaining colors use main page price fallback
-        const colorPrices = {};  // colorName → price
-        const mainPrice = product.price || 0;
+        // 4. Find best "full color" — one that has ALL sizes (most complete data)
+        //    Use this color's ASINs to fetch the price for each size.
+        //    Since prices on Amazon vary by SIZE (not color), this covers all combos.
+        const fullColor = colors.find(c => sizes.every(s => colorSizeMap[c]?.[s]))
+                       || colors.find(c => Object.keys(colorSizeMap[c]||{}).length >= sizes.length - 1)
+                       || colors[0];
 
-        const colorsFetching = colors
-          .filter(c => colorRepAsin[c])
-          .slice(0, 8);  // max 8 fetches to avoid rate limits
+        const sizeToFetchAsin = {};  // size → ASIN to fetch price from
+        for (const size of sizes) {
+          const asin = colorSizeMap[fullColor]?.[size]
+                    || Object.values(colorSizeMap).map(m => m[size]).find(Boolean);
+          if (asin) sizeToFetchAsin[size] = asin;
+        }
+        // For no-size products, fetch the first color's ASIN
+        if (!sizes.length && colors[0]) {
+          sizeToFetchAsin[''] = Object.values(colorSizeMap[colors[0]]||{})[0] || '';
+        }
 
-        if (colorsFetching.length) {
-          await Promise.all(colorsFetching.map(async color => {
-            const asin = colorRepAsin[color];
+        console.log(`[var] fetching ${Object.keys(sizeToFetchAsin).length} size prices via "${fullColor}"`);
+
+        // 5. Fetch one page per size to get the real prices (6 fetches max)
+        const sizePrices = {};  // sizeName → price
+        await Promise.all(
+          Object.entries(sizeToFetchAsin).map(async ([size, asin]) => {
+            if (!asin) return;
             const h = await fetchPage(`https://www.amazon.com/dp/${asin}`, ua);
             if (!h) return;
             const p = extractPrice(h);
-            if (p) { colorPrices[color] = p; }
-          }));
-        }
-        // Any color without a fetched price → use main page price
-        for (const c of colors) {
-          if (!colorPrices[c]) colorPrices[c] = mainPrice;
-        }
-        console.log(`[prices] fetched ${Object.keys(colorPrices).filter(c=>colorPrices[c]!==mainPrice).length} color prices`);
+            if (p) { sizePrices[size] = p; console.log(`[price] "${size}" = $${p} (${asin})`); }
+            else     console.log(`[price] "${size}" FAILED (${asin})`);
+          })
+        );
 
-        // 5. Build colorData: image per color
+        // Fallback: if all fetches failed, use main page price for all sizes
+        const mainPrice = product.price || 0;
+        if (!Object.keys(sizePrices).length && mainPrice) {
+          sizes.forEach(s => { sizePrices[s] = mainPrice; });
+          if (!sizes.length) sizePrices[''] = mainPrice;
+        }
+        // Any size still missing → use main page price
+        sizes.forEach(s => { if (!sizePrices[s]) sizePrices[s] = mainPrice; });
+        if (!sizes.length && !sizePrices['']) sizePrices[''] = mainPrice;
+
+        console.log('[var] sizePrices:', JSON.stringify(sizePrices));
+
+        // 6. Build per-color images
         const colorData = {};
-        for (const c of colors) {
-          colorData[c] = { image: swatchImgMap[c] || '' };
-        }
+        for (const c of colors) colorData[c] = { image: swatchImgMap[c] || '' };
 
-        // 6. Fallback image fetch for any color still missing image
-        const needImg = colors.filter(c => !colorData[c].image && colorRepAsin[c]);
+        // Fallback: fetch image for colors still missing
+        const needImg = colors.filter(c => !colorData[c].image);
         if (needImg.length) {
           await Promise.all(needImg.slice(0, 6).map(async c => {
-            const h = await fetchPage(`https://www.amazon.com/dp/${colorRepAsin[c]}`, ua);
+            const asin = Object.values(colorSizeMap[c] || {})[0];
+            if (!asin) return;
+            const h = await fetchPage(`https://www.amazon.com/dp/${asin}`, ua);
             if (h) { const img = extractMainImage(h); if (img) colorData[c].image = img; }
           }));
         }
 
-        // 7. Collect product-level images (color images deduped)
+        // 7. Collect product images (all color images, deduped)
         for (const c of colors) {
           const img = colorData[c].image;
           if (img && !product.images.includes(img)) product.images.push(img);
@@ -549,27 +559,29 @@ module.exports = async (req, res) => {
           colorData[c].image = product.images[fi++ % Math.max(1, product.images.length)] || '';
         });
 
-        console.log(`[images] ${colors.filter(c=>colorData[c].image).length}/${colors.length} colors have images`);
-
         // 8. Build variation groups
-        //    COLOR: primary — has price, image, stock (from comboAsin)
-        //    SIZE: secondary — toggle only, no price, always enabled
+        //    COLOR: primary — has image and stock flag
+        //    SIZE: secondary — toggle only, shows price for that size
+        //    PRICE comes from sizePrices[size] (per size, same across colors)
         if (colors.length) {
           product.variations.push({
             name: 'Color',
             values: colors.map(c => {
-              // In stock if ANY combo exists for this color
               const inStock = sizes.length
                 ? sizes.some(s => comboAsin[`${c}|${s}`])
                 : !!comboAsin[`${c}|`];
-              // Fallback: if comboAsin is empty (CAPTCHA), assume all in stock
-              const finalInStock = Object.keys(comboAsin).length > 0 ? inStock : true;
+              // Price = cheapest available size for this color
+              const availPrices = sizes
+                .filter(s => comboAsin[`${c}|${s}`] && sizePrices[s])
+                .map(s => sizePrices[s]);
+              const colorPrice = availPrices.length
+                ? Math.min(...availPrices)
+                : (sizePrices[sizes[0]] || mainPrice);
               return {
-                value:   c,
-                price:   colorPrices[c] || mainPrice || 0,
-                image:   colorData[c].image || '',
-                inStock: finalInStock,
-                enabled: finalInStock,
+                value: c, price: colorPrice,
+                image: colorData[c].image || '',
+                inStock: Object.keys(comboAsin).length > 0 ? inStock : true,
+                enabled: Object.keys(comboAsin).length > 0 ? inStock : true,
               };
             }),
           });
@@ -578,27 +590,29 @@ module.exports = async (req, res) => {
           );
         }
 
-        // SIZE: just a list of toggles — no price, always considered in-stock
         if (sizes.length) {
           product.variations.push({
             name: 'Size',
-            values: sizes.map(s => ({
-              value:   s,
-              price:   0,      // sizes have no independent price
-              inStock: true,   // size availability is handled at color+size combo level
-              enabled: true,
-              image:   '',
-            })),
+            values: sizes.map(s => {
+              const inStock = colors.some(c => comboAsin[`${c}|${s}`]);
+              return {
+                value: s,
+                price: sizePrices[s] || mainPrice,
+                inStock: Object.keys(comboAsin).length > 0 ? inStock : true,
+                enabled: true,
+                image: '',
+              };
+            }),
           });
         }
 
-        // Store combo map on product for push step
+        // Store on product for push step
         product.comboAsin  = comboAsin;
-        product.colorPrices = colorPrices;
+        product.sizePrices = sizePrices;
 
-        // Product base price = cheapest available color price
-        const allColorPrices = Object.values(colorPrices).filter(p => p > 0);
-        if (allColorPrices.length) product.price = Math.min(...allColorPrices);
+        // Product base price = cheapest available size
+        const allP = Object.values(sizePrices).filter(p => p > 0);
+        if (allP.length) product.price = Math.min(...allP);
       }
 
       const colorGrp = product.variations.find(v=>v.name==='Color');
@@ -668,21 +682,19 @@ module.exports = async (req, res) => {
       const mkSku = parts => `${groupSku}-${parts.join('-').replace(/[^A-Z0-9]/gi,'_').toUpperCase().slice(0,40)}`;
 
       const defaultQty = parseInt(product.quantity) || 10;
-      // comboAsin: "Color|Size" → ASIN  (only combos that exist on Amazon)
-      // COLOR is primary: price comes from cv.price (per-color), not per-size.
-      const comboAsin    = product.comboAsin   || {};
-      const colorPrices  = product.colorPrices || {};
+      // comboAsin:  "Color|Size" → ASIN  (only combos that exist on Amazon)
+      // sizePrices: sizeName → price (fetched from best-coverage color, applies to all colors at that size)
+      const comboAsin  = product.comboAsin  || {};
+      const sizePrices = product.sizePrices || {};
 
       if (colorGroup && sizeGroup) {
         for (const cv of colorGroup.values.filter(v => v.enabled !== false)) {
           for (const sv of sizeGroup.values.filter(v => v.enabled !== false)) {
-            // Skip combos that don't exist on Amazon
+            // Only push combos that actually exist on Amazon
             const key = `${cv.value}|${sv.value}`;
             if (Object.keys(comboAsin).length > 0 && !comboAsin[key]) continue;
-            // Price = color's price (color is the primary axis)
-            const price = parseFloat(
-              colorPrices[cv.value] || cv.price || basePrice
-            ).toFixed(2);
+            // Price comes from sizePrices (size determines price on this product type)
+            const price = parseFloat(sizePrices[sv.value] || sv.price || basePrice).toFixed(2);
             variants.push({
               sku:   mkSku([cv.value, sv.value]),
               color: cv.value, size: sv.value,
@@ -696,7 +708,7 @@ module.exports = async (req, res) => {
         for (const cv of colorGroup.values.filter(v => v.enabled !== false)) {
           variants.push({
             sku:   mkSku([cv.value]), color: cv.value, size: null,
-            price: parseFloat(colorPrices[cv.value] || cv.price || basePrice).toFixed(2),
+            price: parseFloat(sizePrices[''] || cv.price || basePrice).toFixed(2),
             image: colorImgs[cv.value] || product.images[0] || '',
             qty:   defaultQty,
           });
@@ -705,13 +717,12 @@ module.exports = async (req, res) => {
         for (const sv of sizeGroup.values.filter(v => v.enabled !== false)) {
           variants.push({
             sku:   mkSku([sv.value]), color: null, size: sv.value,
-            price: parseFloat(sv.price || basePrice).toFixed(2),
+            price: parseFloat(sizePrices[sv.value] || sv.price || basePrice).toFixed(2),
             image: product.images[0] || '',
             qty:   defaultQty,
           });
         }
       }
-
       const final = variants.slice(0, 250);
       console.log(`[push] ${final.length} variants`);
 
