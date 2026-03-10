@@ -90,6 +90,27 @@ async function fetchPage(url, ua) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// ── eBay title sanitizer — strips words that trigger policy violations ─────────
+function sanitizeTitle(title) {
+  if (!title) return '';
+  // Words eBay bans or that trigger errorId 25019
+  const BANNED = [
+    /\bauthentic\b/gi, /\bgenuine\b/gi, /\boriginal\b/gi,
+    /\breal\b/gi, /\bverified\b/gi, /\bcertified\b/gi,
+    /\bauthorized\b/gi, /\bofficially licensed\b/gi,
+    /\bnot fake\b/gi, /\bnot a fake\b/gi, /\bnot replica\b/gi,
+  ];
+  let t = title;
+  for (const re of BANNED) t = t.replace(re, '');
+  // Collapse multiple spaces
+  t = t.replace(/\s{2,}/g, ' ').trim();
+  // Remove trailing punctuation/separators
+  t = t.replace(/[\-–,|:]+$/, '').trim();
+  // Enforce 80 char eBay limit
+  if (t.length > 80) t = t.slice(0, 80).replace(/\s+\S*$/, '').trim();
+  return t;
+}
+
 // ── Extract price from Amazon HTML ────────────────────────────────────────────
 function extractPrice(html) {
   const pats = [
@@ -246,9 +267,10 @@ TITLE RULES - follow strictly:
 - Lead with product type then key descriptors: material, style, use case
 - No special chars, colons, quotes, or dimensions in the title
 - No ALL CAPS words, no filler words (perfect, great, best)
+- NEVER use: authentic, genuine, original, real, verified, certified — eBay bans these
 - Title Case formatting
 - Good example: "Chunky Knit Throw Blanket Soft Chenille Handmade Couch Home Decor"
-- Bad example: "L'AGRATY Chunky Knit Blanket 30x40 Chenille..."
+- Bad example: "L'AGRATY Authentic Chunky Knit Blanket 30x40 Chenille..."
 
 CRITICAL: categoryId MUST be a LEAF category from the suggestions list. Never pick a parent category.`
         }]
@@ -569,10 +591,84 @@ module.exports = async (req, res) => {
         .map(m => m[1]).filter((v,i,a) => a.indexOf(v)===i);
       product.images = imgs.slice(0, 12);
 
-      // Description from bullet points
-      const bullets = [...html.matchAll(/<span class="a-list-item">\s*([^<]{20,500})\s*<\/span>/g)]
-        .map(m => m[1].trim()).slice(0, 5);
-      product.description = bullets.join('\n') || product.title;
+      // ── Description: extract feature bullets from multiple Amazon patterns ──────
+      const extractBullets = (h) => {
+        const results = [];
+
+        // Pattern 1: productFactsDesktopExpander or featurebullets_feature_div
+        // Find the "About this item" section content
+        const sectionPatterns = [
+          /id="productFactsDesktopExpander"[^>]*>([\s\S]{100,8000}?)<\/div>\s*<\/div>\s*<\/div>/,
+          /id="featurebullets_feature_div"[^>]*>([\s\S]{100,6000}?)<\/div>\s*<\/div>/,
+          /id="feature-bullets"[^>]*>([\s\S]{100,6000}?)<\/div>\s*<\/div>/,
+          /id="FeatureBullets"[^>]*>([\s\S]{100,6000}?)<\/div>\s*<\/div>/,
+        ];
+        let sectionHtml = '';
+        for (const pat of sectionPatterns) {
+          const m = h.match(pat);
+          if (m) { sectionHtml = m[1]; break; }
+        }
+
+        // Extract <li> content from the section
+        if (sectionHtml) {
+          const liMatches = [...sectionHtml.matchAll(/<li[^>]*>[\s\S]*?<span[^>]*class="[^"]*a-list-item[^"]*"[^>]*>([\s\S]{15,600}?)<\/span>/g)];
+          for (const m of liMatches) {
+            const text = m[1].replace(/<[^>]+>/g, '').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&#\d+;/g,'').trim();
+            if (text.length > 15 && !text.includes('return') && !text.includes('Your Orders')) {
+              results.push(text);
+            }
+          }
+        }
+
+        // Pattern 2: broader a-list-item spans (fallback)
+        if (!results.length) {
+          const allLi = [...h.matchAll(/<li[^>]*>\s*<span[^>]*a-list-item[^"]*"[^>]*>([\s\S]{20,600}?)<\/span>/g)];
+          for (const m of allLi) {
+            const text = m[1].replace(/<[^>]+>/g,'').replace(/&amp;/g,'&').trim();
+            if (text.length > 20 && !text.includes('return') && !text.includes('Your Orders') && !text.includes('Drop off')) {
+              results.push(text);
+            }
+            if (results.length >= 8) break;
+          }
+        }
+
+        return results.slice(0, 8);
+      };
+
+      const bullets = extractBullets(html);
+
+      // Also extract product description paragraph if exists
+      const descParaM = html.match(/id="productDescription"[^>]*>[\s\S]{0,200}<p[^>]*>([\s\S]{30,1000}?)<\/p>/);
+      const descPara = descParaM ? descParaM[1].replace(/<[^>]+>/g,'').replace(/&amp;/g,'&').trim() : '';
+
+      // Store raw bullets for building eBay HTML description later
+      product.bullets = bullets;
+      product.descriptionPara = descPara;
+
+      // Build the eBay HTML description
+      const buildEbayDescription = (title, buls, para, aspects) => {
+        const bulletHtml = buls.length
+          ? '<ul>' + buls.map(b => `<li>${b.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</li>`).join('') + '</ul>'
+          : '';
+        const specRows = Object.entries(aspects || {})
+          .filter(([k,v]) => !['ASIN','UPC','Color','Size','Brand Name','Brand'].includes(k) && v[0] && v[0].length < 80)
+          .slice(0, 10)
+          .map(([k,v]) => `<tr><td><b>${k}</b></td><td>${v[0]}</td></tr>`)
+          .join('');
+        const specsTable = specRows
+          ? `<br/><table border="0" cellpadding="4" cellspacing="0" width="100%"><tbody>${specRows}</tbody></table>`
+          : '';
+        return [
+          `<h2>${title}</h2>`,
+          bulletHtml,
+          para ? `<p>${para}</p>` : '',
+          specsTable,
+          '<br/><p style="font-size:11px;color:#888">Ships from US. Item is new. Please message us with any questions before purchasing.</p>'
+        ].filter(Boolean).join('\n');
+      };
+
+      product.description = buildEbayDescription(product.title, bullets, descPara, product.aspects);
+      if (!bullets.length) product.description = product.title; // fallback
 
       // Item specifics from product details table
       const rows = [...html.matchAll(/<th[^>]*class="[^"]*prodDetSectionEntry[^"]*"[^>]*>([^<]+)<\/th>\s*<td[^>]*>([^<]+)<\/td>/gi)];
@@ -841,8 +937,34 @@ module.exports = async (req, res) => {
       const suggestions = await getCategories(product.title || '', access_token);
       const ai = await aiEnrich(product.title, product.breadcrumbs || [], product.aspects || {}, suggestions);
       const categoryId = ai?.categoryId || suggestions[0]?.id || '11450';
-      const listingTitle = (product.ebayTitle || ai?.title || product.title || 'Product').slice(0, 80);
-      console.log(`[push] title: "${listingTitle}"`);
+      const rawTitle = product.ebayTitle || ai?.title || product.title || 'Product';
+      const listingTitle = sanitizeTitle(rawTitle) || sanitizeTitle(product.title) || 'Product';
+      console.log(`[push] title: "${listingTitle}" (raw: "${rawTitle.slice(0,60)}")`);
+
+      // Rebuild eBay description with final listing title + bullets from product
+      const buildEbayDesc = (title, bullets, para, aspects) => {
+        const bulletHtml = (bullets||[]).length
+          ? '<ul>' + bullets.map(b => `<li>${String(b).replace(/</g,'&lt;').replace(/>/g,'&gt;')}</li>`).join('') + '</ul>'
+          : '';
+        const specRows = Object.entries(aspects || {})
+          .filter(([k,v]) => !['ASIN','UPC','Color','Size','Brand Name','Brand'].includes(k) && v[0] && String(v[0]).length < 80)
+          .slice(0, 10)
+          .map(([k,v]) => `<tr><td><b>${k}</b></td><td>${v[0]}</td></tr>`)
+          .join('');
+        const specsTable = specRows
+          ? `<br/><table border="0" cellpadding="4" cellspacing="0" width="100%"><tbody>${specRows}</tbody></table>`
+          : '';
+        return [
+          `<h2>${title}</h2>`,
+          bulletHtml,
+          para ? `<p>${para}</p>` : '',
+          specsTable,
+          '<br/><p style="font-size:11px;color:#888">Ships from US. Item is new. Please message us with any questions before purchasing.</p>'
+        ].filter(Boolean).join('\n');
+      };
+      const ebayDescription = buildEbayDesc(listingTitle, product.bullets || [], product.descriptionPara || '', product.aspects || {})
+                           || product.description
+                           || listingTitle;
       // Strip Color/Size from base aspects — variants will set their own single values
       const rawAspects = { ...(product.aspects || {}), ...(ai?.aspects || {}) };
       delete rawAspects['Color']; delete rawAspects['color'];
@@ -882,7 +1004,7 @@ module.exports = async (req, res) => {
           body: JSON.stringify({
             availability: { shipToLocationAvailability: { quantity: parseInt(product.quantity)||10 } },
             condition: 'NEW',
-            product: { title: listingTitle, description: product.description || listingTitle, imageUrls: product.images.slice(0,12), aspects },
+            product: { title: listingTitle, description: ebayDescription, imageUrls: product.images.slice(0,12), aspects },
           }),
         });
         if (!ir.ok) return res.status(400).json({ error: 'Inventory PUT failed', details: await ir.text() });
@@ -999,7 +1121,7 @@ module.exports = async (req, res) => {
             availability: { shipToLocationAvailability: { quantity: testV.qty } },
             condition: 'NEW',
             product: {
-              title: listingTitle, description: product.description || listingTitle,
+              title: listingTitle, description: ebayDescription,
               imageUrls: [testV.image, ...product.images.filter(x => x !== testV.image)].filter(Boolean).slice(0, 12),
               aspects: testAsp,
             },
@@ -1029,7 +1151,7 @@ module.exports = async (req, res) => {
               availability: { shipToLocationAvailability: { quantity: v.qty } },
               condition: 'NEW',
               product: {
-                title: listingTitle, description: product.description || listingTitle,
+                title: listingTitle, description: ebayDescription,
                 imageUrls: [v.image, ...product.images.filter(x => x !== v.image)].filter(Boolean).slice(0, 12),
                 aspects: asp,
               },
@@ -1060,7 +1182,7 @@ module.exports = async (req, res) => {
                 availability: { shipToLocationAvailability: { quantity: v.qty } },
                 condition: 'NEW',
                 product: {
-                  title: listingTitle, description: product.description || listingTitle,
+                  title: listingTitle, description: ebayDescription,
                   imageUrls: [v.image, ...product.images.filter(x => x !== v.image)].filter(Boolean).slice(0, 12),
                   aspects: asp,
                 },
@@ -1100,7 +1222,7 @@ module.exports = async (req, res) => {
         const groupBody = {
             inventoryItemGroupKey: groupSku,
             title: listingTitle,
-            description: product.description || listingTitle,
+            description: ebayDescription,
             imageUrls: groupImageUrls,
             variantSKUs: final.map(v => v.sku).filter(s => createdSkus.has(s)),
             aspects: groupAspects,
@@ -1296,13 +1418,21 @@ Generate a clean, optimized eBay listing title following these rules:
 - Include key descriptors: material, style, color range hint, use case
 - No special characters, no colons, no quotes, no dimensions in title
 - No ALL CAPS words, no filler words
+- NEVER use: authentic, genuine, original, real, verified, certified — eBay bans these
 - Title case formatting
 
 Return ONLY the optimized title text, nothing else. No quotes, no explanation.` }]
           })
         });
         const d = await r.json();
-        const optimized = (d.content?.[0]?.text || '').trim().replace(/^["']|["']$/g, '');
+        const raw = (d.content?.[0]?.text || '').trim().replace(/^["']|["']$/g, '');
+        const optimized = sanitizeTitle(raw);
+        console.log(`[optimizeTitle] raw="${raw}" cleaned="${optimized}" apiErr=${JSON.stringify(d.error)}`);
+        if (!optimized) {
+          // AI returned empty — fall back to cleaning up the raw Amazon title
+          const fallback = sanitizeTitle(title.replace(/[^\w\s\-&]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80));
+          return res.json({ success: true, optimizedTitle: fallback, fallback: true });
+        }
         return res.json({ success: true, optimizedTitle: optimized });
       } catch (e) {
         return res.status(500).json({ error: e.message });
