@@ -109,6 +109,9 @@ label{display:block;font-size:11px;font-weight:700;color:var(--text3);margin-bot
   <div class="nav-item" onclick="nav('products')" id="nav-products">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>My Products
   </div>
+  <div class="nav-item" onclick="nav('logs')" id="nav-logs">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>Activity Log
+  </div>
   <div class="nav-item" onclick="nav('settings')" id="nav-settings">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>Settings
   </div>
@@ -166,10 +169,17 @@ const toast = (msg, type='info', dur=3500) => {
   document.getElementById('toast').appendChild(el);
   setTimeout(() => el.remove(), dur);
 };
-const log = (msg) => {
-  S.logs = [{ ts: new Date().toISOString(), msg }, ...(S.logs||[]).slice(0, 199)];
+// Structured activity log
+// type: 'push'|'sync'|'end'|'delete'|'price'|'stock'|'error'|'info'
+function addLog(type, title, detail = '', meta = {}) {
+  const entry = { id: Date.now() + Math.random(), ts: new Date().toISOString(), type, title, detail, ...meta };
+  S.logs = [entry, ...(S.logs||[]).slice(0, 499)];
   save();
-};
+  // Refresh log view if open
+  if (S.view === 'logs') renderLogs();
+}
+// legacy shim
+const log = (msg) => addLog('info', msg);
 
 // ── eBay Token Management ──────────────────────────────
 async function ensureToken() {
@@ -230,10 +240,10 @@ function nav(view) {
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   const el = document.getElementById(`nav-${view}`);
   if (el) el.classList.add('active');
-  const titles = { import: 'Import Product', products: 'My Products', settings: 'Settings' };
+  const titles = { import: 'Import Product', products: 'My Products', logs: 'Activity Log', settings: 'Settings' };
   document.getElementById('topbar-title').textContent = titles[view] || view;
   document.getElementById('topbar-actions').innerHTML = '';
-  const renders = { import: renderImport, products: renderProducts, settings: renderSettings };
+  const renders = { import: renderImport, products: renderProducts, logs: renderLogs, settings: renderSettings };
   renders[view]?.();
 }
 const $ = id => document.getElementById(id);
@@ -524,13 +534,13 @@ async function doPush() {
     prod.pushedAt = new Date().toISOString();
     S.products.unshift(prod); save();
 
-    log(`✅ Listed "${prod.title.slice(0,50)}" eBay ID: ${prod.ebayListingId} (${d.variantsCreated||1} variants)`);
+    addLog('push', `Listed: ${prod.title.slice(0,50)}`, `eBay ID ${prod.ebayListingId} · ${d.variantsCreated||1} variants`, { productId: prod.id, ebayId: prod.ebayListingId });
     setStatus(`✅ Listed on eBay! ${d.variantsCreated ? `${d.variantsCreated} variants` : ''} · <a href="https://www.ebay.com/itm/${prod.ebayListingId}" target="_blank" style="color:var(--accent2)">View listing</a>`, 'success');
     toast(`🎉 Live on eBay!`, 'success');
     IMP = null;
     setTimeout(() => { if ($('imp-preview')) $('imp-preview').innerHTML = ''; }, 2000);
   } catch (e) {
-    log(`❌ Push failed: ${e.message}`);
+    addLog('error', `Push failed: ${IMP?.title?.slice(0,50)||''}`, e.message);
     setStatus(`❌ ${e.message}`, 'error');
     toast(e.message, 'error', 6000);
   } finally {
@@ -650,7 +660,7 @@ async function pushExisting(pid) {
     p.status = 'listed'; p.ebaySku = d.sku; p.ebayListingId = d.listingId; p.pushedAt = new Date().toISOString();
     save(); renderProducts();
     toast(`🎉 Live on eBay!`, 'success');
-    log(`✅ Pushed "${p.title.slice(0,50)}" → eBay ${p.ebayListingId}`);
+    addLog('push', `Listed: ${p.title.slice(0,50)}`, `eBay ID ${p.ebayListingId}`, { productId: p.id, ebayId: p.ebayListingId });
   } catch (e) { toast(e.message, 'error', 6000); }
 }
 
@@ -669,7 +679,23 @@ async function syncOne(pid) {
     if (d.price) p.price = d.price;
     save(); renderProducts();
     toast(`Synced! ${d.updatedVariants||''} variants updated`, 'success');
-    log(`🔄 Synced "${p.title.slice(0,40)}" — ${d.updatedVariants||0} variants`);
+    // Log per-variant price/stock changes
+    if (d.freshData?.length) {
+      const pChanges = [], sChanges = [];
+      for (const u of d.freshData) {
+        const variant = (p.variations||[]).flatMap(g=>g.values).find(v=>v.value===u.color);
+        if (variant) {
+          if (variant.price && Math.abs((variant.price||0) - u.price) > 0.01)
+            pChanges.push(`${u.color}: $${(variant.price||0).toFixed(2)}→$${u.price.toFixed(2)}`);
+          if (variant.inStock !== undefined && variant.inStock !== u.inStock)
+            sChanges.push(`${u.color}: ${variant.inStock?'In Stock':'OOS'}→${u.inStock?'In Stock':'OOS'}`);
+          variant.price = u.price; variant.inStock = u.inStock;
+        }
+      }
+      if (pChanges.length) addLog('price', `Price changes: ${p.title.slice(0,40)}`, pChanges.join(' · '), { productId: p.id, changes: pChanges });
+      if (sChanges.length) addLog('stock', `Stock changes: ${p.title.slice(0,40)}`, sChanges.join(' · '), { productId: p.id, changes: sChanges });
+    }
+    addLog('sync', `Synced: ${p.title.slice(0,40)}`, `${d.updatedVariants||0} variants updated`, { productId: p.id });
   } catch (e) { toast(`Sync failed: ${e.message}`, 'error'); }
 }
 
@@ -686,7 +712,24 @@ async function syncAll() {
         body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, sourceUrl: p.sourceUrl, hasVariations: p.hasVariations, quantity: p.quantity, variations: p.variations }),
       });
       const d = await r.json();
-      if (d.success) { p.lastSynced = new Date().toISOString(); ok++; }
+      if (d.success) {
+        p.lastSynced = new Date().toISOString(); ok++;
+        if (d.freshData?.length) {
+          const pChanges = [], sChanges = [];
+          for (const u of d.freshData) {
+            const variant = (p.variations||[]).flatMap(g=>g.values).find(v=>v.value===u.color);
+            if (variant) {
+              if (variant.price && Math.abs((variant.price||0) - u.price) > 0.01)
+                pChanges.push(`${u.color}: $${(variant.price||0).toFixed(2)}→$${u.price.toFixed(2)}`);
+              if (variant.inStock !== undefined && variant.inStock !== u.inStock)
+                sChanges.push(`${u.color}: ${variant.inStock?'In Stock':'OOS'}→${u.inStock?'In Stock':'OOS'}`);
+              variant.price = u.price; variant.inStock = u.inStock;
+            }
+          }
+          if (pChanges.length) addLog('price', `Price changes: ${p.title.slice(0,40)}`, pChanges.join(' · '), { productId: p.id, changes: pChanges });
+          if (sChanges.length) addLog('stock', `Stock changes: ${p.title.slice(0,40)}`, sChanges.join(' · '), { productId: p.id, changes: sChanges });
+        }
+      }
     } catch {}
     await new Promise(r => setTimeout(r, 500));
   }
@@ -719,9 +762,11 @@ async function endListing(pid, deleteAfter = false) {
     const d = await r.json();
     if (!d.success) throw new Error(d.error || 'End listing failed');
     if (deleteAfter) {
+      addLog('delete', `Ended & deleted: ${p.title.slice(0,50)}`, `${d.ended||0} offers removed · ${d.deleted||0} inventory items deleted`, { productId: p.id });
       S.products = S.products.filter(x => x.id !== pid);
       toast(`Listing ended & deleted (${d.ended || 0} offers removed)`, 'info');
     } else {
+      addLog('end', `Listing ended: ${p.title.slice(0,50)}`, `${d.ended||0} offers removed`, { productId: p.id });
       p.status = 'ended'; p.ebayListingId = '';
       toast(`Listing ended (${d.ended || 0} offers removed)`, 'info');
     }
@@ -740,6 +785,7 @@ function deleteProduct(pid) {
     );
   } else {
     if (!confirm('Delete this product from DropSync?')) return;
+    addLog('delete', `Deleted: ${p.title.slice(0,50)}`, 'Removed from DropSync (was draft/ended)', { productId: p.id });
     S.products = S.products.filter(x => x.id !== pid); save(); renderProducts();
   }
 }
@@ -747,6 +793,69 @@ function deleteProduct(pid) {
 // ══════════════════════════════════════════════════════
 // SETTINGS VIEW
 // ══════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════
+// ACTIVITY LOG VIEW
+// ══════════════════════════════════════════════════════
+let _logFilter = 'all';
+
+function renderLogs() {
+  const LOG_ICONS = { push:'🚀', sync:'🔄', price:'💰', stock:'📦', end:'🛑', delete:'🗑️', error:'❌', info:'ℹ️' };
+  const LOG_COLORS = { push:'var(--green)', sync:'var(--accent)', price:'#f59e0b', stock:'#8b5cf6', end:'#f97316', delete:'var(--red)', error:'var(--red)', info:'var(--text3)' };
+  const LOG_LABELS = { all:'All', push:'Pushed', sync:'Synced', price:'Price ∆', stock:'Stock ∆', end:'Ended', delete:'Deleted', error:'Errors' };
+
+  const logs = S.logs || [];
+  const filtered = _logFilter === 'all' ? logs : logs.filter(e => e.type === _logFilter);
+
+  const filterBtns = Object.entries(LOG_LABELS).map(([k,v]) => {
+    const count = k === 'all' ? logs.length : logs.filter(e=>e.type===k).length;
+    const active = _logFilter === k;
+    return `<button class="btn ${active ? 'btn-outline' : 'btn-ghost'} btn-sm"
+      style="${active ? `border-color:${LOG_COLORS[k]||'var(--accent)'};color:${LOG_COLORS[k]||'var(--accent)'}` : ''};font-size:11px"
+      onclick="_logFilter='${k}';renderLogs()">${v}${count ? ` <span style="opacity:.6">${count}</span>` : ''}</button>`;
+  }).join('');
+
+  const rows = filtered.length ? filtered.map(e => {
+    const icon = LOG_ICONS[e.type] || 'ℹ️';
+    const color = LOG_COLORS[e.type] || 'var(--text3)';
+    const dt = new Date(e.ts);
+    const dateStr = dt.toLocaleDateString('en-US', { month:'short', day:'numeric' });
+    const timeStr = dt.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit' });
+    const changes = e.changes?.length
+      ? `<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">${e.changes.map(c =>
+          `<span style="font-family:var(--font-mono);font-size:11px;background:rgba(255,255,255,.06);padding:2px 7px;border-radius:4px;white-space:nowrap">${c}</span>`
+        ).join('')}</div>` : '';
+    return `<div style="display:flex;gap:14px;padding:14px 0;border-bottom:1px solid var(--border)">
+      <div style="font-size:20px;width:28px;flex-shrink:0;padding-top:1px">${icon}</div>
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">
+          <span style="font-size:13px;font-weight:600;color:var(--text)">${e.title}</span>
+          <span style="font-size:11px;font-weight:600;color:${color};text-transform:uppercase;letter-spacing:.04em">${e.type}</span>
+        </div>
+        ${e.detail ? `<div style="font-size:12px;color:var(--text2);margin-top:2px">${e.detail}</div>` : ''}
+        ${changes}
+      </div>
+      <div style="flex-shrink:0;text-align:right;font-size:11px;color:var(--text3);line-height:1.5">
+        <div>${dateStr}</div><div>${timeStr}</div>
+      </div>
+    </div>`;
+  }).join('') : `<div style="text-align:center;padding:60px 0;color:var(--text3);font-size:13px">
+    ${_logFilter==='all' ? 'No activity yet — push a product to get started' : `No ${LOG_LABELS[_logFilter]||_logFilter} events logged`}
+  </div>`;
+
+  $('content').innerHTML = `
+    <div style="padding:0 24px 24px">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:20px 0 16px;gap:12px;flex-wrap:wrap">
+        <div style="display:flex;gap:6px;flex-wrap:wrap">${filterBtns}</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span style="font-size:12px;color:var(--text3)">${filtered.length} event${filtered.length!==1?'s':''}</span>
+          ${logs.length ? `<button class="btn btn-ghost btn-sm" style="color:var(--red);font-size:11px"
+            onclick="if(confirm('Clear all activity logs?')){S.logs=[];save();renderLogs()}">Clear All</button>` : ''}
+        </div>
+      </div>
+      <div>${rows}</div>
+    </div>`;
+}
+
 function renderSettings() {
   $('content').innerHTML = `
     <div style="max-width:600px;display:flex;flex-direction:column;gap:16px">
