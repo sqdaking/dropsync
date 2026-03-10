@@ -877,22 +877,26 @@ module.exports = async (req, res) => {
 
       let groupOk = false;
       for (let attempt = 1; attempt <= 3 && !groupOk; attempt++) {
-        const gr = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(groupSku)}`, {
-          method: 'PUT', headers: auth,
-          body: JSON.stringify({
-            inventoryItemGroupKey: groupSku, title: listingTitle,
+        const colorUrlList = Object.values(colorImgUrls).filter(Boolean).slice(0,12);
+        const groupImageUrls = colorUrlList.length ? colorUrlList : product.images.slice(0, 12);
+        const groupBody = {
+            inventoryItemGroupKey: groupSku,
+            title: listingTitle,
             description: product.description || listingTitle,
-            imageUrls: product.images.slice(0, 12),
+            imageUrls: groupImageUrls,
             variantSKUs: final.map(v => v.sku),
             aspects: varAspects,
-            variesBy: Object.keys(varAspects),  // Color first = primary variation on eBay
-            ...(Object.keys(colorImgUrls).length ? { imageUrls: Object.values(colorImgUrls).filter(Boolean).slice(0,12) } : {}),
-          }),
+            variesBy: Object.keys(varAspects),
+        };
+        console.log('[push] group body keys:', Object.keys(groupBody), 'variantSKUs:', groupBody.variantSKUs.length, 'variesBy:', groupBody.variesBy);
+        const gr = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(groupSku)}`, {
+          method: 'PUT', headers: auth,
+          body: JSON.stringify(groupBody),
         });
         if (gr.ok || gr.status === 204) { groupOk = true; console.log('[push] group ok'); }
         else {
           const gt = await gr.text();
-          console.warn(`[push] group attempt ${attempt}: ${gr.status}`, gt.slice(0,200));
+          console.warn(`[push] group attempt ${attempt}: ${gr.status}`, gt.slice(0,400));
           if (attempt < 3) await sleep(600); else return res.status(400).json({ error: 'Group PUT failed', details: gt.slice(0,400) });
         }
       }
