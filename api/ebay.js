@@ -264,6 +264,13 @@ async function resolvePolicies(token, supplied, sandbox=false) {
       });
       const d = await r.json();
       if (d.fulfillmentPolicyId) { p.fulfillmentPolicyId = d.fulfillmentPolicyId; break; }
+      // If name already exists, fetch it
+      if ((d.errors||[]).some(e => e.errorId === 20400)) {
+        const existing = await fetch(`${EBAY_API}/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
+        p.fulfillmentPolicyId = (existing.fulfillmentPolicies||[]).find(x=>x.name==='DropSync Free Shipping')?.fulfillmentPolicyId
+                              || (existing.fulfillmentPolicies||[])[0]?.fulfillmentPolicyId || '';
+        if (p.fulfillmentPolicyId) break;
+      }
       console.warn('[policy] create failed with', svc.shippingServiceCode, ':', JSON.stringify(d).slice(0,200));
     }
   }
@@ -277,7 +284,14 @@ async function resolvePolicies(token, supplied, sandbox=false) {
         returnShippingCostPayer: 'BUYER', refundMethod: 'MONEY_BACK',
       }),
     });
-    const d = await r.json(); p.returnPolicyId = d.returnPolicyId || '';
+    const d = await r.json();
+    p.returnPolicyId = d.returnPolicyId || '';
+    // If name already exists, fetch it
+    if (!p.returnPolicyId && (d.errors||[]).some(e => e.errorId === 20400)) {
+      const existing = await fetch(`${EBAY_API}/sell/account/v1/return_policy?marketplace_id=EBAY_US`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
+      p.returnPolicyId = (existing.returnPolicies||[]).find(x=>x.name==='DropSync 30-Day Returns')?.returnPolicyId
+                       || (existing.returnPolicies||[])[0]?.returnPolicyId || '';
+    }
   }
 
   if (!p.fulfillmentPolicyId) throw new Error(
