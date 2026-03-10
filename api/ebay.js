@@ -347,8 +347,8 @@ module.exports = async (req, res) => {
       const sandbox = req.query.state === 'sandbox' || req.query.sandbox === 'true' || process.env.EBAY_SANDBOX === 'true';
       const E = getEbayUrls(sandbox);
       const REDIRECT = E.REDIRECT || `${req.headers['x-forwarded-proto']||'https'}://${req.headers.host}/api/ebay?action=callback`;
-      console.log(`[callback] sandbox=${sandbox} state=${req.query.state} client_id=${E.CLIENT_ID?.slice(0,20)} redirect=${REDIRECT}`);
       const creds = Buffer.from(`${E.CLIENT_ID}:${E.CLIENT_SECRET}`).toString('base64');
+      console.error(`[callback] sandbox=${sandbox} tok_url=${E.EBAY_TOK} client=${E.CLIENT_ID?.slice(0,25)} redirect=${REDIRECT}`);
       const r = await fetch(E.EBAY_TOK, {
         method: 'POST',
         headers: { Authorization: `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
