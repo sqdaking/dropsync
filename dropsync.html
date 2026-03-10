@@ -474,8 +474,9 @@ function buildProd() {
     ebaySku: '', ebayListingId: '',
     createdAt: new Date().toISOString(), lastSynced: null,
     // Required for variant filtering and pricing on push
-    comboAsin:  IMP.comboAsin  || {},
-    sizePrices: IMP.sizePrices || {},
+    comboAsin:   IMP.comboAsin   || {},
+    sizePrices:  IMP.sizePrices  || {},
+    comboPrices: IMP.comboPrices || {},
   };
 }
 
