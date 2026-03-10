@@ -1395,46 +1395,90 @@ module.exports = async (req, res) => {
     }
 
     // ── END LISTING ───────────────────────────────────────────────────────────
-    // ── BULK SCRAPE: extract related ASINs from a product page ─────────────────
-    if (action === 'bulkScrapeAsins') {
-      const { url, limit = 15 } = body;
-      if (!url) return res.status(400).json({ error: 'url required' });
-      const asinM = url.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/);
-      const seedAsin = asinM?.[1];
-      if (seedAsin) {
-        const seedUrl = `https://www.amazon.com/dp/${seedAsin}?th=1`;
-        const html = await fetchPage(seedUrl, randUA());
-        if (!html) return res.json({ success: false, error: 'Could not load page — Amazon may be blocking. Try again.' });
+    // ── DEALS SCRAPE v2: get ASINs from Amazon Today's Deals page ────────────────
+    if (action === 'bulkScrapeAsins') action = 'dealsScrape'; // backward compat alias
+    if (action === 'dealsScrape') {
+      const { exclude = [], count = 25 } = body;
+      const excludeSet = new Set(exclude);
 
-        const foundAsins = new Set();
-        // Always include seed ASIN itself
-        foundAsins.add(seedAsin);
+      // VeRO / brand-protected items to skip (eBay will reject these)
+      const VERO_BRANDS = new Set([
+        'samsung','apple','nike','adidas','sony','microsoft','lg','bose',
+        'beats','dyson','lego','gucci','louis vuitton','chanel','rolex',
+        'prada','versace','burberry','yeezy','jordan','off-white','supreme',
+        'north face','ugg','timberland','new balance','under armour','reebok',
+        'puma','vans','converse','dr. martens','crocs','birkenstock',
+        'kindle','echo','ring','roomba','nespresso','keurig','instant pot',
+        'nintendo','playstation','xbox','fitbit','garmin','gopro',
+        'turbotax','doordash','uber','instacart','grubhub',
+        'pokemon','disney','marvel','dc comics','star wars','harry potter',
+      ]);
 
-        // Extract ASINs from all JS data on the page (carousels, related, sponsored)
-        const asinPatterns = [
-          // Standard ASIN references in JSON data
-          /"asin"\s*:\s*"([B][0-9A-Z]{9})"/g,
-          // dp URLs
-          /\/dp\/([B][0-9A-Z]{9})/g,
-          // data-asin attributes
-          /data-asin="([B][0-9A-Z]{9})"/g,
-          // ASIN in JSON strings
-          /"([B][0-9A-Z]{9})"/g,
-        ];
+      // Digital / non-physical product keywords to skip
+      const SKIP_KEYWORDS = [
+        'ebook','kindle edition','gift card','egift','digital code',
+        'game download','app purchase','audible','prime video',
+        'rolling balls','brain games','alpha\'s bride','design home',
+        'iq boost','training brain','free 3d game',
+      ];
 
-        for (const pat of asinPatterns) {
-          for (const m of html.matchAll(pat)) {
-            if (m[1] && m[1] !== seedAsin) foundAsins.add(m[1]);
-            if (foundAsins.size >= limit + 5) break;
-          }
-          if (foundAsins.size >= limit + 5) break;
-        }
+      const isVero = (title, brand) => {
+        const t = (title + ' ' + (brand||'')).toLowerCase();
+        for (const b of VERO_BRANDS) if (t.includes(b)) return true;
+        for (const k of SKIP_KEYWORDS) if (t.includes(k)) return true;
+        return false;
+      };
 
-        const asins = [...foundAsins].slice(0, limit);
-        console.log(`[bulkScrape] seed=${seedAsin} found ${asins.length} ASINs`);
-        return res.json({ success: true, seedAsin, asins });
+      const dealsUrl = 'https://www.amazon.com/deals?ref_=nav_cs_gb';
+      const html = await fetchPage(dealsUrl, randUA());
+      if (!html) return res.json({ success: false, error: 'Could not load Amazon deals page. Try again in a moment.' });
+
+      // Extract ASINs + titles from the deals page
+      const productMap = {}; // asin → { asin, title, url }
+
+      // 1) JSON "asin":"B..." pattern (richest source — JS bundles on deals page)
+      for (const m of html.matchAll(/"asin"\s*:\s*"([B][0-9A-Z]{9})"/g)) {
+        productMap[m[1]] = productMap[m[1]] || { asin: m[1], title: '' };
       }
-      return res.json({ success: false, error: 'Could not extract ASIN from URL' });
+
+      // 2) data-asin attributes
+      for (const m of html.matchAll(/data-asin="([B][0-9A-Z]{9})"/g)) {
+        productMap[m[1]] = productMap[m[1]] || { asin: m[1], title: '' };
+      }
+
+      // 3) URL slugs give product title hints
+      for (const m of html.matchAll(/href="([^"]*\/([^\/]+)\/dp\/([B][0-9A-Z]{9})[^"]*)"/g)) {
+        const asin = m[3];
+        const slug = decodeURIComponent(m[2]).replace(/-/g, ' ');
+        if (asin && slug.length > 5) {
+          productMap[asin] = { asin, title: slug, url: 'https://www.amazon.com/dp/' + asin };
+        }
+      }
+
+      // 4) img alt text near dp links
+      for (const m of html.matchAll(/\/dp\/([B][0-9A-Z]{9})[^"]*"[^>]*>[\s\S]{0,300}?alt="([^"]{10,120})"/g)) {
+        if (!productMap[m[1]]?.title || productMap[m[1]].title.length < 10) {
+          productMap[m[1]] = { asin: m[1], title: m[2], url: 'https://www.amazon.com/dp/' + m[1] };
+        }
+      }
+
+      // Filter: exclude already-used, VeRO, and digital items
+      const allProducts = Object.values(productMap).filter(p =>
+        p.asin &&
+        !excludeSet.has(p.asin) &&
+        !isVero(p.title, '')
+        // note: title may be empty — that's OK, we'll get it when we scrape
+      );
+
+      // Shuffle randomly
+      for (let i = allProducts.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [allProducts[i], allProducts[j]] = [allProducts[j], allProducts[i]];
+      }
+
+      const selected = allProducts.slice(0, count);
+      console.log(`[dealsScrape] total=${Object.keys(productMap).length} after filter=${allProducts.length} selected=${selected.length}`);
+      return res.json({ success: true, products: selected, totalFound: Object.keys(productMap).length });
     }
 
     if (action === 'optimizeTitle') {
