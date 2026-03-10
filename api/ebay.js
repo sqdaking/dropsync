@@ -1,7 +1,7 @@
 // DropSync AI Agent — Amazon → eBay Dropshipping Backend
 // Clean architecture: per-ASIN prices+images, AI category detection, auto policies
 
-const SCOPES = 'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.inventory https://api.ebay.com/oauth/api_scope/sell.account https://api.ebay.com/oauth/api_scope/sell.fulfillment';
+const SCOPES = 'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.inventory https://api.ebay.com/oauth/api_scope/sell.account https://api.ebay.com/oauth/api_scope/sell.fulfillment https://api.ebay.com/oauth/api_scope/sell.listing';
 
 function getEbayUrls(sandbox) {
   return {
@@ -569,7 +569,7 @@ module.exports = async (req, res) => {
         title: '', price: 0, images: [],
         description: '', aspects: {}, breadcrumbs: [],
         variations: [], variationImages: {}, hasVariations: false,
-        inStock: true, quantity: 10,
+        inStock: true, quantity: 1,
       };
 
       // Title
@@ -1002,7 +1002,7 @@ module.exports = async (req, res) => {
         const ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(groupSku)}`, {
           method: 'PUT', headers: auth,
           body: JSON.stringify({
-            availability: { shipToLocationAvailability: { quantity: parseInt(product.quantity)||10 } },
+            availability: { shipToLocationAvailability: { quantity: parseInt(product.quantity)||1 } },
             condition: 'NEW',
             product: { title: listingTitle, description: ebayDescription, imageUrls: product.images.slice(0,12), aspects },
           }),
@@ -1042,7 +1042,7 @@ module.exports = async (req, res) => {
         return skuPrefix + raw.slice(0, maxSuffix - 9) + '_' + hashStr;
       };
 
-      const defaultQty = parseInt(product.quantity) || 10;
+      const defaultQty = parseInt(product.quantity) || 1;
       // comboAsin:  "Color|Size" → ASIN  (only combos that exist on Amazon)
       // sizePrices: sizeName → price (fetched from best-coverage color, applies to all colors at that size)
       const comboAsin   = product.comboAsin   || {};
@@ -1319,74 +1319,149 @@ module.exports = async (req, res) => {
       const EBAY_API = getEbayUrls(false).EBAY_API;
       const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
 
-      // Paginate through all active offers
-      const allOffers = [];
-      let offset = 0;
-      const limit = 100;
-      let total = null;
+      const allListings = [];
+      const seenIds = new Set();
 
-      while (true) {
-        const r = await fetch(`${EBAY_API}/sell/inventory/v1/offer?limit=${limit}&offset=${offset}`, { headers: auth });
-        const d = await r.json();
-        if (!r.ok) {
-          console.error('[fetchMyListings] offers error:', JSON.stringify(d).slice(0,300));
-          break;
-        }
-        const offers = d.offers || [];
-        allOffers.push(...offers);
-        total = d.total || offers.length;
-        console.log(`[fetchMyListings] fetched ${allOffers.length}/${total} offers`);
-        if (allOffers.length >= total || offers.length < limit) break;
-        offset += limit;
-      }
-
-      // Map to clean listing objects
-      const listings = allOffers
-        .filter(o => o.status === 'PUBLISHED' || o.listingId)
-        .map(o => ({
-          ebayListingId: o.listingId || '',
-          ebaySku:       o.sku || '',
-          title:         o.listingDescription?.slice(0,80) || o.sku || '',
-          price:         parseFloat(o.pricingSummary?.price?.value || 0),
-          quantity:      o.availableQuantity || 0,
-          status:        o.status || 'PUBLISHED',
-          currency:      o.pricingSummary?.price?.currency || 'USD',
-          categoryId:    o.categoryId || '',
-          ebayUrl:       o.listingId ? `https://www.ebay.com/itm/${o.listingId}` : '',
-        }));
-
-      // Also try to get item titles from inventory items (for better display)
-      const skus = [...new Set(allOffers.map(o => o.sku).filter(Boolean))].slice(0, 200);
-      const inventoryMap = {};
-      // Batch fetch inventory items for titles/images
-      for (let i = 0; i < skus.length; i += 25) {
-        const batch = skus.slice(i, i+25);
-        try {
-          const ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item?sku=${batch.join('|')}`, { headers: auth });
-          const id = await ir.json();
-          for (const item of (id.inventoryItems || [])) {
-            inventoryMap[item.sku] = {
-              title: item.product?.title || '',
-              image: item.product?.imageUrls?.[0] || '',
-              aspects: item.product?.aspects || {},
-            };
+      // ── Strategy 1: Inventory API offers (catches DropSync-created listings) ──
+      try {
+        let offset = 0;
+        const limit = 100;
+        while (true) {
+          const r = await fetch(`${EBAY_API}/sell/inventory/v1/offer?limit=${limit}&offset=${offset}`, { headers: auth });
+          const d = await r.json();
+          if (!r.ok) { console.log('[fetchMyListings] inventory offers err:', d?.errors?.[0]?.message); break; }
+          for (const o of (d.offers || [])) {
+            if (!o.listingId || seenIds.has(o.listingId)) continue;
+            seenIds.add(o.listingId);
+            allListings.push({
+              ebayListingId: o.listingId,
+              ebaySku:       o.sku || '',
+              title:         o.sku || '',
+              price:         parseFloat(o.pricingSummary?.price?.value || 0),
+              quantity:      o.availableQuantity || 0,
+              image:         '',
+              ebayUrl:       `https://www.ebay.com/itm/${o.listingId}`,
+              aspects:       {},
+            });
           }
-        } catch {}
-      }
+          const total = d.total || 0;
+          offset += limit;
+          if (offset >= total || (d.offers||[]).length < limit) break;
+        }
+        console.log(`[fetchMyListings] inventory offers: ${allListings.length}`);
+      } catch(e) { console.log('[fetchMyListings] inventory err:', e.message); }
 
-      // Enrich listings with inventory data
-      for (const l of listings) {
-        const inv = inventoryMap[l.ebaySku];
-        if (inv) {
-          if (inv.title) l.title = inv.title;
-          if (inv.image) l.image = inv.image;
-          l.aspects = inv.aspects;
+      // ── Strategy 2: Trading API GetMyeBaySelling (catches ALL listings) ──────
+      try {
+        const TRADING_API = 'https://api.ebay.com/ws/api.dll';
+        let pageNum = 1, totalPages = 1;
+        while (pageNum <= totalPages && pageNum <= 20) {
+          const xmlBody = `<?xml version="1.0" encoding="utf-8"?><GetMyeBaySellingRequest xmlns="urn:ebay:apis:eBLBaseComponents"><RequesterCredentials><eBayAuthToken>${access_token}</eBayAuthToken></RequesterCredentials><ActiveList><Include>true</Include><IncludeItemSpecifics>true</IncludeItemSpecifics><Pagination><EntriesPerPage>200</EntriesPerPage><PageNumber>${pageNum}</PageNumber></Pagination></ActiveList><ErrorLanguage>en_US</ErrorLanguage><WarningLevel>High</WarningLevel></GetMyeBaySellingRequest>`;
+          const r = await fetch(TRADING_API, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'text/xml',
+              'X-EBAY-API-SITEID': '0',
+              'X-EBAY-API-COMPATIBILITY-LEVEL': '1155',
+              'X-EBAY-API-CALL-NAME': 'GetMyeBaySelling',
+              'X-EBAY-API-IAF-TOKEN': access_token,
+            },
+            body: xmlBody,
+          });
+          const xml = await r.text();
+          console.log(`[fetchMyListings] trading page=${pageNum} status=${r.status} len=${xml.length}`);
+          if (!r.ok) break;
+
+          // Check for eBay error in XML
+          const ackMatch = xml.match(/<Ack>(.*?)<\/Ack>/);
+          const ack = ackMatch?.[1] || '';
+          if (ack === 'Failure') {
+            const errMsg = xml.match(/<LongMessage>(.*?)<\/LongMessage>/)?.[1] || xml.slice(0,300);
+            console.log('[fetchMyListings] trading API failure:', errMsg);
+            break;
+          }
+
+          const tpMatch = xml.match(/<TotalNumberOfPages>(\d+)<\/TotalNumberOfPages>/);
+          if (tpMatch) totalPages = Math.min(parseInt(tpMatch[1]), 20);
+
+          // Parse items
+          const itemRegex = /<Item>([\s\S]*?)<\/Item>/g;
+          let count = 0;
+          for (const m of xml.matchAll(itemRegex)) {
+            const block = m[1];
+            const get = tag => block.match(new RegExp(`<${tag}>([\s\S]*?)<\/${tag}>`))?.[1]?.trim() || '';
+            const itemId = get('ItemID');
+            if (!itemId || seenIds.has(itemId)) continue;
+            seenIds.add(itemId);
+            count++;
+            allListings.push({
+              ebayListingId: itemId,
+              ebaySku:       get('SKU'),
+              title:         get('Title'),
+              price:         parseFloat(get('CurrentPrice') || get('BuyItNowPrice') || '0'),
+              quantity:      parseInt(get('QuantityAvailable') || get('Quantity') || '0'),
+              image:         get('GalleryURL') || get('PictureURL') || '',
+              ebayUrl:       `https://www.ebay.com/itm/${itemId}`,
+              aspects:       {},
+            });
+          }
+          console.log(`[fetchMyListings] trading page ${pageNum}/${totalPages}: +${count} items`);
+          pageNum++;
+        }
+      } catch(e) { console.log('[fetchMyListings] trading err:', e.message); }
+
+      // ── Enrich titles/images via inventory items for DropSync SKUs ────────────
+      const dsItems = allListings.filter(l => l.ebaySku?.startsWith('DS-'));
+      if (dsItems.length) {
+        const skus = [...new Set(dsItems.map(l => l.ebaySku))].slice(0, 100);
+        for (let i = 0; i < skus.length; i += 25) {
+          try {
+            const batch = skus.slice(i, i+25);
+            const ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item?sku=${batch.join('|')}`, { headers: auth });
+            const id = await ir.json();
+            for (const item of (id.inventoryItems || [])) {
+              const l = allListings.find(x => x.ebaySku === item.sku);
+              if (l) {
+                if (!l.title && item.product?.title) l.title = item.product.title;
+                if (!l.image && item.product?.imageUrls?.[0]) l.image = item.product.imageUrls[0];
+              }
+            }
+          } catch {}
         }
       }
 
-      console.log(`[fetchMyListings] returning ${listings.length} listings`);
-      return res.json({ success: true, listings, total: listings.length });
+      console.log(`[fetchMyListings] TOTAL: ${allListings.length} listings`);
+      return res.json({ success: true, listings: allListings, total: allListings.length });
     }
+
+
+    // ── FETCH MY LISTINGS DEBUG — returns raw XML ─────────────────────────────
+    if (action === 'fetchMyListingsDebug') {
+      const { access_token } = body;
+      if (!access_token) return res.status(400).json({ error: 'Missing access_token' });
+      const TRADING_API = 'https://api.ebay.com/ws/api.dll';
+      const xmlBody = `<?xml version="1.0" encoding="utf-8"?>
+<GetMyeBaySellingRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials><eBayAuthToken>${access_token}</eBayAuthToken></RequesterCredentials>
+  <ActiveList><Include>true</Include><Pagination><EntriesPerPage>10</EntriesPerPage><PageNumber>1</PageNumber></Pagination></ActiveList>
+  <ErrorLanguage>en_US</ErrorLanguage><WarningLevel>High</WarningLevel>
+</GetMyeBaySellingRequest>`;
+      const r = await fetch(TRADING_API, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'text/xml',
+          'X-EBAY-API-SITEID': '0',
+          'X-EBAY-API-COMPATIBILITY-LEVEL': '967',
+          'X-EBAY-API-CALL-NAME': 'GetMyeBaySelling',
+          'X-EBAY-API-IAF-TOKEN': access_token,
+        },
+        body: xmlBody,
+      });
+      const xmlText = await r.text();
+      console.log('[fetchMyListingsDebug] status:', r.status, 'len:', xmlText.length);
+      return res.json({ status: r.status, xml: xmlText.slice(0, 5000) });
+    }
+
 
 
     // ── SYNC: re-scrape Amazon, push diffs to eBay ────────────────────────────
@@ -1405,18 +1480,32 @@ module.exports = async (req, res) => {
 
       if (!hasVariations) {
         const offerList = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(ebaySku)}`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
-        const offerId = (offerList.offers||[])[0]?.offerId;
-        if (offerId && freshPrice) {
+        const offer = (offerList.offers||[])[0];
+        const offerId = offer?.offerId;
+        const oldPrice = parseFloat(offer?.pricingSummary?.price?.value || 0);
+        const priceChanges = [], stockChanges = [];
+
+        if (offerId && freshPrice && Math.abs(freshPrice - oldPrice) > 0.01) {
           await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerId}`, {
             method: 'PUT', headers: auth,
             body: JSON.stringify({ pricingSummary: { price: { value: String(freshPrice.toFixed(2)), currency: 'USD' } } }),
           });
+          priceChanges.push(`$${oldPrice.toFixed(2)} → $${freshPrice.toFixed(2)}`);
         }
+
+        // Always set qty — 0 if OOS (never pause the listing itself)
+        const newQty = freshStock ? parseInt(quantity)||1 : 0;
+        const invRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(ebaySku)}`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
+        const oldQty = invRes?.availability?.shipToLocationAvailability?.quantity ?? -1;
         await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(ebaySku)}`, {
           method: 'PUT', headers: auth,
-          body: JSON.stringify({ availability: { shipToLocationAvailability: { quantity: freshStock ? parseInt(quantity)||10 : 0 } }, condition: 'NEW', product: {} }),
+          body: JSON.stringify({ availability: { shipToLocationAvailability: { quantity: newQty } }, condition: 'NEW', product: invRes?.product || {} }),
         });
-        return res.json({ success: true, price: freshPrice, inStock: freshStock });
+        if (oldQty >= 0 && oldQty !== newQty) {
+          stockChanges.push(freshStock ? `Restocked (qty ${newQty})` : `Out of stock (qty → 0)`);
+        }
+
+        return res.json({ success: true, price: freshPrice, inStock: freshStock, priceChanges, stockChanges, wentOos: !freshStock && oldQty > 0 });
       }
 
       // Variation sync: update each color ASIN's price/stock
@@ -1452,23 +1541,40 @@ module.exports = async (req, res) => {
         const skuLower = sku.toLowerCase();
         const match = updated.find(u => skuLower.includes(u.color.replace(/\s+/g,'_').toLowerCase()));
         if (!match) continue;
-        // Update inventory item qty
+
+        // Get current state for change detection
+        const curInv = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
+        const oldQty = curInv?.availability?.shipToLocationAvailability?.quantity ?? -1;
+        const newQty = match.inStock ? parseInt(quantity)||1 : 0;
+        match.stockChanged = oldQty >= 0 && oldQty !== newQty && (oldQty === 0 || newQty === 0);
+
+        // Update inventory item qty (0 = OOS, never pause the listing)
         await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
           method: 'PUT', headers: auth,
-          body: JSON.stringify({ availability: { shipToLocationAvailability: { quantity: match.inStock ? parseInt(quantity)||10 : 0 } }, condition: 'NEW', product: {} }),
+          body: JSON.stringify({ availability: { shipToLocationAvailability: { quantity: newQty } }, condition: 'NEW', product: curInv?.product || {} }),
         });
+
         // Update offer price
         const ol = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
         const oid = (ol.offers||[])[0]?.offerId;
         if (oid) {
-          await fetch(`${EBAY_API}/sell/inventory/v1/offer/${oid}`, {
-            method: 'PUT', headers: auth,
-            body: JSON.stringify({ pricingSummary: { price: { value: String(match.price.toFixed(2)), currency: 'USD' } } }),
-          });
+          match.oldPrice = parseFloat((ol.offers||[])[0]?.pricingSummary?.price?.value || 0);
+          if (Math.abs(match.price - match.oldPrice) > 0.01) {
+            await fetch(`${EBAY_API}/sell/inventory/v1/offer/${oid}`, {
+              method: 'PUT', headers: auth,
+              body: JSON.stringify({ pricingSummary: { price: { value: String(match.price.toFixed(2)), currency: 'USD' } } }),
+            });
+          }
         }
         syncCount++;
       }
-      return res.json({ success: true, updatedVariants: syncCount, freshData: updated });
+      // Build change summaries for logging
+      const priceChanges = updated.filter(u => u.oldPrice && Math.abs(u.price - u.oldPrice) > 0.01)
+        .map(u => `${u.color}: $${u.oldPrice.toFixed(2)}→$${u.price.toFixed(2)}`);
+      const stockChanges = updated.filter(u => u.stockChanged)
+        .map(u => u.inStock ? `${u.color}: restocked` : `${u.color}: OOS (qty→0)`);
+      const wentOos = updated.some(u => !u.inStock && u.stockChanged);
+      return res.json({ success: true, updatedVariants: syncCount, freshData: updated, priceChanges, stockChanges, wentOos });
     }
 
     // ── END LISTING ───────────────────────────────────────────────────────────
@@ -1506,12 +1612,67 @@ module.exports = async (req, res) => {
         return false;
       };
 
-      const dealsUrl = 'https://www.amazon.com/deals?ref_=nav_cs_gb';
-      const html = await fetchPage(dealsUrl, randUA());
-      if (!html) return res.json({ success: false, error: 'Could not load Amazon deals page. Try again in a moment.' });
+      // Scrape multiple Amazon pages to get a large, diverse ASIN pool
+      const AMAZON_PAGES = [
+        'https://www.amazon.com/deals?ref_=nav_cs_gb',
+        'https://www.amazon.com/s?i=fashion&rh=n%3A7141123011&fs=true&ref=lp_7141123011_sar',
+        'https://www.amazon.com/s?i=fashion-womens&bbn=1040660&rh=n%3A1040660%2Cn%3A7147441011&ref=nav_em',
+        'https://www.amazon.com/s?k=womens+clothing&i=fashion-womens&ref=nb_sb_noss',
+        'https://www.amazon.com/s?k=home+decor&i=garden&ref=nb_sb_noss',
+        'https://www.amazon.com/s?k=kitchen+gadgets&i=kitchen&ref=nb_sb_noss',
+        'https://www.amazon.com/s?k=jewelry+women&i=jewelry&ref=nb_sb_noss',
+        'https://www.amazon.com/s?k=baby+products&i=baby-products&ref=nb_sb_noss',
+        'https://www.amazon.com/s?k=sports+fitness&i=sporting&ref=nb_sb_noss',
+        'https://www.amazon.com/gp/bestsellers/fashion/ref=zg_bs_nav_fashion_0',
+        'https://www.amazon.com/gp/bestsellers/garden/ref=zg_bs_nav_garden_0',
+        'https://www.amazon.com/gp/new-releases/fashion/ref=zg_bsnr_nav_fashion_0',
+      ];
 
-      // Extract ASINs + titles from the deals page
       const productMap = {}; // asin → { asin, title, url }
+      let pagesLoaded = 0;
+
+      // Fetch pages in parallel (up to 4 at a time) until we have enough ASINs
+      const fetchPage_ = async (url) => {
+        try {
+          const h = await fetchPage(url, randUA());
+          if (!h || h.length < 5000) return;
+          // Extract ASINs using all patterns
+          for (const m of h.matchAll(/"asin"\s*:\s*"([B][0-9A-Z]{9})"/g))
+            productMap[m[1]] = productMap[m[1]] || { asin: m[1], title: '' };
+          for (const m of h.matchAll(/data-asin="([B][0-9A-Z]{9})"/g))
+            productMap[m[1]] = productMap[m[1]] || { asin: m[1], title: '' };
+          for (const m of h.matchAll(/href="[^"]*\/([^\/\s"]{5,})\/dp\/([B][0-9A-Z]{9})[^"]*"/g)) {
+            const slug = decodeURIComponent(m[1]).replace(/-/g,' ');
+            if (slug.length > 5) productMap[m[2]] = { asin: m[2], title: slug, url: 'https://www.amazon.com/dp/'+m[2] };
+          }
+          for (const m of h.matchAll(/\/dp\/([B][0-9A-Z]{9})[^"]*"[^>]*>[\s\S]{0,300}?alt="([^"]{10,120})"/g)) {
+            if (!productMap[m[1]]?.title || productMap[m[1]].title.length < 10)
+              productMap[m[1]] = { asin: m[1], title: m[2], url: 'https://www.amazon.com/dp/'+m[1] };
+          }
+          pagesLoaded++;
+          console.log('[dealsScrape] loaded page', url.slice(0,60), '→ pool='+Object.keys(productMap).length);
+        } catch(e) { console.error('[dealsScrape] page error:', e.message); }
+      };
+
+      // Always fetch deals page + rotate through category pages based on exclude set size
+      // so every "Fetch More" call hits different pages
+      const pageOffset = Math.floor(excludeSet.size / 20) % AMAZON_PAGES.length;
+      const pagesToFetch = [
+        AMAZON_PAGES[0], // deals always
+        ...AMAZON_PAGES.slice(1).sort(() => Math.random()-0.5).slice(0, 4)
+      ];
+
+      // Fetch in batches of 2 (avoid hammering)
+      for (let i = 0; i < pagesToFetch.length; i += 2) {
+        await Promise.all(pagesToFetch.slice(i, i+2).map(fetchPage_));
+        if (Object.keys(productMap).length >= excludeSet.size + count + 50) break;
+        if (i+2 < pagesToFetch.length) await new Promise(r => setTimeout(r, 600));
+      }
+
+      if (Object.keys(productMap).length === 0)
+        return res.json({ success: false, error: 'Could not load Amazon pages. Try again in a moment.' });
+
+      console.log('[dealsScrape] total pool after', pagesLoaded, 'pages:', Object.keys(productMap).length);
 
       // 1) JSON "asin":"B..." pattern (richest source — JS bundles on deals page)
       for (const m of html.matchAll(/"asin"\s*:\s*"([B][0-9A-Z]{9})"/g)) {
