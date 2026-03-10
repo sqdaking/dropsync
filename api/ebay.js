@@ -227,18 +227,35 @@ async function resolvePolicies(token, supplied) {
   }
 
   if (!p.fulfillmentPolicyId) {
-    const r = await fetch(`${EBAY_API}/sell/account/v1/fulfillment_policy`, {
-      method: 'POST', headers: auth,
-      body: JSON.stringify({
-        name: 'DropSync Free Shipping', marketplaceId: 'EBAY_US',
-        categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
-        handlingTime: { value: 3, unit: 'DAY' },
-        shippingOptions: [{ optionType: 'DOMESTIC', costType: 'FLAT_RATE',
-          shippingServices: [{ shippingServiceCode: 'USPSFirstClass', freeShipping: true,
-            shippingCost: { value: '0.00', currency: 'USD' }, buyerResponsibleForShipping: false }] }],
-      }),
-    });
-    const d = await r.json(); p.fulfillmentPolicyId = d.fulfillmentPolicyId || '';
+    // Try to create a fulfillment policy with multiple fallback service codes
+    // eBay accounts have different supported services depending on registration type
+    const serviceAttempts = [
+      { shippingServiceCode: 'ShippingMethodStandard', freeShipping: true },
+      { shippingServiceCode: 'USPSFirstClass', freeShipping: true },
+      { shippingServiceCode: 'USPSPriority', freeShipping: true },
+    ];
+    for (const svc of serviceAttempts) {
+      const r = await fetch(`${EBAY_API}/sell/account/v1/fulfillment_policy`, {
+        method: 'POST', headers: auth,
+        body: JSON.stringify({
+          name: 'DropSync Free Shipping', marketplaceId: 'EBAY_US',
+          categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES', default: true }],
+          handlingTime: { value: 3, unit: 'DAY' },
+          shippingOptions: [{ optionType: 'DOMESTIC', costType: 'FLAT_RATE',
+            shippingServices: [{
+              shippingServiceCode: svc.shippingServiceCode,
+              freeShipping: svc.freeShipping,
+              shippingCost: { value: '0.00', currency: 'USD' },
+              buyerResponsibleForShipping: false,
+              sortOrder: 1,
+            }],
+          }],
+        }),
+      });
+      const d = await r.json();
+      if (d.fulfillmentPolicyId) { p.fulfillmentPolicyId = d.fulfillmentPolicyId; break; }
+      console.warn('[policy] create failed with', svc.shippingServiceCode, ':', JSON.stringify(d).slice(0,200));
+    }
   }
   if (!p.returnPolicyId) {
     const r = await fetch(`${EBAY_API}/sell/account/v1/return_policy`, {
@@ -435,6 +452,7 @@ module.exports = async (req, res) => {
 
         // 4. Per-size prices: fetch ONE representative ASIN per size (max 6 fetches)
         const sizePrices = {};  // size → price
+        const sizeStock  = {};  // size → boolean (in stock)
         const sizeKeys = Object.keys(sizeToAsin);
         if (sizeKeys.length) {
           await Promise.all(sizeKeys.slice(0, 6).map(async size => {
@@ -442,29 +460,30 @@ module.exports = async (req, res) => {
             const h = await fetchPage(`https://www.amazon.com/dp/${sAsin}`, ua);
             if (!h) return;
             const p = extractPrice(h);
-            const s = !h.toLowerCase().includes('currently unavailable');
-            if (p) { sizePrices[size] = p; console.log(`[price] ${size}=$${p}`); }
+            const inStock = !h.toLowerCase().includes('currently unavailable')
+                         && !h.toLowerCase().includes('temporarily out of stock')
+                         && !h.toLowerCase().includes('out of stock');
+            sizeStock[size] = inStock;
+            if (p) { sizePrices[size] = p; console.log(`[price] ${size}=$${p} inStock=${inStock}`); }
+            else   { console.log(`[price] ${size} price extraction failed (inStock=${inStock})`); }
           }));
         }
-        // If all size fetches failed, use main page price for everything
+        // Fallback: if all size fetches failed, use main page price
         if (!Object.keys(sizePrices).length && product.price) {
-          sizes.forEach(s => sizePrices[s] = product.price);
+          sizes.forEach(s => { sizePrices[s] = product.price; sizeStock[s] = true; });
         }
+        // Any size with no stock data → assume in stock
+        sizes.forEach(s => { if (sizeStock[s] === undefined) sizeStock[s] = true; });
+        console.log('[stock] sizePrices:', JSON.stringify(sizePrices));
+        console.log('[stock] sizeStock:', JSON.stringify(sizeStock));
 
-        // 5. Build colorData per color
+        // 5. Build colorData per color (images only — prices come from size)
         const colorData = {};
         for (const c of colors) {
           const cAsin = colorToAsin[c] || null;
-          // Price: find this color's size price (use first size as default)
-          // For color-only products: all same price. For color+size: per-size pricing
-          const defaultPrice = sizes.length > 0
-            ? (sizePrices[sizes[0]] || product.price || 0)
-            : (product.price || 0);
           colorData[c] = {
-            asin:    cAsin,
-            price:   defaultPrice,
-            image:   swatchImgMap[c] || '',
-            inStock: true,
+            asin:  cAsin,
+            image: swatchImgMap[c] || '',
           };
         }
 
@@ -500,9 +519,10 @@ module.exports = async (req, res) => {
             name: 'Color',
             values: colors.map(c => ({
               value:   c,
-              price:   colorData[c].price || product.price || 0,
+              // Color-only price: use first available size price as a display price
+              price:   sizes.length > 0 ? (sizePrices[sizes[0]] || product.price || 0) : (product.price || 0),
               image:   colorData[c].image || '',
-              inStock: colorData[c].inStock,
+              inStock: sizes.length > 0 ? Object.values(sizeStock).some(Boolean) : true,
               enabled: true,
             })),
           });
@@ -516,14 +536,20 @@ module.exports = async (req, res) => {
             values: sizes.map(s => ({
               value:   s,
               price:   sizePrices[s] || product.price || 0,
-              image:   '', inStock: true, enabled: true,
+              inStock: sizeStock[s] !== false,  // false = definitely OOS, undefined = assume in stock
+              image:   '', enabled: true,
             })),
           });
         }
 
-        // Set product base price = cheapest size price
-        const allSizePrices = Object.values(sizePrices).filter(p => p > 0);
-        if (allSizePrices.length) product.price = Math.min(...allSizePrices);
+        // Set product base price = cheapest in-stock size price
+        const availSizePrices = sizes
+          .filter(s => sizeStock[s] !== false && sizePrices[s])
+          .map(s => sizePrices[s]);
+        if (availSizePrices.length) product.price = Math.min(...availSizePrices);
+        // Also store sizePrices on product for use during push
+        product.sizePrices = sizePrices;
+        product.sizeStock  = sizeStock;
       }
 
       const colorGrp = product.variations.find(v=>v.name==='Color');
@@ -592,13 +618,16 @@ module.exports = async (req, res) => {
       const variants = [];
       const mkSku = parts => `${groupSku}-${parts.join('-').replace(/[^A-Z0-9]/gi,'_').toUpperCase().slice(0,40)}`;
 
+      const defaultQty = parseInt(product.quantity) || 10;
       if (colorGroup && sizeGroup) {
         for (const cv of colorGroup.values.filter(v => v.enabled!==false)) {
           for (const sv of sizeGroup.values.filter(v => v.enabled!==false)) {
+            // Price comes from size (sv.price), not color — sizes have different prices
+            const price = parseFloat(sv.price || cv.price || basePrice).toFixed(2);
+            // Stock: sv.inStock reflects actual Amazon stock check for that size
+            const qty = sv.inStock !== false ? defaultQty : 0;
             variants.push({ sku: mkSku([cv.value, sv.value]), color: cv.value, size: sv.value,
-              price: parseFloat(cv.price || basePrice).toFixed(2),
-              image: colorImgs[cv.value] || product.images[0] || '',
-              qty:   cv.inStock ? (parseInt(product.quantity)||10) : 0 });
+              price, image: colorImgs[cv.value] || product.images[0] || '', qty });
           }
         }
       } else if (colorGroup) {
@@ -606,13 +635,14 @@ module.exports = async (req, res) => {
           variants.push({ sku: mkSku([cv.value]), color: cv.value, size: null,
             price: parseFloat(cv.price || basePrice).toFixed(2),
             image: colorImgs[cv.value] || product.images[0] || '',
-            qty:   cv.inStock ? (parseInt(product.quantity)||10) : 0 });
+            qty:   cv.inStock !== false ? defaultQty : 0 });
         }
       } else if (sizeGroup) {
         for (const sv of sizeGroup.values.filter(v => v.enabled!==false)) {
           variants.push({ sku: mkSku([sv.value]), color: null, size: sv.value,
             price: parseFloat(sv.price || basePrice).toFixed(2),
-            image: product.images[0] || '', qty: parseInt(product.quantity)||10 });
+            image: product.images[0] || '',
+            qty:   sv.inStock !== false ? defaultQty : 0 });
         }
       }
 
@@ -678,8 +708,20 @@ module.exports = async (req, res) => {
           method: 'POST', headers: auth, body: JSON.stringify({ requests: batch }),
         });
         const od = await or.json();
-        for (const resp of (od.responses || [])) { if (resp.offerId) allOfferIds.push(resp.offerId); }
-        console.log(`[push] offers batch ${Math.floor(i/25)+1}: ${(od.responses||[]).filter(r=>r.offerId).length} ok`);
+        for (const resp of (od.responses || [])) {
+          if (resp.offerId) { allOfferIds.push(resp.offerId); }
+          else if (resp.errors?.length) {
+            console.warn(`[offer] SKU ${resp.sku?.slice(-20)} error:`, JSON.stringify(resp.errors[0]).slice(0,200));
+          }
+        }
+        const batchOk = (od.responses||[]).filter(r=>r.offerId).length;
+        const batchFail = (od.responses||[]).filter(r=>!r.offerId).length;
+        console.log(`[push] offers batch ${Math.floor(i/25)+1}: ${batchOk} ok, ${batchFail} failed`);
+        if (batchFail && batchOk === 0) {
+          // Return the first error to the frontend
+          const firstErr = (od.responses||[]).find(r=>r.errors?.length);
+          if (firstErr) return res.status(400).json({ error: 'Offer creation failed', details: firstErr.errors[0] });
+        }
       }
 
       // Publish by group
