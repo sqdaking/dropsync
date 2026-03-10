@@ -190,15 +190,24 @@ Return ONLY a JSON object (no markdown backticks):
 {
   "categoryId": "<LEAF category ID from suggestions above>",
   "categoryName": "<category name>",
-  "title": "<eBay-optimized title, under 80 chars, keyword-rich>",
+  "title": "<see title rules below>",
   "aspects": {
     "Brand": ["Unbranded"],
     "Color": ["See Listing"],
-    "Material": ["Polyester"],
-    "Size": ["See Listing"],
-    ... include 5-10 relevant aspects for this category
+    "Material": ["<actual material>"],
+    "Size": ["See Listing"]
   }
 }
+
+TITLE RULES - follow strictly:
+- Exactly 10-12 words, no more no less
+- Remove ALL brand/seller/store names (L'AGRATY, Woman Within, Amazon Basics, etc)
+- Lead with product type then key descriptors: material, style, use case
+- No special chars, colons, quotes, or dimensions in the title
+- No ALL CAPS words, no filler words (perfect, great, best)
+- Title Case formatting
+- Good example: "Chunky Knit Throw Blanket Soft Chenille Handmade Couch Home Decor"
+- Bad example: "L'AGRATY Chunky Knit Blanket 30x40 Chenille..."
 
 CRITICAL: categoryId MUST be a LEAF category from the suggestions list. Never pick a parent category.`
         }]
@@ -756,7 +765,8 @@ module.exports = async (req, res) => {
       const suggestions = await getCategories(product.title || '', access_token);
       const ai = await aiEnrich(product.title, product.breadcrumbs || [], product.aspects || {}, suggestions);
       const categoryId = ai?.categoryId || suggestions[0]?.id || '11450';
-      const listingTitle = (ai?.title || product.title || 'Product').slice(0, 80);
+      const listingTitle = (product.ebayTitle || ai?.title || product.title || 'Product').slice(0, 80);
+      console.log(`[push] title: "${listingTitle}"`);
       // Strip Color/Size from base aspects — variants will set their own single values
       const rawAspects = { ...(product.aspects || {}), ...(ai?.aspects || {}) };
       delete rawAspects['Color']; delete rawAspects['color'];
@@ -820,7 +830,19 @@ module.exports = async (req, res) => {
 
       // Build flat variant list
       const variants = [];
-      const mkSku = parts => `${groupSku}-${parts.join('-').replace(/[^A-Z0-9]/gi,'_').toUpperCase().slice(0,40)}`;
+      // eBay SKU max = 50 chars. groupSku = "DS-XXXXXXXXXXXXX-XXXXX" (22 chars) + "-" = 23
+      // So variant suffix can be at most 27 chars
+      const SKU_MAX = 50;
+      const skuPrefix = groupSku + '-';
+      const maxSuffix = SKU_MAX - skuPrefix.length; // typically 27
+      const mkSku = parts => {
+        const raw = parts.join('_').replace(/[^A-Z0-9]/gi,'_').toUpperCase().replace(/_+/g,'_').replace(/^_|_$/g,'');
+        if (raw.length <= maxSuffix) return skuPrefix + raw;
+        // Hash entire raw string into 8 hex chars, keep first (maxSuffix-9) chars of raw
+        const hash = raw.split('').reduce((h,c)=>((h<<5)-h+c.charCodeAt(0))|0, 0);
+        const hashStr = (hash >>> 0).toString(16).toUpperCase().slice(0,8).padStart(8,'0');
+        return skuPrefix + raw.slice(0, maxSuffix - 9) + '_' + hashStr;
+      };
 
       const defaultQty = parseInt(product.quantity) || 10;
       // comboAsin:  "Color|Size" → ASIN  (only combos that exist on Amazon)
@@ -917,7 +939,9 @@ module.exports = async (req, res) => {
         }
       }
 
-      let okInv = 1; // count the test PUT above
+      const createdSkus = new Set([final[0].sku]); // test PUT already succeeded
+      const failedInvSkus = [];
+
       for (let i = 1; i < final.length; i += 8) {
         await Promise.all(final.slice(i, i+8).map(async v => {
           const asp = { ...aspects };
@@ -935,12 +959,44 @@ module.exports = async (req, res) => {
               },
             }),
           });
-          if (r.ok || r.status === 204) okInv++;
-          else console.warn(`[push] inv ${v.sku.slice(-15)}: ${r.status}`);
+          if (r.ok || r.status === 204) createdSkus.add(v.sku);
+          else {
+            const rb = await r.text().catch(()=>'');
+            console.warn(`[push] inv FAIL ${v.sku.slice(-20)}: ${r.status} ${rb.slice(0,80)}`);
+            failedInvSkus.push(v);
+          }
         }));
         if (i+8 < final.length) await sleep(150);
       }
-      console.log(`[push] inventory items: ${okInv}/${final.length}`);
+
+      // Retry failed inventory items once after a short wait
+      if (failedInvSkus.length) {
+        console.log(`[push] retrying ${failedInvSkus.length} failed inventory items...`);
+        await sleep(1000);
+        for (let i = 0; i < failedInvSkus.length; i += 8) {
+          await Promise.all(failedInvSkus.slice(i, i+8).map(async v => {
+            const asp = { ...aspects };
+            if (v.color) asp['Color'] = [v.color];
+            if (v.size)  asp['Size']  = [v.size];
+            const r = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(v.sku)}`, {
+              method: 'PUT', headers: auth,
+              body: JSON.stringify({
+                availability: { shipToLocationAvailability: { quantity: v.qty } },
+                condition: 'NEW',
+                product: {
+                  title: listingTitle, description: product.description || listingTitle,
+                  imageUrls: [v.image, ...product.images.filter(x => x !== v.image)].filter(Boolean).slice(0, 12),
+                  aspects: asp,
+                },
+              }),
+            });
+            if (r.ok || r.status === 204) createdSkus.add(v.sku);
+            else console.warn(`[push] inv retry FAIL ${v.sku.slice(-20)}: ${r.status}`);
+          }));
+          if (i+8 < failedInvSkus.length) await sleep(200);
+        }
+      }
+      console.log(`[push] inventory items: ${createdSkus.size}/${final.length} created`);
 
       // PUT inventory_item_group
       // Color must be FIRST in variesBy so eBay treats it as primary (image-bearing) variation
@@ -970,7 +1026,7 @@ module.exports = async (req, res) => {
             title: listingTitle,
             description: product.description || listingTitle,
             imageUrls: groupImageUrls,
-            variantSKUs: final.map(v => v.sku),
+            variantSKUs: final.map(v => v.sku).filter(s => createdSkus.has(s)),
             aspects: groupAspects,
             variesBy: {
               aspectsImageVariesBy: colorGroup ? ['Color'] : [],
@@ -1141,6 +1197,42 @@ module.exports = async (req, res) => {
     }
 
     // ── END LISTING ───────────────────────────────────────────────────────────
+    if (action === 'optimizeTitle') {
+      const { title, breadcrumbs = [], aspects = {} } = body;
+      if (!title) return res.status(400).json({ error: 'title required' });
+      const key = process.env.ANTHROPIC_API_KEY;
+      if (!key) return res.status(500).json({ error: 'No ANTHROPIC_API_KEY set' });
+      try {
+        const r = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({
+            model: 'claude-sonnet-4-20250514', max_tokens: 200,
+            messages: [{ role: 'user', content: `You are an eBay listing title optimizer.
+
+Original Amazon title: "${title}"
+Category path: ${breadcrumbs.join(' > ') || 'unknown'}
+
+Generate a clean, optimized eBay listing title following these rules:
+- Exactly 10-12 words
+- Remove ALL brand names, seller names, and store names completely
+- Start with the product type (e.g. "Chunky Knit Throw Blanket", "Women's V-Neck T-Shirt")
+- Include key descriptors: material, style, color range hint, use case
+- No special characters, no colons, no quotes, no dimensions in title
+- No ALL CAPS words, no filler words
+- Title case formatting
+
+Return ONLY the optimized title text, nothing else. No quotes, no explanation.` }]
+          })
+        });
+        const d = await r.json();
+        const optimized = (d.content?.[0]?.text || '').trim().replace(/^["']|["']$/g, '');
+        return res.json({ success: true, optimizedTitle: optimized });
+      } catch (e) {
+        return res.status(500).json({ error: e.message });
+      }
+    }
+
     if (action === 'endListing') {
       const { access_token, ebaySku, ebayListingId } = body;
       const sandbox = body.sandbox === true || body.sandbox === 'true';
