@@ -148,7 +148,7 @@ label{display:block;font-size:11px;font-weight:700;color:var(--text3);margin-bot
 const KEY = 'ds_v2';
 const DEFAULT_STATE = {
   backendUrl: '', token: '', refreshToken: '', tokenExpiry: 0,
-  markup: 35, minMarkup: 5, handlingCost: 2, quantity: 10,
+  markup: 35, minMarkup: 5, handlingCost: 2, quantity: 1,
   fulfillmentPolicyId: '', paymentPolicyId: '', returnPolicyId: '',
   products: [], logs: [], view: 'import',
 };
@@ -455,7 +455,7 @@ function renderPreview() {
         <div style="display:flex;align-items:center;gap:12px;padding-top:12px;border-top:1px solid var(--border)">
           <div style="display:flex;align-items:center;gap:8px">
             <label style="margin:0;white-space:nowrap">Qty per variant</label>
-            <input type="number" class="input" min="1" max="999" value="${IMP.quantity||S.quantity||10}"
+            <input type="number" class="input" min="1" max="999" value="${IMP.quantity||S.quantity||1}"
               oninput="IMP.quantity=+this.value" style="width:70px">
           </div>
           <div style="flex:1"></div>
@@ -500,7 +500,7 @@ function buildProd() {
     variations: JSON.parse(JSON.stringify(IMP.variations || [])),
     variationImages: JSON.parse(JSON.stringify(IMP.variationImages || {})),
     hasVariations: IMP.hasVariations || false,
-    quantity: IMP.quantity || S.quantity || 10,
+    quantity: IMP.quantity || S.quantity || 1,
     inStock: IMP.inStock !== false,
     status: 'draft',
     ebaySku: '', ebayListingId: '',
@@ -835,7 +835,7 @@ async function bulkFetchDeals() {
           variations: JSON.parse(JSON.stringify(p.variations||[])),
           variationImages: JSON.parse(JSON.stringify(p.variationImages||{})),
           hasVariations: p.hasVariations||false,
-          quantity: S.quantity||10, inStock: p.inStock!==false,
+          quantity: S.quantity||1, inStock: p.inStock!==false,
           status: 'draft', ebaySku: '', ebayListingId: '',
           createdAt: new Date().toISOString(), lastSynced: null,
           comboAsin: p.comboAsin||{}, sizePrices: p.sizePrices||{}, comboPrices: p.comboPrices||{},
@@ -1148,7 +1148,7 @@ async function eiImportSelected() {
       breadcrumbs: [],
       variations: [], variationImages: {},
       hasVariations: false,
-      quantity: l.quantity || 10,
+      quantity: l.quantity || 1,
       inStock: true,
       status: 'listed',
       ebaySku: l.ebaySku || '',
@@ -1414,9 +1414,9 @@ function deleteProduct(pid) {
 let _logFilter = 'all';
 
 function renderLogs() {
-  const LOG_ICONS = { push:'🚀', sync:'🔄', price:'💰', stock:'📦', end:'🛑', delete:'🗑️', error:'❌', info:'ℹ️' };
-  const LOG_COLORS = { push:'var(--green)', sync:'var(--accent)', price:'#f59e0b', stock:'#8b5cf6', end:'#f97316', delete:'var(--red)', error:'var(--red)', info:'var(--text3)' };
-  const LOG_LABELS = { all:'All', push:'Pushed', sync:'Synced', price:'Price ∆', stock:'Stock ∆', end:'Ended', delete:'Deleted', error:'Errors' };
+  const LOG_ICONS = { push:'🚀', sync:'🔄', price:'💰', stock:'📦', end:'🛑', delete:'🗑️', error:'❌', info:'ℹ️', import:'📥' };
+  const LOG_COLORS = { push:'var(--green)', sync:'var(--accent)', price:'#f59e0b', stock:'#8b5cf6', end:'#f97316', delete:'var(--red)', error:'var(--red)', info:'var(--text3)', import:'#06b6d4' };
+  const LOG_LABELS = { all:'All', push:'Pushed', sync:'Synced', price:'Price ∆', stock:'Stock ∆', end:'Ended', delete:'Deleted', error:'Errors', import:'Imported' };
 
   const logs = (S.logs || []).map(e => ({
     ...e,
@@ -1598,7 +1598,7 @@ function renderSettings() {
           </div>
           <div>
             <label>Default Quantity per Variant</label>
-            <input type="number" class="input" id="def-qty" value="${S.quantity||10}" min="1" max="999" style="width:100px">
+            <input type="number" class="input" id="def-qty" value="${S.quantity||1}" min="1" max="999" style="width:100px">
           </div>
           <button class="btn btn-primary" style="align-self:flex-start" onclick="savePricingDefaults()">Save Pricing</button>
           <div style="font-size:11px;color:var(--text3);padding:8px;background:rgba(59,130,246,.05);border-radius:6px">
@@ -1609,16 +1609,46 @@ function renderSettings() {
 
       <!-- Auto Sync -->
       <div class="card">
-        <div class="card-header"><span class="card-title">🔄 Auto Sync</span></div>
-        <div class="card-body">
-          <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+        <div class="card-header"><span class="card-title">🔄 Monitoring &amp; Auto Sync</span></div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:14px">
+
+          <!-- 24/7 Server Monitor -->
+          <div style="padding:14px;background:var(--bg);border-radius:10px;border:1px solid ${S.monitor24h ? 'var(--green)' : 'var(--border)'}">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+              <div>
+                <div style="font-size:13px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:6px">
+                  🌐 24/7 Server Monitoring
+                  <span style="font-size:10px;font-weight:700;background:var(--green);color:#000;padding:1px 6px;border-radius:4px">RECOMMENDED</span>
+                </div>
+                <div style="font-size:12px;color:var(--text3);margin-top:3px">Runs every hour on Vercel servers — works even when you're offline</div>
+              </div>
+              <button class="btn ${S.monitor24h ? 'btn-outline' : 'btn-success'} btn-sm" onclick="toggleMonitor24h()" id="monitor-btn" style="min-width:120px">
+                ${S.monitor24h ? '✅ Enabled' : '🚀 Enable Now'}
+              </button>
+            </div>
+            ${S.monitor24h ? `
+            <div style="margin-top:10px;padding:8px 10px;background:rgba(34,197,94,.08);border-radius:6px;font-size:11px;color:var(--green)">
+              ✅ Active · ${(S.products||[]).filter(p=>p.status==='listed'&&p.sourceUrl).length} listings monitored hourly
+              ${S.monitorLastReg ? ` · last synced: ${timeAgo(S.monitorLastReg)}` : ''}
+            </div>
+            <div style="margin-top:6px;display:flex;gap:8px">
+              <button class="btn btn-ghost btn-sm" style="font-size:11px" onclick="checkMonitorStatus()">📊 Check Status</button>
+              <button class="btn btn-ghost btn-sm" style="font-size:11px;color:var(--red)" onclick="disableMonitor24h()">Disable</button>
+            </div>` : `
+            <div style="margin-top:8px;font-size:11px;color:var(--text3)">
+              ⚠️ Without this, monitoring only runs while DropSync is open in your browser
+            </div>`}
+          </div>
+
+          <!-- Browser auto-sync fallback -->
+          <div>
             <label style="margin:0;cursor:pointer;display:flex;align-items:center;gap:8px">
               <input type="checkbox" id="auto-sync-chk" ${S.autoSync?'checked':''} onchange="S.autoSync=this.checked;save();setupAutoSync()">
-              <span style="font-size:13px;color:var(--text);font-weight:600">Enable auto-sync every 20 minutes</span>
+              <span style="font-size:12px;color:var(--text2)">Also sync every 20 min while browser is open (backup)</span>
             </label>
+            ${S.autoSync && _syncTimer ? `<div style="font-size:11px;color:var(--green);margin-top:4px;margin-left:22px">✅ Active · last run: ${S.lastAutoSync ? timeAgo(S.lastAutoSync) : 'never'}</div>` : ''}
           </div>
-          <div style="font-size:12px;color:var(--text3)">Automatically re-checks Amazon prices/stock and updates eBay listings</div>
-          ${S.autoSync && _syncTimer ? `<div style="font-size:11px;color:var(--green);margin-top:6px">✅ Active · last run: ${S.lastAutoSync ? timeAgo(S.lastAutoSync) : 'never'}</div>` : ''}
+
         </div>
       </div>
 
@@ -1636,7 +1666,7 @@ function saveBackendUrl() {
 function savePricingDefaults() {
   S.markup = parseFloat($('def-markup')?.value) || 35;
   S.handlingCost = parseFloat($('def-handling')?.value) || 2;
-  S.quantity = parseInt($('def-qty')?.value) || 10;
+  S.quantity = parseInt($('def-qty')?.value) || 1;
   save(); toast('Pricing saved', 'success');
 }
 
@@ -1749,6 +1779,71 @@ async function loadPolicies() {
 }
 
 // ══════════════════════════════════════════════════════
+// 24/7 SERVER MONITOR
+// ══════════════════════════════════════════════════════
+async function registerMonitor() {
+  if (!S.monitor24h || !S.token || !S.backendUrl || !S.refreshToken) return;
+  const tracked = (S.products||[]).filter(p => p.status==='listed' && p.sourceUrl && p.ebaySku);
+  if (!tracked.length) return;
+  try {
+    const r = await fetch(`${S.backendUrl}/api/monitor?action=register`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ products: tracked, refresh_token: S.refreshToken, markup: S.markup, quantity: S.quantity })
+    });
+    const d = await r.json();
+    if (d.success) {
+      S.monitorLastReg = new Date().toISOString();
+      save();
+      console.log('[Monitor] registered', d.tracked, 'products for 24/7 monitoring');
+    }
+  } catch(e) { console.warn('[Monitor] register failed:', e.message); }
+}
+
+async function toggleMonitor24h() {
+  if (!S.backendUrl) { toast('Set Backend URL in Settings first', 'error'); return; }
+  if (!S.token) { toast('Connect eBay first', 'error'); return; }
+  if (!S.refreshToken) { toast('Please reconnect eBay to enable 24/7 monitoring (need refresh token)', 'warn', 5000); return; }
+  S.monitor24h = true;
+  save();
+  const btn = $('monitor-btn');
+  if (btn) btn.innerHTML = '<span style="display:inline-flex;align-items:center;gap:6px"><div class="spinner" style="width:10px;height:10px"></div> Registering…</span>';
+  await registerMonitor();
+  toast('✅ 24/7 monitoring enabled — your listings are tracked every hour even when offline!', 'success', 6000);
+  renderSettings();
+}
+
+function disableMonitor24h() {
+  S.monitor24h = false; S.monitorLastReg = null;
+  save(); renderSettings();
+  toast('24/7 monitoring disabled', 'info');
+}
+
+async function checkMonitorStatus() {
+  if (!S.backendUrl) return;
+  try {
+    const r = await fetch(`${S.backendUrl}/api/monitor?action=status`);
+    const d = await r.json();
+    if (!d.registered) { toast('No products registered yet — click Enable Now', 'warn'); return; }
+    const lastRun = d.lastRun ? timeAgo(d.lastRun) : 'never';
+    const sum = d.lastSummary;
+    const msg = sum
+      ? `Last run ${lastRun}: ${sum.ran} checked · ${sum.priceUpdates} price updates · ${sum.stockUpdates} stock updates`
+      : `${d.tracked} products registered · last run: ${lastRun}`;
+    toast('📊 ' + msg, 'info', 7000);
+    // Inject last run results into logs
+    if (d.lastResults?.length) {
+      for (const r of d.lastResults) {
+        if (r.priceChanges?.length) addLog('price', `[Server] Price updated: ${r.title}`, r.priceChanges.join(' · '), { changes: r.priceChanges });
+        if (r.stockChanges?.length) addLog('stock', `[Server] Stock updated: ${r.title}`, r.stockChanges.join(' · '), { changes: r.stockChanges });
+        if (r.wentOos) addLog('stock', `[Server] ⚠️ OOS: ${r.title}`, 'qty → 0 on eBay', {});
+      }
+      save();
+      if (S.view === 'logs') renderLogs();
+    }
+  } catch(e) { toast('Could not reach monitor: ' + e.message, 'error'); }
+}
+
+// ══════════════════════════════════════════════════════
 // AUTO SYNC
 // ══════════════════════════════════════════════════════
 let _syncTimer = null;
@@ -1759,6 +1854,8 @@ function setupAutoSync() {
       const listed = (S.products||[]).filter(p => p.status==='listed' && p.sourceUrl);
       if (!listed.length) return;
       console.log('[AutoSync] syncing', listed.length, 'products');
+      let totalPriceChanges = 0, totalStockChanges = 0, totalOos = 0;
+
       for (const p of listed.slice(0, 20)) {
         try {
           const token = await ensureToken();
@@ -1767,13 +1864,48 @@ function setupAutoSync() {
             body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, sourceUrl: p.sourceUrl, hasVariations: p.hasVariations, quantity: p.quantity, variations: p.variations }),
           });
           const d = await r.json();
-          if (d.success) { p.lastSynced = new Date().toISOString(); }
-        } catch {}
+          if (d.success) {
+            p.lastSynced = new Date().toISOString();
+
+            // Log price changes
+            if (d.priceChanges?.length) {
+              totalPriceChanges += d.priceChanges.length;
+              addLog('price', `Price updated: ${p.title.slice(0,40)}`, d.priceChanges.join(' · '), { productId: p.id, changes: d.priceChanges });
+            }
+            // Log stock/OOS changes
+            if (d.stockChanges?.length) {
+              totalStockChanges += d.stockChanges.length;
+              addLog('stock', `Stock updated: ${p.title.slice(0,40)}`, d.stockChanges.join(' · '), { productId: p.id, changes: d.stockChanges });
+            }
+            if (d.wentOos) {
+              totalOos++;
+              addLog('stock', `⚠️ Out of stock: ${p.title.slice(0,40)}`, 'Listing paused on eBay', { productId: p.id });
+            }
+            // Log a sync heartbeat every time (so logs show monitoring is active)
+            if (!d.priceChanges?.length && !d.stockChanges?.length && !d.wentOos) {
+              addLog('sync', `Monitored: ${p.title.slice(0,40)}`, `No changes · last price $${(p.myPrice||0).toFixed(2)}`, { productId: p.id });
+            }
+          }
+        } catch(e) {
+          addLog('error', `Auto-sync failed: ${p.title.slice(0,40)}`, e.message, { productId: p.id });
+        }
         await new Promise(r => setTimeout(r, 800));
       }
-      S.lastAutoSync = new Date().toISOString(); save();
+
+      S.lastAutoSync = new Date().toISOString();
+      save();
       if (S.view === 'products') renderProducts();
-    }, 20 * 60 * 1000); // 20 min
+      if (S.view === 'logs') renderLogs();
+
+      // Summary toast if anything changed
+      if (totalPriceChanges || totalStockChanges || totalOos) {
+        const parts = [];
+        if (totalPriceChanges) parts.push(`${totalPriceChanges} price update${totalPriceChanges>1?'s':''}`);
+        if (totalStockChanges) parts.push(`${totalStockChanges} stock update${totalStockChanges>1?'s':''}`);
+        if (totalOos) parts.push(`${totalOos} went OOS`);
+        toast(`🔄 Auto-sync: ${parts.join(', ')}`, 'info', 5000);
+      }
+    }, 20 * 60 * 1000); // every 20 min
   }
 }
 
@@ -1794,6 +1926,8 @@ function updateStatus() {
 updateStatus();
 setupAutoSync();
 nav(S.view || 'import');
+// Auto-register with server monitor on every page load (keeps product list fresh)
+setTimeout(registerMonitor, 3000);
 </script>
 </body>
 </html>
