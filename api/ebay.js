@@ -329,6 +329,8 @@ async function ensureLocation(auth, sandbox=false) {
   });
   const cd = await cr.json().catch(() => ({}));
   console.log(`[location] create result: ${cr.status} ${JSON.stringify(cd).slice(0,200)}`);
+  // Wait for eBay to propagate the new location before using it
+  await sleep(3000);
   return key;
 }
 
@@ -916,8 +918,9 @@ module.exports = async (req, res) => {
         }
       }
 
-      // Bulk create offers (25 at a time)
+      // Bulk create offers (25 at a time), with one retry pass for location errors
       const allOfferIds = [];
+      const failedVariants = [];
       for (let i = 0; i < final.length; i += 25) {
         const batch = final.slice(i, i+25).map(v => buildOffer(v.sku, v.price, categoryId, policies, locationKey));
         const or = await fetch(`${EBAY_API}/sell/inventory/v1/bulk_create_offer`, {
@@ -927,16 +930,35 @@ module.exports = async (req, res) => {
         for (const resp of (od.responses || [])) {
           if (resp.offerId) { allOfferIds.push(resp.offerId); }
           else if (resp.errors?.length) {
+            const isLocationErr = (resp.errors[0]?.errorId === 25002);
             console.warn(`[offer] SKU ${resp.sku?.slice(-20)} error:`, JSON.stringify(resp.errors[0]).slice(0,200));
+            if (isLocationErr) failedVariants.push(final.find(v => v.sku === resp.sku));
           }
         }
         const batchOk = (od.responses||[]).filter(r=>r.offerId).length;
         const batchFail = (od.responses||[]).filter(r=>!r.offerId).length;
         console.log(`[push] offers batch ${Math.floor(i/25)+1}: ${batchOk} ok, ${batchFail} failed`);
         if (batchFail && batchOk === 0) {
-          // Return the first error to the frontend
           const firstErr = (od.responses||[]).find(r=>r.errors?.length);
-          if (firstErr) return res.status(400).json({ error: 'Offer creation failed', details: firstErr.errors[0] });
+          const isLocationErr = firstErr?.errors[0]?.errorId === 25002;
+          if (firstErr && !isLocationErr) return res.status(400).json({ error: 'Offer creation failed', details: firstErr.errors[0] });
+        }
+      }
+      // Retry location-failed offers after a delay
+      if (failedVariants.length) {
+        console.log(`[push] retrying ${failedVariants.length} location-failed offers after delay...`);
+        await sleep(4000);
+        for (let i = 0; i < failedVariants.length; i += 25) {
+          const batch = failedVariants.filter(Boolean).slice(i, i+25).map(v => buildOffer(v.sku, v.price, categoryId, policies, locationKey));
+          const or = await fetch(`${EBAY_API}/sell/inventory/v1/bulk_create_offer`, {
+            method: 'POST', headers: auth, body: JSON.stringify({ requests: batch }),
+          });
+          const od = await or.json();
+          for (const resp of (od.responses || [])) {
+            if (resp.offerId) { allOfferIds.push(resp.offerId); }
+            else console.warn(`[offer] retry failed SKU ${resp.sku?.slice(-20)}:`, JSON.stringify(resp.errors?.[0]).slice(0,150));
+          }
+          console.log(`[push] retry batch: ${(od.responses||[]).filter(r=>r.offerId).length} ok`);
         }
       }
 
