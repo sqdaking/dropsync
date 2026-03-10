@@ -312,12 +312,23 @@ async function resolvePolicies(token, supplied, sandbox=false) {
 async function ensureLocation(auth, sandbox=false) {
   const EBAY_API = getEbayUrls(sandbox).EBAY_API;
   const r = await fetch(`${EBAY_API}/sell/inventory/v1/location`, { headers: auth }).then(r => r.json()).catch(() => ({}));
-  if ((r.locations || []).length) return r.locations[0].merchantLocationKey;
+  if ((r.locations || []).length) {
+    const key = r.locations[0].merchantLocationKey;
+    console.log(`[location] found existing: ${key}`);
+    return key;
+  }
   const key = 'MainWarehouse';
-  await fetch(`${EBAY_API}/sell/inventory/v1/location/${key}`, {
+  const cr = await fetch(`${EBAY_API}/sell/inventory/v1/location/${key}`, {
     method: 'POST', headers: auth,
-    body: JSON.stringify({ location: { address: { country: 'US' } }, locationTypes: ['WAREHOUSE'], name: key }),
+    body: JSON.stringify({
+      location: { address: { addressLine1: '123 Main St', city: 'San Jose', stateOrProvince: 'CA', postalCode: '95125', country: 'US' } },
+      locationTypes: ['WAREHOUSE'],
+      name: key,
+      merchantLocationStatus: 'ENABLED',
+    }),
   });
+  const cd = await cr.json().catch(() => ({}));
+  console.log(`[location] create result: ${cr.status} ${JSON.stringify(cd).slice(0,200)}`);
   return key;
 }
 
