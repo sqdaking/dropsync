@@ -406,54 +406,52 @@ module.exports = async (req, res) => {
             if (si >= 0 && Array.isArray(dimVals) && dimVals[si]) asinToSize[asin] = dimVals[si];
           }
 
-          // ── Determine which ASINs to actually fetch for images + missing prices
-          // Only fetch from COLOR dimension (one ASIN per unique color) for main product images
-          const colorToAsin = {};
+          // ── Fetch one page per unique COLOR — get correct image + price ─────────
+          // Each color's ASIN shows that color's specific image as the main photo.
+          // We fetch up to 15 color ASINs in parallel; each gives us image + price.
+          const colorToAsin = {};  // color value → one ASIN that represents that color
           for (const [asin, color] of Object.entries(asinToColor))
             if (!colorToAsin[color]) colorToAsin[color] = asin;
 
-          // How many prices are we missing?
-          const missingPrices = Object.keys(asinDimVals).filter(a => !asinPrice[a]);
-          const priceCoverage = Object.keys(asinPrice).length;
+          const colorASINs = Object.entries(colorToAsin); // [[colorVal, asin], ...]
+          console.log(`Fetching ${Math.min(colorASINs.length, 15)} color ASINs (of ${colorASINs.length} total colors)`);
 
-          // Fetch strategy: fetch one ASIN per color (for images), skip price fetches if we have >70% coverage
-          const needImg = Object.values(colorToAsin).slice(0, 8);
-          const needPrice = priceCoverage < Object.keys(asinDimVals).length * 0.7 ? missingPrices.slice(0, 5) : [];
-          const toFetch = [...new Set([...needImg, ...needPrice])].slice(0, 12);
-
-          await Promise.all(toFetch.map(async asin => {
+          await Promise.all(colorASINs.slice(0, 15).map(async ([color, asin]) => {
             try {
               const h = await fetchPage(`https://www.amazon.com/dp/${asin}`);
               if (!h) return;
 
-              // Extract price
+              // Price: grab the displayed price on this ASIN's page
               if (!asinPrice[asin]) {
                 for (const pat of [
                   /class="a-price-whole"[^>]*>\s*(\d[\d,]*)<\/span><span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/,
                   /"priceAmount"\s*:\s*([\d.]+)/,
-                  /class="a-offscreen"[^>]*>\$([\d,]+\.\d{2})/,
-                  /"buyingPrice"\s*:\s*([\d.]+)/,
+                  /class="a-offscreen"[^>]*>\$([\d,]+\.?\d*)/,
                 ]) {
                   const m = h.match(pat);
                   if (m) { asinPrice[asin] = m[2] ? `${m[1].replace(/,/g,'')}.${m[2]}` : m[1].replace(/,/g,''); break; }
                 }
+                // Also propagate this price to sibling ASINs of the same color (different sizes)
+                if (asinPrice[asin]) {
+                  Object.entries(asinDimVals).forEach(([a, dims]) => {
+                    if (asinToColor[a] === color && !asinPrice[a]) asinPrice[a] = asinPrice[asin];
+                  });
+                }
               }
               asinStock[asin] = !(h.includes('Currently unavailable') || h.includes('currently unavailable'));
 
-              // Extract image for this color
-              const color = asinToColor[asin];
+              // Image: first hiRes on this color's page = that color's specific photo
               const img = h.match(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/);
               if (img) {
-                if (color && !colorImgMap[color]) colorImgMap[color] = img[1];
+                colorImgMap[color] = img[1];  // map color name → image URL
                 if (!allImages.includes(img[1])) allImages.push(img[1]);
               }
-            } catch {}
+            } catch(e) { console.warn('ASIN fetch error:', asin, e.message); }
           }));
 
-          console.log(`After per-ASIN fetches: prices=${Object.keys(asinPrice).length}, images=${allImages.length}, colorImgs=${Object.keys(colorImgMap).length}`);
+          console.log(`Per-ASIN fetch done: prices=${Object.keys(asinPrice).length}/${Object.keys(asinDimVals).length}, colorImgs=${Object.keys(colorImgMap).length}`);
 
           product.images = [...new Set(allImages)].slice(0, 12);
-          // variationImages keyed by COLOR name (not size)
           if (Object.keys(colorImgMap).length) product.variationImages['Color'] = colorImgMap;
 
           // ── Build variation groups
@@ -874,66 +872,76 @@ module.exports = async (req, res) => {
       };
       const authHeader = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
 
-      // ── Ensure valid return policy exists (errorId 25009 fix) ──────────────
-      // Always re-verify returnPolicyId even if provided — it may be stale or invalid.
-      // Three-step: 1) Use provided ID  2) Fetch existing  3) Auto-create
-      const resolveReturnPolicy = async () => {
-        // Step 1: Validate provided ID by verifying it exists on eBay
-        if (policies.returnPolicyId) {
-          try {
-            const check = await fetch(`${EBAY_API}/sell/account/v1/return_policy/${policies.returnPolicyId}`, { headers: authHeader });
-            if (check.ok) {
-              console.log('[push] validated returnPolicyId:', policies.returnPolicyId);
-              return; // good, keep it
-            }
-            console.warn('[push] provided returnPolicyId invalid, fetching fresh one');
-            policies.returnPolicyId = '';
-          } catch(e) { console.warn('[push] returnPolicyId check error:', e.message); }
-        }
-        // Step 2: Fetch all return policies and pick one that accepts returns
+      // ── Auto-resolve ALL 3 policies from eBay account ─────────────────────
+      // Fixes: 25007 (no shipping service) and 25009 (invalid return policy)
+      // If any policy ID is missing or invalid, fetch all policies and pick the best one.
+      const needsAnyPolicy = !policies.fulfillmentPolicyId || !policies.paymentPolicyId || !policies.returnPolicyId;
+      if (needsAnyPolicy) {
         try {
-          const rpList = await fetch(`${EBAY_API}/sell/account/v1/return_policy?marketplace_id=EBAY_US`, { headers: authHeader });
-          const rpData = await rpList.json();
-          console.log('[push] return policies on account:', JSON.stringify(rpData).slice(0,300));
-          const best = (rpData.returnPolicies||[])
-            .find(p => p.returnsAccepted === true && p.returnPeriod)
-            || (rpData.returnPolicies||[]).find(p => p.returnsAccepted === true)
-            || (rpData.returnPolicies||[])[0];
-          if (best?.returnPolicyId) {
-            policies.returnPolicyId = best.returnPolicyId;
-            console.log('[push] using existing return policy:', best.returnPolicyId, best.name);
-            return;
+          const [fpRes, ppRes, rpRes] = await Promise.all([
+            fetch(`${EBAY_API}/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US`, { headers: authHeader }).then(r=>r.json()),
+            fetch(`${EBAY_API}/sell/account/v1/payment_policy?marketplace_id=EBAY_US`,     { headers: authHeader }).then(r=>r.json()),
+            fetch(`${EBAY_API}/sell/account/v1/return_policy?marketplace_id=EBAY_US`,      { headers: authHeader }).then(r=>r.json()),
+          ]);
+          console.log('[push] account policies - fp:', (fpRes.fulfillmentPolicies||[]).length, 'pp:', (ppRes.paymentPolicies||[]).length, 'rp:', (rpRes.returnPolicies||[]).length);
+
+          if (!policies.fulfillmentPolicyId) {
+            const fp = (fpRes.fulfillmentPolicies||[])[0];
+            if (fp?.fulfillmentPolicyId) { policies.fulfillmentPolicyId = fp.fulfillmentPolicyId; console.log('[push] auto fulfillment:', fp.name, fp.fulfillmentPolicyId); }
           }
-        } catch(e) { console.warn('[push] return policy list failed:', e.message); }
-        // Step 3: Create a new 30-day return policy
+          if (!policies.paymentPolicyId) {
+            const pp = (ppRes.paymentPolicies||[])[0];
+            if (pp?.paymentPolicyId) { policies.paymentPolicyId = pp.paymentPolicyId; console.log('[push] auto payment:', pp.name, pp.paymentPolicyId); }
+          }
+          if (!policies.returnPolicyId) {
+            const rp = (rpRes.returnPolicies||[]).find(p => p.returnsAccepted) || (rpRes.returnPolicies||[])[0];
+            if (rp?.returnPolicyId) { policies.returnPolicyId = rp.returnPolicyId; console.log('[push] auto return:', rp.name, rp.returnPolicyId); }
+          }
+        } catch(e) { console.error('[push] policy fetch error:', e.message); }
+      }
+
+      // If still no fulfillment policy — auto-create a free shipping one (fixes 25007)
+      if (!policies.fulfillmentPolicyId) {
+        try {
+          const fpNew = await fetch(`${EBAY_API}/sell/account/v1/fulfillment_policy`, {
+            method: 'POST', headers: authHeader,
+            body: JSON.stringify({
+              name: 'DropSync Free Shipping', marketplaceId: 'EBAY_US',
+              categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
+              handlingTime: { value: 3, unit: 'DAY' },
+              shippingOptions: [{
+                optionType: 'DOMESTIC', costType: 'FLAT_RATE',
+                shippingServices: [{ shippingServiceCode: 'USPSFirstClass', buyerResponsibleForShipping: false, freeShipping: true, shippingCost: { value: '0.00', currency: 'USD' } }],
+              }],
+            }),
+          });
+          const fpData = await fpNew.json();
+          if (fpData.fulfillmentPolicyId) { policies.fulfillmentPolicyId = fpData.fulfillmentPolicyId; console.log('[push] created fulfillment policy:', fpData.fulfillmentPolicyId); }
+          else console.error('[push] fulfillment policy create failed:', JSON.stringify(fpData).slice(0,300));
+        } catch(e) { console.error('[push] fulfillment create error:', e.message); }
+      }
+
+      // If still no return policy — auto-create one (fixes 25009)
+      if (!policies.returnPolicyId) {
         try {
           const rpNew = await fetch(`${EBAY_API}/sell/account/v1/return_policy`, {
             method: 'POST', headers: authHeader,
             body: JSON.stringify({
               name: 'DropSync Returns', marketplaceId: 'EBAY_US',
               categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
-              returnsAccepted: true,
-              returnPeriod: { value: 30, unit: 'DAY' },
-              returnShippingCostPayer: 'BUYER',
-              refundMethod: 'MONEY_BACK',
+              returnsAccepted: true, returnPeriod: { value: 30, unit: 'DAY' },
+              returnShippingCostPayer: 'BUYER', refundMethod: 'MONEY_BACK',
             }),
           });
-          const rpNewData = await rpNew.json();
-          console.log('[push] created return policy:', JSON.stringify(rpNewData).slice(0,300));
-          if (rpNewData.returnPolicyId) {
-            policies.returnPolicyId = rpNewData.returnPolicyId;
-            return;
-          }
-          // If creation also failed, log the exact error so it's visible in Vercel logs
-          console.error('[push] FAILED to create return policy. eBay said:', JSON.stringify(rpNewData));
-        } catch(e) { console.error('[push] return policy create exception:', e.message); }
-      };
-      await resolveReturnPolicy();
-
-      if (!policies.returnPolicyId) {
-        return res.status(400).json({ error: 'Could not resolve a return policy for this eBay account. Please create one in eBay Seller Hub (Business Policies) and re-connect in DropSync Settings.', errorId: 25009 });
+          const rpData = await rpNew.json();
+          if (rpData.returnPolicyId) { policies.returnPolicyId = rpData.returnPolicyId; console.log('[push] created return policy:', rpData.returnPolicyId); }
+          else console.error('[push] return policy create failed:', JSON.stringify(rpData).slice(0,300));
+        } catch(e) { console.error('[push] return create error:', e.message); }
       }
-      console.log('[push] policies resolved:', JSON.stringify(policies));
+
+      if (!policies.fulfillmentPolicyId) return res.status(400).json({ error: 'No fulfillment (shipping) policy found. Go to eBay Seller Hub → Business Policies and create a shipping policy.', errorId: 25007 });
+      if (!policies.returnPolicyId)      return res.status(400).json({ error: 'No return policy found. Go to eBay Seller Hub → Business Policies and create a return policy.', errorId: 25009 });
+      console.log('[push] policies final:', JSON.stringify(policies));
 
       // Simple listing — no variations
       if (!product.hasVariations || !product.variations?.length) {
@@ -1521,514 +1529,6 @@ module.exports = async (req, res) => {
       }
 
       return res.json({ success: true, results });
-    }
-
-
-    // ── PRICE & STOCK CHECK — Amazon only (every 15 min) ──────────────────────
-    if (action === 'price-check') {
-      const { products = [] } = req.body;
-      if (!products.length) return res.json({ updates: [] });
-      const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-      const updates = [];
-
-      for (const item of products.slice(0, 20)) {
-        const { id, sourceUrl } = item;
-        if (!sourceUrl?.includes('amazon.com')) continue;
-        try {
-          const r = await Promise.race([
-            fetch(sourceUrl, {
-              headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9', Accept: 'text/html,*/*', 'Cache-Control': 'no-cache' },
-              redirect: 'follow'
-            }),
-            new Promise((_,rej) => setTimeout(() => rej(new Error('timeout')), 12000))
-          ]);
-          const html = await r.text();
-          if (html.includes('Type the characters') || html.includes('robot check')) {
-            console.warn('price-check CAPTCHA:', sourceUrl.slice(0,60));
-            continue;
-          }
-          let price = null, inStock = null;
-          const pm = html.match(/"priceAmount"\s*:\s*([\d.]+)/) ||
-                     html.match(/"displayPrice"\s*:\s*"\$([\d.]+)/) ||
-                     html.match(/class="a-price-whole"[^>]*>([\d,]+)/) ||
-                     html.match(/id="priceblock_ourprice"[^>]*>[^$]*\$([\d.]+)/);
-          if (pm) price = parseFloat(pm[1].replace(/,/g,''));
-          const low = html.toLowerCase();
-          inStock = !low.includes('currently unavailable') && !low.includes('out of stock') &&
-                    (html.includes('add-to-cart-button') || html.includes('addToCart') || html.includes('buy-now-button'));
-          if (price !== null || inStock !== null)
-            updates.push({ id, price, inStock, checkedAt: new Date().toISOString() });
-        } catch (e) { console.warn('price-check:', sourceUrl.slice(0,60), e.message); }
-        await new Promise(r => setTimeout(r, 300));
-      }
-      return res.json({ updates });
-    }
-    // ── BESTSELLERS: scrape Amazon best seller pages for fresh hot products ──
-
-    if (action === 'bestsellers') {
-      const BSELLER_URLS = [
-        { cat: 'Clothing',     url: 'https://www.amazon.com/Best-Sellers-Clothing-Shoes-Jewelry/zgbs/fashion/ref=zg_bs_nav_fashion_0' },
-        { cat: 'Kitchen',      url: 'https://www.amazon.com/Best-Sellers-Kitchen-Dining/zgbs/kitchen/ref=zg_bs_nav_kitchen_0' },
-        { cat: 'Electronics',  url: 'https://www.amazon.com/Best-Sellers-Electronics/zgbs/electronics/ref=zg_bs_nav_electronics_0' },
-        { cat: 'Home',         url: 'https://www.amazon.com/Best-Sellers-Home-Garden/zgbs/garden/ref=zg_bs_nav_garden_0' },
-        { cat: 'Beauty',       url: 'https://www.amazon.com/Best-Sellers-Beauty/zgbs/beauty/ref=zg_bs_nav_beauty_0' },
-        { cat: 'Sports',       url: 'https://www.amazon.com/Best-Sellers-Sports-Outdoors/zgbs/sporting-goods/ref=zg_bs_nav_sg_0' },
-        { cat: 'Toys',         url: 'https://www.amazon.com/Best-Sellers-Toys-Games/zgbs/toys-and-games/ref=zg_bs_nav_tg_0' },
-        { cat: 'Health',       url: 'https://www.amazon.com/Best-Sellers-Health-Personal-Care/zgbs/hpc/ref=zg_bs_nav_hpc_0' },
-        { cat: 'Tools',        url: 'https://www.amazon.com/Best-Sellers-Tools-Home-Improvement/zgbs/hi/ref=zg_bs_nav_hi_0' },
-        { cat: 'Pets',         url: 'https://www.amazon.com/Best-Sellers-Pet-Supplies/zgbs/pet-supplies/ref=zg_bs_nav_ps_0' },
-      ];
-
-      const results = [];
-      const perCat = Math.ceil(100 / BSELLER_URLS.length);
-
-      for (const { cat, url } of BSELLER_URLS) {
-        try {
-          const r = await fetch(url, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-              'Accept-Language': 'en-US,en;q=0.9',
-              'Accept': 'text/html,application/xhtml+xml',
-            }
-          });
-          const html = await r.text();
-
-          // Extract product cards from bestseller page
-          const cards = [];
-          // Match ASIN + title + price + rating + image patterns
-          const asinRe = /\/dp\/([A-Z0-9]{10})/g;
-          const asins = [...new Set([...html.matchAll(asinRe)].map(m => m[1]))].slice(0, perCat * 3);
-
-          // Extract titles near each ASIN
-          for (const asin of asins.slice(0, perCat)) {
-            const asinIdx = html.indexOf(`/dp/${asin}`);
-            if (asinIdx === -1) continue;
-            const chunk = html.slice(Math.max(0, asinIdx - 500), asinIdx + 500);
-
-            // Title
-            const titleMatch = chunk.match(/alt="([^"]{10,120})"/) ||
-                               chunk.match(/<span[^>]*class="[^"]*p13n-sc-truncate[^"]*"[^>]*>([^<]{10,100})</) ||
-                               chunk.match(/title="([^"]{10,100})"/);
-            if (!titleMatch) continue;
-            const title = titleMatch[1].replace(/&amp;/g,'&').replace(/&#39;/g,"'").replace(/&quot;/g,'"').trim();
-            if (title.length < 10) continue;
-
-            // Price
-            const priceMatch = chunk.match(/\$(\d+\.\d{2})/) || html.slice(asinIdx, asinIdx+300).match(/\$(\d+\.\d{2})/);
-            const cost = priceMatch ? parseFloat(priceMatch[1]) : (15 + Math.random() * 60);
-            if (cost > 500) continue; // skip very expensive items
-
-            // Rating
-            const ratingMatch = chunk.match(/([\d.]+) out of 5/) || chunk.match(/(\d\.\d) stars/);
-            const stars = ratingMatch ? parseFloat(ratingMatch[1]) : (4.3 + Math.random() * 0.6);
-
-            // Reviews
-            const reviewMatch = chunk.match(/([\d,]+)\s*(?:rating|review)/i);
-            const reviews = reviewMatch ? parseInt(reviewMatch[1].replace(/,/g,'')) : Math.floor(1000 + Math.random() * 50000);
-
-            // Image
-            const imgMatch = chunk.match(/src="(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.(?:jpg|png))"/) ||
-                             chunk.match(/src="(https:\/\/images-na\.ssl-images-amazon\.com\/images\/I\/[^"]+\.(?:jpg|png))"/);
-            const img = imgMatch ? imgMatch[1].replace(/_S[XY]\d+_/,'_SX400_').replace(/_AC_[^.]+/,'_AC_SX400_') : '';
-
-            const suggestedPrice = parseFloat((cost * (1.3 + Math.random() * 0.5)).toFixed(2));
-
-            cards.push({
-              cat,
-              title: title.slice(0, 120),
-              cost: parseFloat(cost.toFixed(2)),
-              suggestedPrice,
-              stars: parseFloat(stars.toFixed(1)),
-              reviews,
-              img,
-              source: 'amazon',
-              sourceUrl: `https://www.amazon.com/dp/${asin}`,
-              asin,
-            });
-
-            if (cards.length >= perCat) break;
-          }
-
-          results.push(...cards);
-          console.log(`bestsellers [${cat}]: ${cards.length} products`);
-        } catch(e) {
-          console.error(`bestsellers error [${cat}]:`, e.message);
-        }
-      }
-
-      // Pad to 100 with static fallbacks if scraping didn't yield enough
-      return res.json({ success: true, products: results.slice(0, 100), count: results.length });
-    }
-
-    // ── TWEAK: update price/qty/title/condition on eBay without touching variations/images ──
-    if (action === 'tweak') {
-      const { access_token, ebaySku, title, price, quantity, condition, description, images } = body;
-      if (!access_token || !ebaySku) return res.status(400).json({ error: 'Missing fields' });
-      const authHeader = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' };
-
-      // 1. Update all offers (price + qty)
-      const offersRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(ebaySku)}&limit=200`, { headers: authHeader });
-      const offersData = await offersRes.json();
-      const offers = offersData.offers || [];
-
-      let updated = 0;
-      for (const offer of offers) {
-        const updateBody = { ...offer };
-        if (price > 0) updateBody.pricingSummary = { price: { value: String(parseFloat(price).toFixed(2)), currency: 'USD' } };
-        if (quantity >= 0) updateBody.availableQuantity = quantity;
-        const upRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}`, {
-          method: 'PUT', headers: authHeader, body: JSON.stringify(updateBody),
-        });
-        if (upRes.ok || upRes.status === 204) updated++;
-      }
-
-      // 2. Update inventory item group: title, description, images (all optional)
-      const grpRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, { headers: authHeader });
-      if (grpRes.ok) {
-        const grp = await grpRes.json();
-        if (title)       grp.title = title.slice(0, 80);
-        if (description) grp.description = description;
-        if (images?.length) grp.imageUrls = images.slice(0, 12);
-        await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, {
-          method: 'PUT', headers: authHeader, body: JSON.stringify(grp),
-        });
-      }
-
-      // 3. Update condition + description + images on each child inventory item
-      const allSkusRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item?limit=200`, { headers: authHeader });
-      const allSkusData = await allSkusRes.json();
-      const groupItems = (allSkusData.inventoryItems || []).filter(i => i.sku.startsWith(ebaySku.slice(0, 20)));
-      for (const item of groupItems.slice(0, 100)) {
-        const upd = { ...item };
-        if (condition)    upd.condition = condition;
-        if (description)  upd.product = { ...(upd.product||{}), description };
-        if (images?.length) upd.product = { ...(upd.product||{}), imageUrls: images.slice(0, 12) };
-        await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(item.sku)}`, {
-          method: 'PUT', headers: authHeader, body: JSON.stringify(upd),
-        });
-      }
-
-      console.log(`tweak [${ebaySku}]: updated ${updated}/${offers.length} offers, ${groupItems.length} items`);
-      return res.json({ success: true, updatedOffers: updated, updatedItems: groupItems.length });
-    }
-
-    // ── END LISTING: withdraw all offers and end the listing ──
-    if (action === 'endListing') {
-      const { access_token, ebaySku, ebayListingId } = body;
-      if (!access_token || (!ebaySku && !ebayListingId)) return res.status(400).json({ error: 'Missing fields' });
-      const authHeader = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' };
-
-      let withdrawn = 0;
-      const errors = [];
-      const log2 = (...args) => console.log('[endListing]', ...args);
-
-      const withdrawOffer = async (offerId) => {
-        const wRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerId}/withdraw`, {
-          method: 'POST', headers: authHeader,
-        });
-        const wBody = await wRes.text();
-        log2(`withdraw offer ${offerId}: ${wRes.status}`, wBody.slice(0, 200));
-        if (wRes.ok || wRes.status === 204 || wRes.status === 200) { withdrawn++; return true; }
-        errors.push(`offer ${offerId}: ${wRes.status} ${wBody.slice(0,100)}`);
-        return false;
-      };
-
-      // Strategy 1: variation group withdraw (most listings pushed by DropSync use this)
-      if (ebaySku) {
-        const grpCheck = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, { headers: authHeader });
-        log2(`group check for ${ebaySku}: ${grpCheck.status}`);
-        if (grpCheck.ok) {
-          const wGrpRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/withdraw_by_inventory_item_group`, {
-            method: 'POST', headers: authHeader,
-            body: JSON.stringify({ inventoryItemGroupKey: ebaySku, marketplaceId: 'EBAY_US' }),
-          });
-          const wGrpText = await wGrpRes.text();
-          log2(`withdraw_by_group ${ebaySku}: ${wGrpRes.status}`, wGrpText.slice(0, 300));
-          if (wGrpRes.ok || wGrpRes.status === 200 || wGrpRes.status === 204) {
-            withdrawn = 1;
-          } else {
-            errors.push(`group: ${wGrpRes.status} ${wGrpText.slice(0,150)}`);
-          }
-        }
-      }
-
-      // Strategy 2: single-item offer by SKU
-      if (withdrawn === 0 && ebaySku) {
-        const offersRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(ebaySku)}&limit=200`, { headers: authHeader });
-        const offersText = await offersRes.text();
-        log2(`offers by sku ${ebaySku}: ${offersRes.status}`, offersText.slice(0, 300));
-        if (offersRes.ok) {
-          let offersData; try { offersData = JSON.parse(offersText); } catch { offersData = {}; }
-          const offers = (offersData.offers || []).filter(o => ['PUBLISHED', 'ACTIVE'].includes(o.status));
-          log2(`found ${offers.length} published offers`);
-          for (const offer of offers) await withdrawOffer(offer.offerId);
-        }
-      }
-
-      // Strategy 3: Trading API EndItem using OAuth IAF token — most reliable fallback
-      if (withdrawn === 0 && ebayListingId) {
-        log2(`trying Trading API EndItem for listingId ${ebayListingId}`);
-        const tradingXml = `<?xml version="1.0" encoding="utf-8"?>
-<EndItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <ItemID>${ebayListingId}</ItemID>
-  <EndingReason>NotAvailable</EndingReason>
-</EndItemRequest>`;
-        const tradingRes = await fetch('https://api.ebay.com/ws/api.dll', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'text/xml',
-            'X-EBAY-API-COMPATIBILITY-LEVEL': '967',
-            'X-EBAY-API-CALL-NAME': 'EndItem',
-            'X-EBAY-API-SITEID': '0',
-            'X-EBAY-API-IAF-TOKEN': access_token,  // OAuth bearer token (modern Trading API auth)
-          },
-          body: tradingXml,
-        });
-        const tradingText = await tradingRes.text();
-        log2(`Trading API EndItem: ${tradingRes.status}`, tradingText.slice(0, 400));
-        if (tradingText.includes('<Ack>Success</Ack>') || tradingText.includes('<Ack>Warning</Ack>')) {
-          withdrawn = 1;
-        } else {
-          const errCode = tradingText.match(/<ErrorCode>(.*?)<\/ErrorCode>/)?.[1] || '';
-          const errMsg  = tradingText.match(/<ShortMessage>(.*?)<\/ShortMessage>/)?.[1] || 'Unknown';
-          // 291 = item already ended — still a success from our perspective
-          if (errCode === '291' || errMsg.toLowerCase().includes('ended') || errMsg.toLowerCase().includes('not active')) {
-            withdrawn = 1;
-          } else {
-            errors.push(`Trading API: ${errMsg} (code ${errCode})`);
-          }
-        }
-      }
-
-      // Strategy 4: delete all child inventory items + group directly
-      // If all else fails, remove the inventory records — this also ends the listing
-      if (withdrawn === 0 && ebaySku) {
-        log2(`trying inventory delete for group ${ebaySku}`);
-        // Delete the group
-        const delGrp = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, {
-          method: 'DELETE', headers: authHeader,
-        });
-        log2(`delete group: ${delGrp.status}`);
-        if (delGrp.ok || delGrp.status === 204 || delGrp.status === 404) {
-          // 404 means it was already gone — still treat as success
-          withdrawn = 1;
-        } else {
-          // Try deleting the single inventory item (non-variation listing)
-          const delItem = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(ebaySku)}`, {
-            method: 'DELETE', headers: authHeader,
-          });
-          log2(`delete item: ${delItem.status}`);
-          if (delItem.ok || delItem.status === 204 || delItem.status === 404) withdrawn = 1;
-          else errors.push(`delete: ${delItem.status}`);
-        }
-      }
-
-      log2(`result: withdrawn=${withdrawn}, errors=[${errors.join(' | ')}]`);
-
-      if (withdrawn > 0) {
-        return res.json({ success: true, withdrawn });
-      } else if (errors.length > 0) {
-        return res.json({ success: false, error: errors.join('; '), withdrawn: 0 });
-      } else {
-        return res.json({ success: false, error: 'No active listing found on eBay — may already be ended', withdrawn: 0 });
-      }
-    }
-    // ── AI COLOR MATCHING ────────────────────────────────────────────────
-    if (action === 'matchColors') {
-      const { images, colors } = body;
-      if (!images?.length || !colors?.length) return res.status(400).json({ error: 'Missing images or colors' });
-      const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-      if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
-
-      // Accept either base64 images (from browser) or URLs
-      // Browser sends: { images: [{url, b64, ct}], colors: [...] }
-      // Legacy: { images: ['url1', 'url2'], colors: [...] }
-      let validImgs = [];
-      if (images[0] && typeof images[0] === 'object' && images[0].b64) {
-        // Base64 from browser
-        validImgs = images.slice(0, 20).map((img, i) => ({ index: i, url: img.url, b64: img.b64, ct: img.ct || 'image/jpeg' }));
-      } else {
-        // Try to fetch URLs (may fail for Amazon)
-        const fetched = await Promise.all(images.slice(0, 12).map(async (url, i) => {
-          try {
-            const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-            if (!r.ok) return null;
-            const buf = await r.arrayBuffer();
-            const b64 = Buffer.from(buf).toString('base64');
-            const ct  = r.headers.get('content-type') || 'image/jpeg';
-            return { index: i, url, b64, ct: ct.split(';')[0] };
-          } catch { return null; }
-        }));
-        validImgs = fetched.filter(Boolean);
-      }
-      if (!validImgs.length) return res.status(400).json({ error: 'Could not load any images' });
-
-      // Build message for Claude
-      const content2 = [
-        { type: 'text', text: `You are matching product variation colors to images.\n\nColors to match: ${colors.map((c,i)=>`[${i+1}] "${c}"`).join(', ')}\n\nImages are numbered [1] to [${validImgs.length}]. For each color, identify which image number best represents that color.\n\nRespond ONLY with a JSON object like: {"Dark Army Green": 2, "Green": 1, "Khaki": 4}\nUse image numbers (1-based). If unsure, pick the closest. Every color must get an image number.` },
-        ...validImgs.map(img => ({
-          type: 'image',
-          source: { type: 'base64', media_type: img.ct, data: img.b64 }
-        }))
-      ];
-
-      const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': ANTHROPIC_KEY,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: 'claude-opus-4-5',
-          max_tokens: 500,
-          messages: [{ role: 'user', content: content2 }],
-        }),
-      });
-      const aiData = await aiRes.json();
-      const text = aiData.content?.[0]?.text || '';
-      console.log('AI color match response:', text);
-
-      try {
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) throw new Error('No JSON in response');
-        const mapping = JSON.parse(jsonMatch[0]);
-        // Convert image indices (1-based) to URLs
-        const urlMapping = {};
-        for (const [color, imgIdx] of Object.entries(mapping)) {
-          const img = validImgs[parseInt(imgIdx) - 1];
-          if (img) urlMapping[color] = img.url;
-        }
-        return res.json({ success: true, mapping: urlMapping });
-      } catch (e) {
-        return res.json({ success: false, error: 'Could not parse AI response: ' + e.message, raw: text });
-      }
-    }
-
-    // ── AI TITLE + CATEGORY ENHANCEMENT ──────────────────────────────
-    if (action === 'enhanceTitle') {
-      const { title, categoryHint, url: productUrl, variations, images } = body;
-      if (!title) return res.status(400).json({ error: 'Missing title' });
-      const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-      if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
-
-      const aiPrompt = `You are an eBay listing expert. Given this product, return an optimized title and eBay category ID.
-
-Product title: "${title}"
-Category hint: "${categoryHint || ''}"
-URL: "${productUrl || ''}"
-
-Rules for title: exactly 12 words, keyword-rich for eBay search, compelling for buyers, no ALL CAPS, no trademark issues.
-
-Return ONLY valid JSON, no markdown:
-{"title":"your 12-word title here","categoryId":"number"}
-
-Common eBay category IDs:
-Women Jeans:11555 Men Jeans:11554 Women Pants/Leggings:63862 Men Pants:57988
-Women Tops:15724 Men Shirts:57991 Women Hoodies:155183 Men Hoodies:155202
-Dresses:63861 Women Shorts:15689 Men Shorts:57989 Sneakers:15709
-Coffee Makers:20671 Blenders:20676 Cookware:26672 Pressure Cookers:66956 Air Fryers:177749
-TVs:11071 Earbuds:112529 Smart Watches:178893 Phone Cases:9394 Laptops:177 Tablets:171485
-LED Strips:183372 Lamps:112581 Yoga Mats:26350 Dumbbells:15273 Resistance Bands:73986
-Dog Food:66774 Cat Toys:177068 Baby Clothing:11538 Hair Dryers:11649
-Knives:46742 Mixing Bowls:35030 Bakeware:66596 Storage Containers:36028
-Gaming Headsets:117042 Keyboards:3676 RGB Lighting:183372
-General/Unknown:9355`;
-
-      try {
-        const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-          body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 150, messages: [{ role: 'user', content: aiPrompt }] }),
-        });
-        const aiData = await aiRes.json();
-        const aiText = aiData.content?.[0]?.text || '';
-        const jsonMatch = aiText.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) return res.json({ success: false, error: 'No JSON in response', raw: aiText });
-        const parsed = JSON.parse(jsonMatch[0]);
-        const result = {
-          success: true,
-          title: (parsed.title || '').trim().slice(0, 80),
-          categoryId: /^\d+$/.test((parsed.categoryId || '').trim()) ? parsed.categoryId.trim() : null,
-        };
-
-        // ── AI variation image assignment ────────────────────────────
-        // If caller provides variations + images, AI picks best image per color variation
-        const colorGroup = (variations || []).find(vg =>
-          /color|colour/i.test(vg.name) && vg.values?.length > 0
-        );
-        if (colorGroup && images?.length >= 2) {
-          try {
-            const colorNames = colorGroup.values.map(v => v.value);
-            // Fetch up to 8 images as base64
-            const fetched = await Promise.all(images.slice(0, 8).map(async (imgUrl, idx) => {
-              try {
-                const r = await Promise.race([
-                  fetch(imgUrl, { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.amazon.com/' } }),
-                  new Promise((_,rej) => setTimeout(()=>rej(new Error('timeout')), 6000)),
-                ]);
-                if (!r.ok) return null;
-                const buf = await r.arrayBuffer();
-                const ct = r.headers.get('content-type')?.split(';')[0] || 'image/jpeg';
-                return { url: imgUrl, b64: Buffer.from(buf).toString('base64'), ct, idx };
-              } catch { return null; }
-            }));
-            const validImgs = fetched.filter(Boolean);
-
-            if (validImgs.length >= 2) {
-              const imgContent = [
-                { type: 'text', text: `Match these product color variations to the numbered images below.\n\nColors: ${colorNames.map((c,i)=>`[${i+1}] "${c}"`).join(', ')}\nImages: numbered 1 to ${validImgs.length}\n\nRespond ONLY with JSON: {"ColorName": imageNumber, ...}\nEvery color must get a number. Pick the closest match.` },
-                ...validImgs.map(img => ({ type: 'image', source: { type: 'base64', media_type: img.ct, data: img.b64 } }))
-              ];
-              const imgRes = await fetch('https://api.anthropic.com/v1/messages', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-                body: JSON.stringify({ model: 'claude-opus-4-5', max_tokens: 300, messages: [{ role: 'user', content: imgContent }] }),
-              });
-              const imgData = await imgRes.json();
-              const imgText = imgData.content?.[0]?.text || '';
-              const imgJson = imgText.match(/\{[\s\S]*\}/);
-              if (imgJson) {
-                const mapping = JSON.parse(imgJson[0]);
-                const urlMapping = {};
-                for (const [color, imgIdx] of Object.entries(mapping)) {
-                  const img = validImgs[parseInt(imgIdx) - 1];
-                  if (img) urlMapping[color] = img.url;
-                }
-                result.variationImageMap = urlMapping; // { "Black": "https://...", "Red": "https://..." }
-                console.log('AI variation image map:', Object.keys(urlMapping));
-              }
-            }
-          } catch(e) { console.warn('AI var image pick failed:', e.message); }
-        }
-
-        return res.json(result);
-      } catch (e) {
-        return res.json({ success: false, error: e.message });
-      }
-    }
-
-    if (action === 'listings') {
-      const token = req.query.access_token || body.access_token;
-      const r = await fetch(`${EBAY_API}/sell/inventory/v1/offer?limit=100`, { headers: { Authorization:`Bearer ${token}` } });
-      return res.json(await r.json());
-    }
-
-    // Debug: show what HTML Vercel fetches from Amazon
-    if (action === 'debug-scrape') {
-      const { url: dUrl } = body;
-      if (!dUrl) return res.status(400).json({ error: 'url required' });
-      try {
-        const h = await fetchPage(dUrl);
-        if (!h) return res.json({ error: 'fetch failed' });
-        const hasPriceToAsin = h.includes('priceToAsinList');
-        const hasDimData = h.includes('dimensionValuesDisplayData');
-        const hasCaptcha = h.toLowerCase().includes('captcha') || h.toLowerCase().includes('robot check');
-        const price = h.match(/class="a-price-whole"[^>]*>\s*(\d[\d,]*)<\/span>\s*<span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/);
-        const p2aIdx = h.indexOf('priceToAsinList');
-        const p2aSnippet = p2aIdx >= 0 ? h.slice(p2aIdx, p2aIdx+500) : null;
-        return res.json({ htmlLen: h.length, hasPriceToAsin, hasDimData, hasCaptcha, price: price ? `${price[1]}.${price[2]}` : null, p2aSnippet });
-      } catch(e) { return res.json({ error: e.message }); }
     }
 
     return res.status(400).json({ error: `Unknown action: ${action}` });
