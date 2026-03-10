@@ -1142,41 +1142,66 @@ module.exports = async (req, res) => {
 
     // ── END LISTING ───────────────────────────────────────────────────────────
     if (action === 'endListing') {
-      const { access_token, ebaySku } = body;
+      const { access_token, ebaySku, ebayListingId } = body;
       const sandbox = body.sandbox === true || body.sandbox === 'true';
       const EBAY_API = getEbayUrls(sandbox).EBAY_API;
       const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
       let ended = 0;
+      const variantSkus = [];
 
-      // 1. Get group → find all variant SKUs
+      // Strategy A: get group to find all variant SKUs
       const groupRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
-      const variantSkus = groupRes.variantSKUs || [];
+      if (groupRes.variantSKUs?.length) variantSkus.push(...groupRes.variantSKUs);
       console.log(`[end] group=${ebaySku} variantSkus=${variantSkus.length}`);
 
-      // 2. Withdraw all published offers for each variant SKU
+      // Strategy B: if group returned no SKUs, page through all offers and find ones
+      // belonging to this listing via ebayListingId
+      if (!variantSkus.length) {
+        console.log('[end] group empty — scanning offers by listing ID:', ebayListingId);
+        let offset = 0;
+        while (true) {
+          const ol = await fetch(`${EBAY_API}/sell/inventory/v1/offer?limit=100&offset=${offset}`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
+          const offers = ol.offers || [];
+          if (!offers.length) break;
+          for (const o of offers) {
+            // Match by listing ID or by SKU prefix
+            const matchesListing = ebayListingId && o.listing?.listingId === String(ebayListingId);
+            const matchesSku = o.sku?.startsWith(ebaySku.split('-').slice(0,3).join('-'));
+            if (matchesListing || matchesSku) {
+              if (!variantSkus.includes(o.sku)) variantSkus.push(o.sku);
+            }
+          }
+          if (offers.length < 100) break;
+          offset += 100;
+        }
+        console.log(`[end] scan found ${variantSkus.length} variant skus`);
+      }
+
+      // Withdraw + delete all offers for each variant SKU
       const allSkus = variantSkus.length ? variantSkus : [ebaySku];
       for (const sku of allSkus) {
         const ol = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
         for (const offer of (ol.offers||[])) {
           if (offer.status === 'PUBLISHED') {
-            await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}/withdraw`, { method: 'POST', headers: auth });
-            ended++;
+            const wr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}/withdraw`, { method: 'POST', headers: auth });
+            const wb = await wr.json().catch(()=>({}));
+            console.log(`[end] withdraw offer ${offer.offerId}:`, wr.status, JSON.stringify(wb).slice(0,100));
+            if (wr.status < 300) ended++;
           }
-          // Also delete the offer entirely
           await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}`, { method: 'DELETE', headers: auth }).catch(()=>{});
         }
       }
 
-      // 3. Delete inventory item group
+      // Delete inventory item group
       await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, { method: 'DELETE', headers: auth }).catch(()=>{});
 
-      // 4. Delete all variant inventory items (batch)
+      // Delete all variant inventory items in batches of 25
       for (let i = 0; i < variantSkus.length; i += 25) {
         const batch = variantSkus.slice(i, i+25);
         await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item?sku=${batch.map(encodeURIComponent).join(',')}`, { method: 'DELETE', headers: auth }).catch(()=>{});
       }
 
-      console.log(`[end] done ended=${ended} deleted=${variantSkus.length} items`);
+      console.log(`[end] done ended=${ended} deletedItems=${variantSkus.length}`);
       return res.json({ success: true, ended, deleted: variantSkus.length });
     }
 
