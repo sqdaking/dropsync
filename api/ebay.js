@@ -340,11 +340,36 @@ module.exports = async (req, res) => {
         body: `grant_type=authorization_code&code=${encodeURIComponent(req.query.code)}&redirect_uri=${encodeURIComponent(REDIRECT)}`,
       });
       const d = await r.json();
+      if (!d.access_token) {
+        console.error('[callback] eBay token exchange failed:', JSON.stringify(d).slice(0,300));
+        return res.setHeader('Content-Type','text/html').send(
+          `<!DOCTYPE html><html><body><p style="font-family:sans-serif;padding:40px;color:red">
+            ❌ eBay auth failed: ${d.error || d.error_description || JSON.stringify(d).slice(0,200)}
+          </p></body></html>`
+        );
+      }
+      const payload = {
+        type: 'ebay_auth',
+        token: d.access_token,
+        refresh: d.refresh_token,
+        expiry: Date.now() + ((d.expires_in||7200)-120)*1000
+      };
       return res.setHeader('Content-Type','text/html').send(
-        `<!DOCTYPE html><html><body><script>
-          window.opener?.postMessage({type:'ebay_auth',token:'${d.access_token}',refresh:'${d.refresh_token}',expiry:${Date.now()+((d.expires_in||7200)-120)*1000}},'*');
-          document.body.innerHTML='<p style="font-family:sans-serif;padding:40px">✅ Connected to eBay! You can close this window.</p>';
-        </script></body></html>`
+        `<!DOCTYPE html><html><body>
+        <p style="font-family:sans-serif;padding:40px">✅ Connected to eBay! Closing…</p>
+        <script>
+          var payload = ${JSON.stringify(payload)};
+          // Try postMessage to opener first
+          if (window.opener) {
+            window.opener.postMessage(payload, '*');
+            setTimeout(function(){ window.close(); }, 800);
+          } else {
+            // Fallback: store in localStorage then redirect back to app
+            try { localStorage.setItem('ebay_auth_pending', JSON.stringify(payload)); } catch(e){}
+            document.querySelector('p').textContent = '✅ Connected! Please close this window and return to DropSync.';
+          }
+        </script>
+        </body></html>`
       );
     }
 
