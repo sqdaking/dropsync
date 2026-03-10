@@ -1143,16 +1143,41 @@ module.exports = async (req, res) => {
     // ── END LISTING ───────────────────────────────────────────────────────────
     if (action === 'endListing') {
       const { access_token, ebaySku } = body;
+      const sandbox = body.sandbox === true || body.sandbox === 'true';
+      const EBAY_API = getEbayUrls(sandbox).EBAY_API;
       const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
-      const ol = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(ebaySku)}`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
       let ended = 0;
-      for (const offer of (ol.offers||[])) {
-        if (offer.status === 'PUBLISHED') {
-          await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}/withdraw`, { method: 'POST', headers: auth });
-          ended++;
+
+      // 1. Get group → find all variant SKUs
+      const groupRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
+      const variantSkus = groupRes.variantSKUs || [];
+      console.log(`[end] group=${ebaySku} variantSkus=${variantSkus.length}`);
+
+      // 2. Withdraw all published offers for each variant SKU
+      const allSkus = variantSkus.length ? variantSkus : [ebaySku];
+      for (const sku of allSkus) {
+        const ol = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
+        for (const offer of (ol.offers||[])) {
+          if (offer.status === 'PUBLISHED') {
+            await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}/withdraw`, { method: 'POST', headers: auth });
+            ended++;
+          }
+          // Also delete the offer entirely
+          await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}`, { method: 'DELETE', headers: auth }).catch(()=>{});
         }
       }
-      return res.json({ success: true, ended });
+
+      // 3. Delete inventory item group
+      await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, { method: 'DELETE', headers: auth }).catch(()=>{});
+
+      // 4. Delete all variant inventory items (batch)
+      for (let i = 0; i < variantSkus.length; i += 25) {
+        const batch = variantSkus.slice(i, i+25);
+        await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item?sku=${batch.map(encodeURIComponent).join(',')}`, { method: 'DELETE', headers: auth }).catch(()=>{});
+      }
+
+      console.log(`[end] done ended=${ended} deleted=${variantSkus.length} items`);
+      return res.json({ success: true, ended, deleted: variantSkus.length });
     }
 
     return res.status(400).json({ error: `Unknown action: ${action}` });
