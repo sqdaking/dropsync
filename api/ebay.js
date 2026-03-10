@@ -1,10 +1,18 @@
 // DropSync AI Agent — Amazon → eBay Dropshipping Backend
 // Clean architecture: per-ASIN prices+images, AI category detection, auto policies
 
-const EBAY_API  = 'https://api.ebay.com';
-const EBAY_AUTH = 'https://auth.ebay.com/oauth2/authorize';
-const EBAY_TOK  = 'https://api.ebay.com/identity/v1/oauth2/token';
-const SCOPES    = 'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.inventory https://api.ebay.com/oauth/api_scope/sell.account https://api.ebay.com/oauth/api_scope/sell.fulfillment https://api.ebay.com/oauth/api_scope/commerce.taxonomy.readonly';
+const SCOPES = 'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.inventory https://api.ebay.com/oauth/api_scope/sell.account https://api.ebay.com/oauth/api_scope/sell.fulfillment https://api.ebay.com/oauth/api_scope/commerce.taxonomy.readonly';
+
+function getEbayUrls(sandbox) {
+  return {
+    EBAY_API:     sandbox ? 'https://api.sandbox.ebay.com'                           : 'https://api.ebay.com',
+    EBAY_AUTH:    sandbox ? 'https://auth.sandbox.ebay.com/oauth2/authorize'         : 'https://auth.ebay.com/oauth2/authorize',
+    EBAY_TOK:     sandbox ? 'https://api.sandbox.ebay.com/identity/v1/oauth2/token'  : 'https://api.ebay.com/identity/v1/oauth2/token',
+    CLIENT_ID:    sandbox ? process.env.EBAY_SANDBOX_CLIENT_ID     : process.env.EBAY_CLIENT_ID,
+    CLIENT_SECRET:sandbox ? process.env.EBAY_SANDBOX_CLIENT_SECRET : process.env.EBAY_CLIENT_SECRET,
+    REDIRECT:     sandbox ? (process.env.EBAY_SANDBOX_REDIRECT_URI || process.env.EBAY_REDIRECT_URI) : process.env.EBAY_REDIRECT_URI,
+  };
+}
 
 const UA_LIST = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -326,15 +334,20 @@ module.exports = async (req, res) => {
 
     // ── AUTH ──────────────────────────────────────────────────────────────────
     if (action === 'auth') {
-      const REDIRECT = process.env.EBAY_REDIRECT_URI || `${req.headers['x-forwarded-proto']||'https'}://${req.headers.host}/api/ebay?action=callback`;
-      const url = `${EBAY_AUTH}?client_id=${process.env.EBAY_CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code&scope=${encodeURIComponent(SCOPES)}`;
-      return res.json({ url });
+      const sandbox = req.query.sandbox === 'true';
+      const E = getEbayUrls(sandbox);
+      const REDIRECT = E.REDIRECT || `${req.headers['x-forwarded-proto']||'https'}://${req.headers.host}/api/ebay?action=callback`;
+      const url = `${E.EBAY_AUTH}?client_id=${E.CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code&scope=${encodeURIComponent(SCOPES)}&state=${sandbox?'sandbox':'production'}`;
+      return res.json({ url, sandbox });
     }
 
     if (action === 'callback') {
-      const REDIRECT = process.env.EBAY_REDIRECT_URI || `${req.headers['x-forwarded-proto']||'https'}://${req.headers.host}/api/ebay?action=callback`;
-      const creds = Buffer.from(`${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`).toString('base64');
-      const r = await fetch(EBAY_TOK, {
+      // Detect sandbox from state param passed through OAuth flow
+      const sandbox = req.query.state === 'sandbox' || req.query.sandbox === 'true' || process.env.EBAY_SANDBOX === 'true';
+      const E = getEbayUrls(sandbox);
+      const REDIRECT = E.REDIRECT || `${req.headers['x-forwarded-proto']||'https'}://${req.headers.host}/api/ebay?action=callback`;
+      const creds = Buffer.from(`${E.CLIENT_ID}:${E.CLIENT_SECRET}`).toString('base64');
+      const r = await fetch(E.EBAY_TOK, {
         method: 'POST',
         headers: { Authorization: `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
         body: `grant_type=authorization_code&code=${encodeURIComponent(req.query.code)}&redirect_uri=${encodeURIComponent(REDIRECT)}`,
@@ -374,8 +387,10 @@ module.exports = async (req, res) => {
     }
 
     if (action === 'refresh') {
-      const creds = Buffer.from(`${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`).toString('base64');
-      const r = await fetch(EBAY_TOK, {
+      const sandbox = (body.sandbox || req.query.sandbox) === 'true';
+      const E = getEbayUrls(sandbox);
+      const creds = Buffer.from(`${E.CLIENT_ID}:${E.CLIENT_SECRET}`).toString('base64');
+      const r = await fetch(E.EBAY_TOK, {
         method: 'POST',
         headers: { Authorization: `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
         body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(body.refresh_token)}&scope=${encodeURIComponent(SCOPES)}`,
