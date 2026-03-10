@@ -879,6 +879,7 @@ module.exports = async (req, res) => {
       for (let attempt = 1; attempt <= 3 && !groupOk; attempt++) {
         const colorUrlList = Object.values(colorImgUrls).filter(Boolean).slice(0,12);
         const groupImageUrls = colorUrlList.length ? colorUrlList : product.images.slice(0, 12);
+        const variesBySpecs = Object.entries(varAspects).map(([name, values]) => ({ name, values }));
         const groupBody = {
             inventoryItemGroupKey: groupSku,
             title: listingTitle,
@@ -886,7 +887,10 @@ module.exports = async (req, res) => {
             imageUrls: groupImageUrls,
             variantSKUs: final.map(v => v.sku),
             aspects: varAspects,
-            variesBy: Object.keys(varAspects),
+            variesBy: {
+              aspectsImageVariesBy: colorGroup ? ['Color'] : [],
+              specifications: variesBySpecs,
+            },
         };
         console.log('[push] group body keys:', Object.keys(groupBody), 'variantSKUs:', groupBody.variantSKUs.length, 'variesBy:', groupBody.variesBy);
         const gr = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(groupSku)}`, {
