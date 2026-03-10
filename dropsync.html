@@ -594,7 +594,9 @@ function renderProdRows(prods) {
         ${img ? `<img src="${img}" class="prod-thumb">` : `<div class="prod-thumb" style="display:flex;align-items:center;justify-content:center;font-size:20px">📦</div>`}
         <div style="min-width:0">
           <div class="prod-title" title="${p.title}">${p.title}</div>
-          <div class="prod-meta">${p.source} · ${p.asin || ''}</div>
+          <div class="prod-meta">
+            ${p.sourceUrl ? `<a href="${p.sourceUrl}" target="_blank" style="color:var(--accent);text-decoration:none" title="View on Amazon">↗ Amazon</a> · ` : ''}${p.source} · ${p.asin || ''}
+          </div>
         </div>
       </td>
       <td class="pmono">$${(p.price||0).toFixed(2)}</td>
@@ -696,32 +698,50 @@ function confirmEnd(pid) {
   const p = S.products.find(x => x.id === pid);
   if (!p) return;
   modal('End Listing',
-    `<p style="font-size:14px;line-height:1.6">End eBay listing for <strong>${p.title.slice(0,60)}</strong>?<br><br>
-    The product will remain in DropSync as a draft.</p>`,
+    `<p style="font-size:14px;line-height:1.6">End eBay listing for <strong>${p.title.slice(0,60)}</strong>?</p>`,
     `<button class="btn btn-outline" onclick="closeModal()">Cancel</button>
-     <button class="btn btn-danger" onclick="endListing('${pid}')">End Listing</button>`
+     <button class="btn btn-outline btn-sm" onclick="endListing('${pid}', false)">End — Keep Draft</button>
+     <button class="btn btn-danger" onclick="endListing('${pid}', true)">End & Delete</button>`
   );
 }
 
-async function endListing(pid) {
+async function endListing(pid, deleteAfter = false) {
   closeModal();
   const p = S.products.find(x => x.id === pid);
   if (!p) return;
   try {
     const token = await ensureToken();
-    await fetch(`${S.backendUrl}/api/ebay?action=endListing`, {
+    const sandbox = S.sandboxMode || false;
+    const r = await fetch(`${S.backendUrl}/api/ebay?action=endListing`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku }),
+      body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, sandbox }),
     });
-    p.status = 'ended'; p.ebayListingId = '';
+    const d = await r.json();
+    if (!d.success) throw new Error(d.error || 'End listing failed');
+    if (deleteAfter) {
+      S.products = S.products.filter(x => x.id !== pid);
+      toast(`Listing ended & deleted (${d.ended || 0} offers removed)`, 'info');
+    } else {
+      p.status = 'ended'; p.ebayListingId = '';
+      toast(`Listing ended (${d.ended || 0} offers removed)`, 'info');
+    }
     save(); renderProducts();
-    toast('Listing ended', 'info');
   } catch (e) { toast(e.message, 'error'); }
 }
 
 function deleteProduct(pid) {
-  if (!confirm('Delete this product from DropSync?')) return;
-  S.products = S.products.filter(x => x.id !== pid); save(); renderProducts();
+  const p = S.products.find(x => x.id === pid);
+  if (!p) return;
+  if (p.status === 'listed') {
+    modal('Delete Product',
+      `<p style="font-size:14px;line-height:1.6">This product is <strong>live on eBay</strong>. Delete from DropSync and end the eBay listing?</p>`,
+      `<button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+       <button class="btn btn-danger" onclick="closeModal();endListing('${pid}', true)">End eBay & Delete</button>`
+    );
+  } else {
+    if (!confirm('Delete this product from DropSync?')) return;
+    S.products = S.products.filter(x => x.id !== pid); save(); renderProducts();
+  }
 }
 
 // ══════════════════════════════════════════════════════
