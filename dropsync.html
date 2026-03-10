@@ -492,9 +492,9 @@ async function doPush() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token: token, product: prod, sandbox: S.sandboxMode || false,
-        fulfillmentPolicyId: S.fulfillmentPolicyId,
-        paymentPolicyId: S.paymentPolicyId,
-        returnPolicyId: S.returnPolicyId,
+        fulfillmentPolicyId: S.sandboxMode ? '' : S.fulfillmentPolicyId,
+        paymentPolicyId:     S.sandboxMode ? '' : S.paymentPolicyId,
+        returnPolicyId:      S.sandboxMode ? '' : S.returnPolicyId,
       }),
     });
     const d = await r.json();
@@ -640,7 +640,7 @@ async function pushExisting(pid) {
     const token = await ensureToken();
     const r = await fetch(`${S.backendUrl}/api/ebay?action=push`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ access_token: token, product: p, sandbox: S.sandboxMode || false, fulfillmentPolicyId: S.fulfillmentPolicyId, paymentPolicyId: S.paymentPolicyId, returnPolicyId: S.returnPolicyId }),
+      body: JSON.stringify({ access_token: token, product: p, sandbox: S.sandboxMode || false, fulfillmentPolicyId: S.sandboxMode ? '' : S.fulfillmentPolicyId, paymentPolicyId: S.sandboxMode ? '' : S.paymentPolicyId, returnPolicyId: S.sandboxMode ? '' : S.returnPolicyId }),
     });
     const d = await r.json();
     if (!d.success) throw new Error(d.error);
