@@ -734,9 +734,19 @@ function renderSettings() {
       <div class="card">
         <div class="card-header"><span class="card-title">⚡ eBay Connection</span></div>
         <div class="card-body">
+          <div style="margin-bottom:14px;display:flex;align-items:center;gap:12px">
+            <label style="font-size:13px;font-weight:600;color:var(--text2)">Environment:</label>
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
+              <input type="radio" name="ebay_env" value="production" ${!S.sandboxMode ? 'checked' : ''} onchange="setSandboxMode(false)"> Production
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
+              <input type="radio" name="ebay_env" value="sandbox" ${S.sandboxMode ? 'checked' : ''} onchange="setSandboxMode(true)"> Sandbox
+            </label>
+            ${S.sandboxMode ? `<span style="background:#f59e0b;color:#000;font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px">SANDBOX</span>` : ''}
+          </div>
           <div id="ebay-conn-status" style="margin-bottom:16px">
             ${S.token
-              ? `<div class="status-bar success">✅ Connected to eBay · token expires ${new Date(S.tokenExpiry).toLocaleTimeString()}</div>`
+              ? `<div class="status-bar success">✅ Connected to eBay${S.sandboxMode?' (Sandbox)':''} · token expires ${new Date(S.tokenExpiry).toLocaleTimeString()}</div>`
               : `<div class="status-bar info">Not connected. Click below to authorize eBay.</div>`}
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -876,10 +886,17 @@ function savePricingDefaults() {
   save(); toast('Pricing saved', 'success');
 }
 
+function setSandboxMode(val) {
+  S.sandboxMode = val;
+  if (S.token) { S.token = null; S.refreshToken = null; S.tokenExpiry = null; }
+  save(); renderSettings(); updateStatus();
+  toast(val ? "🟡 Switched to Sandbox mode" : "🟢 Switched to Production mode", 'info');
+}
+
 async function connectEbay() {
   if (!S.backendUrl) { toast('Set Backend URL first in Settings', 'error'); return; }
   try {
-    const r = await fetch(`${S.backendUrl}/api/ebay?action=auth`);
+    const r = await fetch(`${S.backendUrl}/api/ebay?action=auth&sandbox=${S.sandboxMode?'true':'false'}`);
     const d = await r.json();
     if (!d.url) throw new Error('No auth URL returned from backend');
     
