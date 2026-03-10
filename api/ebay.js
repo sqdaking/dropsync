@@ -686,6 +686,7 @@ module.exports = async (req, res) => {
       // sizePrices: sizeName → price (fetched from best-coverage color, applies to all colors at that size)
       const comboAsin  = product.comboAsin  || {};
       const sizePrices = product.sizePrices || {};
+      console.log(`[push] comboAsin entries=${Object.keys(comboAsin).length} sizePrices entries=${Object.keys(sizePrices).length}`);
 
       if (colorGroup && sizeGroup) {
         for (const cv of colorGroup.values.filter(v => v.enabled !== false)) {
@@ -782,9 +783,19 @@ module.exports = async (req, res) => {
       console.log(`[push] inventory items: ${okInv}/${final.length}`);
 
       // PUT inventory_item_group
+      // Color must be FIRST in variesBy so eBay treats it as primary (image-bearing) variation
       const varAspects = {};
-      if (colorGroup) varAspects['Color'] = colorGroup.values.map(v => v.value);
+      if (colorGroup) varAspects['Color'] = colorGroup.values.filter(v=>v.enabled!==false).map(v => v.value);
       if (sizeGroup)  varAspects['Size']  = sizeGroup.values.map(v => v.value);
+
+      // Build color→imageUrl map for eBay to display correct image per color swatch
+      const colorImgUrls = colorGroup
+        ? Object.fromEntries(
+            colorGroup.values
+              .filter(v => colorImgs[v.value])
+              .map(v => [v.value, colorImgs[v.value]])
+          )
+        : {};
 
       let groupOk = false;
       for (let attempt = 1; attempt <= 3 && !groupOk; attempt++) {
@@ -795,7 +806,9 @@ module.exports = async (req, res) => {
             description: product.description || listingTitle,
             imageUrls: product.images.slice(0, 12),
             variantSKUs: final.map(v => v.sku),
-            aspects: varAspects, variesBy: Object.keys(varAspects),
+            aspects: varAspects,
+            variesBy: Object.keys(varAspects),  // Color first = primary variation on eBay
+            ...(Object.keys(colorImgUrls).length ? { imageUrls: Object.values(colorImgUrls).filter(Boolean).slice(0,12) } : {}),
           }),
         });
         if (gr.ok || gr.status === 204) { groupOk = true; console.log('[push] group ok'); }
