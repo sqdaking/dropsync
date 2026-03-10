@@ -1,6 +1,10 @@
 {
-  "routes": [
-    { "src": "/", "dest": "/dropsync.html" },
-    { "src": "/api/ebay(.*)", "dest": "/api/ebay.js" }
-  ]
+    "routes": [
+          { "src": "/", "dest": "/dropsync.html" },
+          { "src": "/api/ebay(.*)", "dest": "/api/ebay.js" },
+          { "src": "/api/monitor(.*)", "dest": "/api/monitor.js" }
+    ],
+    "crons": [
+          { "path": "/api/monitor?action=run", "schedule": "0 * * * *" }
+    ]
 }
