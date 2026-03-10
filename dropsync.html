@@ -491,7 +491,7 @@ async function doPush() {
     const r = await fetch(`${S.backendUrl}/api/ebay?action=push`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        access_token: token, product: prod,
+        access_token: token, product: prod, sandbox: S.sandboxMode || false,
         fulfillmentPolicyId: S.fulfillmentPolicyId,
         paymentPolicyId: S.paymentPolicyId,
         returnPolicyId: S.returnPolicyId,
@@ -640,7 +640,7 @@ async function pushExisting(pid) {
     const token = await ensureToken();
     const r = await fetch(`${S.backendUrl}/api/ebay?action=push`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ access_token: token, product: p, fulfillmentPolicyId: S.fulfillmentPolicyId, paymentPolicyId: S.paymentPolicyId, returnPolicyId: S.returnPolicyId }),
+      body: JSON.stringify({ access_token: token, product: p, sandbox: S.sandboxMode || false, fulfillmentPolicyId: S.fulfillmentPolicyId, paymentPolicyId: S.paymentPolicyId, returnPolicyId: S.returnPolicyId }),
     });
     const d = await r.json();
     if (!d.success) throw new Error(d.error);
@@ -980,7 +980,7 @@ async function loadPolicies() {
     const token = await ensureToken();
     const r = await fetch(`${S.backendUrl}/api/ebay?action=policies`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ access_token: token }),
+      body: JSON.stringify({ access_token: token, sandbox: S.sandboxMode || false }),
     });
     const d = await r.json();
     const populate = (selId, items, savedId, idKey, nameKey) => {
