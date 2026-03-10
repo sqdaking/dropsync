@@ -1312,6 +1312,82 @@ module.exports = async (req, res) => {
       }
     }
 
+    // ── FETCH MY EBAY LISTINGS ────────────────────────────────────────────────
+    if (action === 'fetchMyListings') {
+      const { access_token } = body;
+      if (!access_token) return res.status(400).json({ error: 'Missing access_token' });
+      const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
+
+      // Paginate through all active offers
+      const allOffers = [];
+      let offset = 0;
+      const limit = 100;
+      let total = null;
+
+      while (true) {
+        const r = await fetch(`${EBAY_API}/sell/inventory/v1/offer?limit=${limit}&offset=${offset}`, { headers: auth });
+        const d = await r.json();
+        if (!r.ok) {
+          console.error('[fetchMyListings] offers error:', JSON.stringify(d).slice(0,300));
+          break;
+        }
+        const offers = d.offers || [];
+        allOffers.push(...offers);
+        total = d.total || offers.length;
+        console.log(`[fetchMyListings] fetched ${allOffers.length}/${total} offers`);
+        if (allOffers.length >= total || offers.length < limit) break;
+        offset += limit;
+      }
+
+      // Map to clean listing objects
+      const listings = allOffers
+        .filter(o => o.status === 'PUBLISHED' || o.listingId)
+        .map(o => ({
+          ebayListingId: o.listingId || '',
+          ebaySku:       o.sku || '',
+          title:         o.listingDescription?.slice(0,80) || o.sku || '',
+          price:         parseFloat(o.pricingSummary?.price?.value || 0),
+          quantity:      o.availableQuantity || 0,
+          status:        o.status || 'PUBLISHED',
+          currency:      o.pricingSummary?.price?.currency || 'USD',
+          categoryId:    o.categoryId || '',
+          ebayUrl:       o.listingId ? `https://www.ebay.com/itm/${o.listingId}` : '',
+        }));
+
+      // Also try to get item titles from inventory items (for better display)
+      const skus = [...new Set(allOffers.map(o => o.sku).filter(Boolean))].slice(0, 200);
+      const inventoryMap = {};
+      // Batch fetch inventory items for titles/images
+      for (let i = 0; i < skus.length; i += 25) {
+        const batch = skus.slice(i, i+25);
+        try {
+          const ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item?sku=${batch.join('|')}`, { headers: auth });
+          const id = await ir.json();
+          for (const item of (id.inventoryItems || [])) {
+            inventoryMap[item.sku] = {
+              title: item.product?.title || '',
+              image: item.product?.imageUrls?.[0] || '',
+              aspects: item.product?.aspects || {},
+            };
+          }
+        } catch {}
+      }
+
+      // Enrich listings with inventory data
+      for (const l of listings) {
+        const inv = inventoryMap[l.ebaySku];
+        if (inv) {
+          if (inv.title) l.title = inv.title;
+          if (inv.image) l.image = inv.image;
+          l.aspects = inv.aspects;
+        }
+      }
+
+      console.log(`[fetchMyListings] returning ${listings.length} listings`);
+      return res.json({ success: true, listings, total: listings.length });
+    }
+
+
     // ── SYNC: re-scrape Amazon, push diffs to eBay ────────────────────────────
     if (action === 'sync') {
       const { access_token, ebaySku, sourceUrl, hasVariations, quantity, variations, variationImages } = body;
