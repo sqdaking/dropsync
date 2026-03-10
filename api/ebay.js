@@ -1,1587 +1,710 @@
-// DropSync — eBay Backend v4 (Vercel Serverless)
-// Improved Amazon variation, price, and image scraping
+// DropSync AI Agent — Amazon → eBay Dropshipping Backend
+// Clean architecture: per-ASIN prices+images, AI category detection, auto policies
 
 const EBAY_API  = 'https://api.ebay.com';
-const EBAY_AUTH = 'https://auth.ebay.com';
+const EBAY_AUTH = 'https://auth.ebay.com/oauth2/authorize';
+const EBAY_TOK  = 'https://api.ebay.com/identity/v1/oauth2/token';
+const SCOPES    = 'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.inventory https://api.ebay.com/oauth/api_scope/sell.account https://api.ebay.com/oauth/api_scope/sell.fulfillment https://api.ebay.com/oauth/api_scope/commerce.taxonomy.readonly';
 
+const UA_LIST = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+];
+const randUA = () => UA_LIST[Math.floor(Math.random() * UA_LIST.length)];
+
+// ── Amazon page fetcher with retry + CAPTCHA detection ────────────────────────
+async function fetchPage(url, ua) {
+  for (let i = 0; i < 3; i++) {
+    try {
+      if (i > 0) await sleep(1500 * i);
+      const r = await fetch(url, {
+        headers: {
+          'User-Agent': ua || randUA(),
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Cache-Control': 'no-cache',
+          'Upgrade-Insecure-Requests': '1',
+        },
+        redirect: 'follow',
+      });
+      const html = await r.text();
+      if (html.includes('Type the characters') || html.includes('robot check')) {
+        if (i < 2) continue;
+        return '';
+      }
+      return html;
+    } catch (e) { if (i === 2) return ''; }
+  }
+  return '';
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ── Extract price from Amazon HTML ────────────────────────────────────────────
+function extractPrice(html) {
+  const pats = [
+    /class="a-price-whole"[^>]*>\s*(\d[\d,]*)<\/span><span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/,
+    /"priceAmount"\s*:\s*([\d.]+)/,
+    /class="a-offscreen"[^>]*>\$([\d,]+\.?\d*)/,
+    /id="priceblock_ourprice"[^>]*>[^$]*\$([\d.]+)/,
+    /"displayPrice"\s*:\s*"\$([\d,]+\.?\d*)"/,
+  ];
+  for (const p of pats) {
+    const m = html.match(p);
+    if (m) return parseFloat(m[2] ? `${m[1].replace(/,/g,'')}.${m[2]}` : m[1].replace(/,/g,''));
+  }
+  return null;
+}
+
+// ── Extract first hi-res image ────────────────────────────────────────────────
+function extractMainImage(html) {
+  const m = html.match(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/);
+  return m ? m[1] : null;
+}
+
+// ── eBay Taxonomy API: get leaf category suggestions ─────────────────────────
+async function getCategories(title, token) {
+  try {
+    const r = await fetch(
+      `${EBAY_API}/commerce/taxonomy/v1/category_tree/0/get_category_suggestions?q=${encodeURIComponent(title.slice(0,80))}`,
+      { headers: { Authorization: `Bearer ${token}`, 'Accept-Language': 'en-US' } }
+    );
+    const d = await r.json();
+    return (d.categorySuggestions || []).slice(0, 10).map(s => ({
+      id: s.category.categoryId,
+      name: s.category.categoryName,
+      path: (s.categoryTreeNodeAncestors || []).reverse().map(a => a.categoryName).join(' > '),
+    }));
+  } catch { return []; }
+}
+
+// ── Claude AI: pick category + write aspects + optimize title ─────────────────
+async function aiEnrich(title, breadcrumbs, aspects, ebaySuggestions) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) return null;
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514', max_tokens: 800,
+        messages: [{
+          role: 'user',
+          content: `You are an expert eBay listing optimizer. Given an Amazon product, choose the best eBay leaf category and write optimal item specifics.
+
+Amazon Title: ${title}
+Amazon Category Path: ${breadcrumbs.join(' > ')}
+Amazon Item Specifics: ${JSON.stringify(aspects).slice(0,400)}
+eBay Category Suggestions (id, name, path):
+${ebaySuggestions.map(s => `  ${s.id}: ${s.name} (${s.path})`).join('\n')}
+
+Return ONLY a JSON object (no markdown backticks):
+{
+  "categoryId": "<LEAF category ID from suggestions above>",
+  "categoryName": "<category name>",
+  "title": "<eBay-optimized title, under 80 chars, keyword-rich>",
+  "aspects": {
+    "Brand": ["Unbranded"],
+    "Color": ["See Listing"],
+    "Material": ["Polyester"],
+    "Size": ["See Listing"],
+    ... include 5-10 relevant aspects for this category
+  }
+}
+
+CRITICAL: categoryId MUST be a LEAF category from the suggestions list. Never pick a parent category.`
+        }]
+      })
+    });
+    const d = await r.json();
+    const text = (d.content?.[0]?.text || '').replace(/```json|```/g, '').trim();
+    return JSON.parse(text);
+  } catch (e) {
+    console.warn('[AI] enrichment failed:', e.message);
+    return null;
+  }
+}
+
+// ── Resolve all 3 eBay policies, auto-create if missing ───────────────────────
+async function resolvePolicies(token, supplied) {
+  const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
+  const p = {
+    fulfillmentPolicyId: (supplied.fulfillmentPolicyId || '').trim(),
+    paymentPolicyId:     (supplied.paymentPolicyId     || '').trim(),
+    returnPolicyId:      (supplied.returnPolicyId       || '').trim(),
+  };
+
+  if (!p.fulfillmentPolicyId || !p.paymentPolicyId || !p.returnPolicyId) {
+    const [fp, pp, rp] = await Promise.all([
+      fetch(`${EBAY_API}/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US`, { headers: auth }).then(r => r.json()).catch(() => ({})),
+      fetch(`${EBAY_API}/sell/account/v1/payment_policy?marketplace_id=EBAY_US`,     { headers: auth }).then(r => r.json()).catch(() => ({})),
+      fetch(`${EBAY_API}/sell/account/v1/return_policy?marketplace_id=EBAY_US`,      { headers: auth }).then(r => r.json()).catch(() => ({})),
+    ]);
+    if (!p.fulfillmentPolicyId) p.fulfillmentPolicyId = (fp.fulfillmentPolicies || [])[0]?.fulfillmentPolicyId || '';
+    if (!p.paymentPolicyId)     p.paymentPolicyId     = (pp.paymentPolicies     || [])[0]?.paymentPolicyId     || '';
+    if (!p.returnPolicyId)      p.returnPolicyId      = (rp.returnPolicies      || []).find(x => x.returnsAccepted)?.returnPolicyId
+                                                        || (rp.returnPolicies || [])[0]?.returnPolicyId || '';
+    console.log(`[policies] fp=${p.fulfillmentPolicyId?.slice(-8)} pp=${p.paymentPolicyId?.slice(-8)} rp=${p.returnPolicyId?.slice(-8)}`);
+  }
+
+  if (!p.fulfillmentPolicyId) {
+    const r = await fetch(`${EBAY_API}/sell/account/v1/fulfillment_policy`, {
+      method: 'POST', headers: auth,
+      body: JSON.stringify({
+        name: 'DropSync Free Shipping', marketplaceId: 'EBAY_US',
+        categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
+        handlingTime: { value: 3, unit: 'DAY' },
+        shippingOptions: [{ optionType: 'DOMESTIC', costType: 'FLAT_RATE',
+          shippingServices: [{ shippingServiceCode: 'USPSFirstClass', freeShipping: true,
+            shippingCost: { value: '0.00', currency: 'USD' }, buyerResponsibleForShipping: false }] }],
+      }),
+    });
+    const d = await r.json(); p.fulfillmentPolicyId = d.fulfillmentPolicyId || '';
+  }
+  if (!p.returnPolicyId) {
+    const r = await fetch(`${EBAY_API}/sell/account/v1/return_policy`, {
+      method: 'POST', headers: auth,
+      body: JSON.stringify({
+        name: 'DropSync 30-Day Returns', marketplaceId: 'EBAY_US',
+        categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
+        returnsAccepted: true, returnPeriod: { value: 30, unit: 'DAY' },
+        returnShippingCostPayer: 'BUYER', refundMethod: 'MONEY_BACK',
+      }),
+    });
+    const d = await r.json(); p.returnPolicyId = d.returnPolicyId || '';
+  }
+
+  if (!p.fulfillmentPolicyId) throw new Error('No shipping policy found. Create one in eBay Seller Hub → Business Policies.');
+  if (!p.returnPolicyId)      throw new Error('No return policy found. Create one in eBay Seller Hub → Business Policies.');
+  return p;
+}
+
+// ── Ensure merchant location exists ──────────────────────────────────────────
+async function ensureLocation(auth) {
+  const r = await fetch(`${EBAY_API}/sell/inventory/v1/location`, { headers: auth }).then(r => r.json()).catch(() => ({}));
+  if ((r.locations || []).length) return r.locations[0].merchantLocationKey;
+  const key = 'MainWarehouse';
+  await fetch(`${EBAY_API}/sell/inventory/v1/location/${key}`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ location: { address: { country: 'US' } }, locationTypes: ['WAREHOUSE'], name: key }),
+  });
+  return key;
+}
+
+// ── Build offer payload ───────────────────────────────────────────────────────
+function buildOffer(sku, price, categoryId, policies, locationKey) {
+  return {
+    sku, marketplaceId: 'EBAY_US', format: 'FIXED_PRICE', listingDuration: 'GTC',
+    pricingSummary: { price: { value: String(parseFloat(price || 0).toFixed(2)), currency: 'USD' } },
+    categoryId: String(categoryId),
+    merchantLocationKey: locationKey,
+    listingPolicies: {
+      fulfillmentPolicyId: policies.fulfillmentPolicyId,
+      paymentPolicyId:     policies.paymentPolicyId,
+      returnPolicyId:      policies.returnPolicyId,
+    },
+    tax: { applyTax: true },
+  };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  const CLIENT_ID     = process.env.EBAY_CLIENT_ID;
-  const CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET;
-  const RUNAME        = process.env.EBAY_RUNAME;
-  const FRONTEND_URL  = process.env.FRONTEND_URL || '';
-  const basicAuth     = 'Basic ' + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
-  const { action }    = req.query;
-
-  let body = {};
-  if (req.method === 'POST') {
-    try { body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {}; } catch {}
-  }
+  const action = req.query.action || req.body?.action;
+  const body   = req.body || {};
 
   try {
 
+    // ── AUTH ──────────────────────────────────────────────────────────────────
     if (action === 'auth') {
-      const scopes = [
-        'https://api.ebay.com/oauth/api_scope',
-        'https://api.ebay.com/oauth/api_scope/sell.inventory',
-        'https://api.ebay.com/oauth/api_scope/sell.inventory.readonly',
-        'https://api.ebay.com/oauth/api_scope/sell.fulfillment',
-        'https://api.ebay.com/oauth/api_scope/sell.fulfillment.readonly',
-        'https://api.ebay.com/oauth/api_scope/sell.account',
-        'https://api.ebay.com/oauth/api_scope/sell.account.readonly',
-      ].join(' ');
-      return res.redirect(`${EBAY_AUTH}/oauth2/authorize?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(RUNAME)}&response_type=code&scope=${encodeURIComponent(scopes)}`);
+      const REDIRECT = process.env.EBAY_REDIRECT_URI || `${req.headers['x-forwarded-proto']||'https'}://${req.headers.host}/api/ebay?action=callback`;
+      const url = `${EBAY_AUTH}?client_id=${process.env.EBAY_CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code&scope=${encodeURIComponent(SCOPES)}`;
+      return res.json({ url });
     }
 
     if (action === 'callback') {
-      const code = req.query.code;
-      if (!code) return res.status(400).send('<h2>Error: No code from eBay</h2>');
-      const r = await fetch(`${EBAY_API}/identity/v1/oauth2/token`, {
+      const REDIRECT = process.env.EBAY_REDIRECT_URI || `${req.headers['x-forwarded-proto']||'https'}://${req.headers.host}/api/ebay?action=callback`;
+      const creds = Buffer.from(`${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`).toString('base64');
+      const r = await fetch(EBAY_TOK, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: basicAuth },
-        body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: RUNAME }),
+        headers: { Authorization: `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `grant_type=authorization_code&code=${encodeURIComponent(req.query.code)}&redirect_uri=${encodeURIComponent(REDIRECT)}`,
       });
       const d = await r.json();
-      if (!d.access_token) return res.status(400).send(`<h2>Token error: ${JSON.stringify(d)}</h2>`);
-      // Send token to parent window via postMessage (works with local file:// HTML)
-      return res.send(`<!DOCTYPE html><html><head><title>eBay Connected</title>
-<style>body{font-family:sans-serif;background:#0a0a0f;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px}
-.icon{font-size:48px}.title{font-size:22px;font-weight:700;color:#26de81}.sub{font-size:13px;color:#888}</style></head>
-<body>
-<div class="icon">✅</div>
-<div class="title">eBay Connected!</div>
-<div class="sub">This window will close automatically...</div>
-<script>
-  const token = ${JSON.stringify({
-    type: 'ebay_token',
-    access_token: d.access_token,
-    refresh_token: d.refresh_token || '',
-    expires_in: d.expires_in || 7200
-  })};
-  // Post to opener (popup flow)
-  if (window.opener) {
-    window.opener.postMessage(token, '*');
-    setTimeout(() => window.close(), 1500);
-  } else {
-    // Fallback: redirect with params if opened as full page
-    const p = new URLSearchParams({
-      access_token: token.access_token,
-      refresh_token: token.refresh_token,
-      expires_in: token.expires_in
-    });
-    const dest = ${JSON.stringify(FRONTEND_URL || '')};
-    if (dest) window.location.href = dest + '?' + p.toString();
-    else document.querySelector('.sub').textContent = 'Copy your token: ' + token.access_token.slice(0,40) + '...';
-  }
-<\/script>
-</body></html>`);
+      return res.setHeader('Content-Type','text/html').send(
+        `<!DOCTYPE html><html><body><script>
+          window.opener?.postMessage({type:'ebay_auth',token:'${d.access_token}',refresh:'${d.refresh_token}',expiry:${Date.now()+((d.expires_in||7200)-120)*1000}},'*');
+          document.body.innerHTML='<p style="font-family:sans-serif;padding:40px">✅ Connected to eBay! You can close this window.</p>';
+        </script></body></html>`
+      );
     }
 
     if (action === 'refresh') {
-      const refresh_token = body.refresh_token || req.query.refresh_token;
-      const r = await fetch(`${EBAY_API}/identity/v1/oauth2/token`, {
+      const creds = Buffer.from(`${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`).toString('base64');
+      const r = await fetch(EBAY_TOK, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: basicAuth },
-        body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token }),
+        headers: { Authorization: `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(body.refresh_token)}&scope=${encodeURIComponent(SCOPES)}`,
       });
-      return res.json(await r.json());
+      const d = await r.json();
+      if (!d.access_token) return res.status(400).json({ error: 'Token refresh failed', raw: d });
+      return res.json({ access_token: d.access_token, expires_in: d.expires_in, expiry: Date.now() + ((d.expires_in||7200)-120)*1000 });
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // SCRAPE — full variation + image + price extraction
-    // ═══════════════════════════════════════════════════════════
-    // Parent snippet — checks what's on the parent ASIN page
+    // ── POLICIES ─────────────────────────────────────────────────────────────
+    if (action === 'policies') {
+      const token = body.access_token || req.query.access_token;
+      if (!token) return res.status(400).json({ error: 'No token' });
+      const auth = { Authorization: `Bearer ${token}`, 'Accept-Language': 'en-US' };
+      const [fp, pp, rp] = await Promise.all([
+        fetch(`${EBAY_API}/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US`, { headers: auth }).then(r => r.json()),
+        fetch(`${EBAY_API}/sell/account/v1/payment_policy?marketplace_id=EBAY_US`,     { headers: auth }).then(r => r.json()),
+        fetch(`${EBAY_API}/sell/account/v1/return_policy?marketplace_id=EBAY_US`,      { headers: auth }).then(r => r.json()),
+      ]);
+      return res.json({
+        fulfillment: (fp.fulfillmentPolicies||[]).map(p => ({ id: p.fulfillmentPolicyId, name: p.name })),
+        payment:     (pp.paymentPolicies||[]).map(p => ({ id: p.paymentPolicyId, name: p.name })),
+        return:      (rp.returnPolicies||[]).map(p => ({ id: p.returnPolicyId, name: p.name })),
+      });
+    }
+
+    // ── SCRAPE: Amazon → structured product data ──────────────────────────────
     if (action === 'scrape') {
-      let url = body.url || req.query.url;
-      if (!url) return res.status(400).json({ error: 'No URL' });
+      let url = (body.url || req.query.url || '').trim();
+      if (!url) return res.status(400).json({ error: 'No URL provided' });
 
-      // ── Normalize any Amazon URL to clean dp/ASIN page ──────────────
-      if (url.includes('amazon.com')) {
-        // Extract ASIN from any Amazon URL format:
-        // - /dp/B0XXXXXX
-        // - /gp/product/B0XXXXXX
-        // - /sspa/click?...dp/B0XXXXXX
-        // - ?asin=B0XXXXXX
-        // - sr_1_2...B0XXXXXX in path
-        let asin = null;
+      // Normalize to clean dp/ASIN URL
+      const asinM = url.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/);
+      const asinP = url.match(/[?&]asin=([A-Z0-9]{10})/i);
+      const asin  = asinM?.[1] || asinP?.[1];
+      if (asin) url = `https://www.amazon.com/dp/${asin}`;
 
-        // Try /dp/ASIN or /gp/product/ASIN
-        const dpMatch = url.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/);
-        if (dpMatch) asin = dpMatch[1];
-
-        // Try asin= query param
-        if (!asin) {
-          const asinParam = url.match(/[?&]asin=([A-Z0-9]{10})/i);
-          if (asinParam) asin = asinParam[1];
-        }
-
-        // Try any 10-char ASIN-like string in the URL
-        if (!asin) {
-          const anyAsin = url.match(/\/([A-Z0-9]{10})(?:\/|\?|$)/);
-          if (anyAsin) asin = anyAsin[1];
-        }
-
-        if (asin) {
-          url = `https://www.amazon.com/dp/${asin}`;
-          console.log('Normalized Amazon URL to:', url);
-        }
-      }
-
+      const ua   = randUA();
+      const html = await fetchPage(url, ua);
+      if (!html) return res.json({ success: false, error: 'Could not load page — Amazon may be rate limiting. Try again in 1 min.' });
 
       const product = {
-        url, source: '', title: '', price: '', images: [],
-        description: '', brand: '', aspects: {},
+        url, source: 'amazon', asin: asin || '',
+        title: '', price: 0, images: [],
+        description: '', aspects: {}, breadcrumbs: [],
         variations: [], variationImages: {}, hasVariations: false,
-        scrapedShipping: null,  // actual shipping cost from the page (null = use rule default)
-        shippingMethod: '',      // e.g. 'AliExpress Standard Shipping', 'Free Shipping', etc.
         inStock: true, quantity: 10,
       };
 
-      try {
-        // Rotate user agents to avoid Amazon bot detection
-        const USER_AGENTS = [
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Safari/605.1.15',
-          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        ];
-        const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+      // Title
+      const tM = html.match(/id="productTitle"[^>]*>\s*([^<]{5,})/);
+      if (tM) product.title = tM[1].trim().replace(/\s+/g,' ');
 
-        // Try fetching with retries
-        let html = '';
-        let lastErr = null;
-        for (let attempt = 0; attempt < 3; attempt++) {
-          try {
-            if (attempt > 0) await new Promise(r => setTimeout(r, 1500 * attempt));
-            const htmlRes = await fetch(url, {
-              headers: {
-                'User-Agent': ua,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1',
-                'Upgrade-Insecure-Requests': '1',
-                'DNT': '1',
-              },
-              redirect: 'follow',
-            });
-            if (htmlRes.status === 503 || htmlRes.status === 429) {
-              lastErr = `HTTP ${htmlRes.status} — Amazon rate limited`;
-              continue;
-            }
-            html = await htmlRes.text();
-            // Check if Amazon served a CAPTCHA page
-            if (html.includes('Type the characters you see') || html.includes('Enter the characters you see') || html.includes('robot check')) {
-              lastErr = 'Amazon CAPTCHA detected — try again in a few minutes';
-              html = '';
-              continue;
-            }
-            break; // success
-          } catch(e) { lastErr = e.message; }
-        }
-        if (!html) return res.json({ success: false, error: lastErr || 'Failed to fetch page', product });
+      // Breadcrumbs (Amazon category path)
+      const bcRaw = [...html.matchAll(/class="a-link-normal"[^>]*>\s*([^<]{2,40})\s*<\/a>/g)];
+      product.breadcrumbs = bcRaw.slice(0, 6).map(m => m[1].trim()).filter(s => s.length > 1 && !/^\d+$/.test(s));
 
-        // ── AMAZON ─────────────────────────────────────────────────────
-        if (url.includes('amazon.com')) {
-          product.source = 'amazon';
+      // Price
+      product.price = extractPrice(html) || 0;
 
-          const fetchPage = async (u) => {
-            try {
-              const r = await fetch(u, {
-                headers: { 'User-Agent': ua, 'Accept': 'text/html,application/xhtml+xml', 'Accept-Language': 'en-US,en;q=0.9', 'Cache-Control': 'no-cache' },
-                redirect: 'follow',
-              });
-              const h = await r.text();
-              if (h.includes('robot check') || h.includes('Type the characters') || h.includes('Enter the characters')) return '';
-              return h;
-            } catch { return ''; }
-          };
+      // Stock
+      product.inStock = !html.toLowerCase().includes('currently unavailable');
 
-          // Walk braces/brackets safely
-          function extractBlock(h, key, opener) {
-            const ki = h.indexOf(`"${key}"`);
-            if (ki < 0) return null;
-            const bi = h.indexOf(opener, ki);
-            if (bi < 0 || bi - ki > 200) return null;
-            const closer = opener === '{' ? '}' : ']';
-            let depth = 0, inStr = false, esc = false;
-            for (let i = bi; i < Math.min(h.length, bi + 400000); i++) {
-              const c = h[i];
-              if (esc) { esc = false; continue; }
-              if (c === '\\') { esc = true; continue; }
-              if (c === '"') { inStr = !inStr; continue; }
-              if (inStr) continue;
-              if (c === opener) depth++;
-              else if (c === closer) { depth--; if (depth === 0) return h.slice(bi, i + 1); }
-            }
-            return null;
-          }
+      // Images — all hiRes from page
+      const imgs = [...html.matchAll(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/g)]
+        .map(m => m[1]).filter((v,i,a) => a.indexOf(v)===i);
+      product.images = imgs.slice(0, 12);
 
-          // ── Title
-          const titleM = html.match(/id="productTitle"[^>]*>\s*([\s\S]*?)\s*<\/span>/);
-          if (titleM) product.title = titleM[1].replace(/<[^>]+>/g,'').trim().replace(/\s+/g,' ');
+      // Description from bullet points
+      const bullets = [...html.matchAll(/<span class="a-list-item">\s*([^<]{20,500})\s*<\/span>/g)]
+        .map(m => m[1].trim()).slice(0, 5);
+      product.description = bullets.join('\n') || product.title;
 
-          // ── Price
-          for (const pat of [
-            /class="a-price-whole"[^>]*>\s*(\d[\d,]*)<\/span><span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/,
-            /"priceAmount"\s*:\s*([\d.]+)/,
-            /class="a-offscreen"[^>]*>\$([\d,]+\.\d{2})/,
-            /id="priceblock_ourprice"[^>]*>\s*\$?([\d,]+\.?\d*)/,
-            /"buyingPrice"\s*:\s*([\d.]+)/,
-          ]) {
-            const m = html.match(pat);
-            if (m) { product.price = m[2] ? `${m[1].replace(/,/g,'')}.${m[2]}` : m[1].replace(/,/g,''); break; }
-          }
+      // Item specifics from product details table
+      const rows = [...html.matchAll(/<th[^>]*class="[^"]*prodDetSectionEntry[^"]*"[^>]*>([^<]+)<\/th>\s*<td[^>]*>([^<]+)<\/td>/gi)];
+      for (const [, k, v] of rows) {
+        const key = k.trim(), val = v.trim().replace(/\s+/g,' ');
+        if (key && val && val.length < 120 && !val.includes('›')) product.aspects[key] = [val];
+      }
+      // Also grab from feature bullets: "Brand: X"
+      for (const [, k, v] of [...html.matchAll(/(Brand|Material|Color|Size|Style|Weight|Dimensions?)\s*:\s*([^\n<]{2,60})/g)]) {
+        if (!product.aspects[k]) product.aspects[k] = [v.trim()];
+      }
 
-          // ── Find parent ASIN and fetch parent page for full variation data
-          const landingAsin = url.match(/\/dp\/([A-Z0-9]{10})/)?.[1] || '';
-          let parentAsin = null;
-          for (const pat of [
-            /"parentAsin"\s*:\s*"([A-Z0-9]{10})"/,
-            /parentAsin[=:&"' ]+([A-Z0-9]{10})/,
-          ]) {
-            const m = html.match(pat);
-            if (m && m[1] !== landingAsin) { parentAsin = m[1]; break; }
-          }
-          let workHtml = html;
-          if (parentAsin) {
-            const ph = await fetchPage(`https://www.amazon.com/dp/${parentAsin}`);
-            if (ph.length > 20000) workHtml = ph;
-          }
+      // ── Variation data ────────────────────────────────────────────────────
+      // 1) variationValues — gives us all color/size names
+      let varVals = null;
+      const vvM = html.match(/"variationValues"\s*:\s*(\{"[a-z_]+"\s*:\s*\[[^\]]+\][^}]*\})/);
+      if (vvM) try { varVals = JSON.parse(vvM[1]); } catch {}
 
-          // ── Extract the twister/variation JSON block ─────────────────
-          // Amazon embeds all variation data in several possible locations
-          let twisterData = null;
+      // 2) ASIN → {color, size} mapping from HTML
+      const asinMap = {};  // asin → { color, size }
+      const dimMatches = [...html.matchAll(/"([A-Z0-9]{10})"\s*:\s*\{([^}]{0,300})\}/g)];
+      for (const [, a, body] of dimMatches) {
+        const cM = body.match(/"color_name"\s*:\s*"([^"]+)"/);
+        const sM = body.match(/"size_name"\s*:\s*"([^"]+)"/);
+        if (cM || sM) asinMap[a] = { color: cM?.[1]||null, size: sM?.[1]||null };
+      }
 
-          // Method 1: data-a-state script tag (modern Amazon)
-          for (const m of [...workHtml.matchAll(/<script[^>]*data-a-state[^>]*type="a-state"[^>]*>([\s\S]*?)<\/script>/g),
-                           ...html.matchAll(/<script[^>]*data-a-state[^>]*type="a-state"[^>]*>([\s\S]*?)<\/script>/g)]) {
-            try {
-              const d = JSON.parse(m[1]);
-              if (d.variationValues || d.dimensionValuesDisplayData) { twisterData = d; break; }
-            } catch {}
-          }
+      // 3) colorToAsin from data-asin attributes on swatch buttons
+      const colorToAsin = {};
+      const swatchRe = /data-dp-url[^>]*th=([A-Z0-9]{10})[^>]*(?:title|alt)="([^"]+)"/g;
+      for (const [, a, name] of [...html.matchAll(swatchRe)]) {
+        if (name && name.length < 60 && !colorToAsin[name]) colorToAsin[name] = a;
+      }
+      // Also try: id="color_name_X_B0XXXXXX" style elements
+      const swRe2 = /data-asin="([A-Z0-9]{10})"[^>]*data-dp-url/g;
+      // And from the ASIN map
+      for (const [a, dims] of Object.entries(asinMap)) {
+        if (dims.color && !colorToAsin[dims.color]) colorToAsin[dims.color] = a;
+      }
 
-          // Method 2: P.when("twister-js-init-dpx-data") block
-          if (!twisterData) {
-            for (const searchHtml of [workHtml, html]) {
-              const idx = searchHtml.indexOf('twister-js-init-dpx-data');
-              if (idx < 0) continue;
-              // Find the data object passed to the callback
-              const dataStart = searchHtml.indexOf('return f(', idx);
-              if (dataStart < 0) continue;
-              const objStart = searchHtml.indexOf('{', dataStart);
-              if (objStart < 0) continue;
-              const raw = extractBlock(searchHtml.slice(objStart), '"dimensionValuesDisplayData"', '{') ||
-                          extractBlock(searchHtml.slice(objStart), '"variationValues"', '{');
-              if (raw) {
-                // Try to get the entire outer object
-                let depth = 0, inStr = false, esc = false;
-                let end2 = -1;
-                for (let i = 0; i < Math.min(searchHtml.length - objStart, 200000); i++) {
-                  const c = searchHtml[objStart + i];
-                  if (esc) { esc = false; continue; }
-                  if (c === '\\') { esc = true; continue; }
-                  if (c === '"') { inStr = !inStr; continue; }
-                  if (inStr) continue;
-                  if (c === '{') depth++;
-                  else if (c === '}') { depth--; if (depth === 0) { end2 = objStart + i; break; } }
-                }
-                if (end2 > objStart) {
-                  try { twisterData = JSON.parse(searchHtml.slice(objStart, end2 + 1)); if (twisterData.variationValues || twisterData.dimensionValuesDisplayData) break; else twisterData = null; } catch {}
-                }
-              }
-              if (twisterData) break;
-            }
-          }
+      // Also look for explicit colorToAsin JSON object
+      const ctaM = html.match(/"colorToAsin"\s*:\s*(\{[^}]{0,2000}\})/);
+      if (ctaM) try { Object.assign(colorToAsin, JSON.parse(ctaM[1])); } catch {}
 
-          // Method 3: inline variationValues in page JS
-          if (!twisterData) {
-            for (const searchHtml of [workHtml, html]) {
-              const vvBlock = extractBlock(searchHtml, 'variationValues', '{');
-              const dvBlock = extractBlock(searchHtml, 'dimensionValuesDisplayData', '{');
-              if (vvBlock || dvBlock) {
-                twisterData = {};
-                if (vvBlock) { try { twisterData.variationValues = JSON.parse(vvBlock); } catch {} }
-                if (dvBlock) { try { twisterData.dimensionValuesDisplayData = JSON.parse(dvBlock); } catch {} }
-                if (twisterData.variationValues || twisterData.dimensionValuesDisplayData) break;
-                twisterData = null;
-              }
-            }
-          }
+      const hasVar = !!(varVals && (varVals.color_name?.length || varVals.size_name?.length));
+      product.hasVariations = hasVar;
 
-          console.log('twisterData found:', !!twisterData, twisterData ? Object.keys(twisterData) : 'none');
+      if (hasVar) {
+        const colors = varVals.color_name || [];
+        const sizes  = varVals.size_name  || [];
 
-          // ── Parse variation data from twisterData
-          const variationValues = twisterData?.variationValues || {};
-          const asinDimVals = twisterData?.dimensionValuesDisplayData || {};
-          const dimOrder = [];
+        // Resolve which ASIN to fetch for each color
+        const colorASINs = colors.map(c => ({ color: c, asin: colorToAsin[c] || null })).filter(x => x.asin);
 
-          // Get dimension order
-          if (Array.isArray(twisterData?.dimensions)) {
-            twisterData.dimensions.forEach(d => dimOrder.push(d));
-          } else {
-            Object.keys(variationValues).forEach(k => dimOrder.push(k));
-          }
+        console.log(`[scrape] ${colors.length} colors, ${sizes.length} sizes, ${colorASINs.length} ASINs to fetch`);
 
-          console.log('dims:', dimOrder, 'vars:', Object.keys(variationValues), 'asins:', Object.keys(asinDimVals).length);
-
-          // ── Per-ASIN prices and stock from the page
-          const asinPrice = {};
-          const asinStock = {};
-
-          // ── Extract ALL per-ASIN prices from the page HTML ───────────────────
-          // Format 1 (object): "priceToAsinList":{"25.49":["B0XX","B0YY"]}
-          const p2aObjBlock = extractBlock(workHtml, 'priceToAsinList', '{') || extractBlock(html, 'priceToAsinList', '{');
-          if (p2aObjBlock) {
-            try {
-              const p2a = JSON.parse(p2aObjBlock);
-              for (const [price, asins] of Object.entries(p2a))
-                if (Array.isArray(asins)) asins.forEach(a => { if (!asinPrice[a]) asinPrice[a] = price; });
-              console.log(`priceToAsinList (obj): ${Object.keys(asinPrice).length} prices`);
-            } catch {}
-          }
-
-          // Format 2 (array): "priceToAsinList":[{"asin":"B0XX","price":"25.49"},...]
-          if (!Object.keys(asinPrice).length) {
-            const p2aArrBlock = extractBlock(workHtml, 'priceToAsinList', '[') || extractBlock(html, 'priceToAsinList', '[');
-            if (p2aArrBlock) {
-              try {
-                const arr = JSON.parse(p2aArrBlock);
-                arr.forEach(item => { if (item.asin && item.price && !asinPrice[item.asin]) asinPrice[item.asin] = item.price; });
-                console.log(`priceToAsinList (arr): ${Object.keys(asinPrice).length} prices`);
-              } catch {}
-            }
-          }
-
-          // Format 3: inline "B0XXXXX":{"price":"19.99"} patterns
-          for (const m of (workHtml + html).matchAll(/"([A-Z0-9]{10})"\s*:\s*\{"price"\s*:\s*"([\d.]+)"/g))
-            if (!asinPrice[m[1]]) asinPrice[m[1]] = m[2];
-
-          // Format 4: generic ASIN price map "B0X":19.99 or "B0X":"19.99"
-          if (Object.keys(asinPrice).length < 3) {
-            for (const m of (workHtml + html).matchAll(/"([A-Z0-9]{10})"\s*:\s*([\d.]{4,8})(?:[,}\s])/g)) {
-              const val = parseFloat(m[2]);
-              if (val > 0.5 && val < 10000 && !asinPrice[m[1]]) asinPrice[m[1]] = m[2];
-            }
-          }
-
-          console.log(`Total ASIN prices extracted: ${Object.keys(asinPrice).length} for ${Object.keys(asinDimVals).length} ASINs`);
-
-          // ── Stock sets ────────────────────────────────────────────────────────
-          const unavailBlock = extractBlock(workHtml + html, 'unavailableAsinSet', '[');
-          if (unavailBlock) { try { JSON.parse(unavailBlock).forEach(a => { asinStock[a] = false; }); } catch {} }
-          const inStockBlock = extractBlock(workHtml + html, 'inStockAsinSet', '[');
-          if (inStockBlock) { try { JSON.parse(inStockBlock).forEach(a => { asinStock[a] = true; }); } catch {} }
-
-          // ── Images ────────────────────────────────────────────────────────────
-          const allImages = [];
-          const colorImgMap = {};
-
-          for (const m of html.matchAll(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/g))
-            if (!allImages.includes(m[1])) allImages.push(m[1]);
-          if (allImages.length < 3) {
-            for (const m of html.matchAll(/"large"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/g))
-              if (!allImages.includes(m[1])) allImages.push(m[1]);
-          }
-
-          // ── Map ASIN → color (using color_name dimension) ─────────────────────
-          // dimOrder can be [size_name, color_name] OR [color_name, size_name]
-          const ci = dimOrder.indexOf('color_name');
-          const si = dimOrder.indexOf('size_name');
-          const asinToColor = {};
-          const asinToSize = {};
-          for (const [asin, dimVals] of Object.entries(asinDimVals)) {
-            if (ci >= 0 && Array.isArray(dimVals) && dimVals[ci]) asinToColor[asin] = dimVals[ci];
-            if (si >= 0 && Array.isArray(dimVals) && dimVals[si]) asinToSize[asin] = dimVals[si];
-          }
-
-          // ── Fetch one page per unique COLOR — get correct image + price ─────────
-          // Each color's ASIN shows that color's specific image as the main photo.
-          // We fetch up to 15 color ASINs in parallel; each gives us image + price.
-          const colorToAsin = {};  // color value → one ASIN that represents that color
-          for (const [asin, color] of Object.entries(asinToColor))
-            if (!colorToAsin[color]) colorToAsin[color] = asin;
-
-          const colorASINs = Object.entries(colorToAsin); // [[colorVal, asin], ...]
-          console.log(`Fetching ${Math.min(colorASINs.length, 15)} color ASINs (of ${colorASINs.length} total colors)`);
-
-          await Promise.all(colorASINs.slice(0, 15).map(async ([color, asin]) => {
-            try {
-              const h = await fetchPage(`https://www.amazon.com/dp/${asin}`);
-              if (!h) return;
-
-              // Price: grab the displayed price on this ASIN's page
-              if (!asinPrice[asin]) {
-                for (const pat of [
-                  /class="a-price-whole"[^>]*>\s*(\d[\d,]*)<\/span><span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/,
-                  /"priceAmount"\s*:\s*([\d.]+)/,
-                  /class="a-offscreen"[^>]*>\$([\d,]+\.?\d*)/,
-                ]) {
-                  const m = h.match(pat);
-                  if (m) { asinPrice[asin] = m[2] ? `${m[1].replace(/,/g,'')}.${m[2]}` : m[1].replace(/,/g,''); break; }
-                }
-                // Also propagate this price to sibling ASINs of the same color (different sizes)
-                if (asinPrice[asin]) {
-                  Object.entries(asinDimVals).forEach(([a, dims]) => {
-                    if (asinToColor[a] === color && !asinPrice[a]) asinPrice[a] = asinPrice[asin];
-                  });
-                }
-              }
-              asinStock[asin] = !(h.includes('Currently unavailable') || h.includes('currently unavailable'));
-
-              // Image: first hiRes on this color's page = that color's specific photo
-              const img = h.match(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/);
-              if (img) {
-                colorImgMap[color] = img[1];  // map color name → image URL
-                if (!allImages.includes(img[1])) allImages.push(img[1]);
-              }
-            } catch(e) { console.warn('ASIN fetch error:', asin, e.message); }
+        // Fetch each color's ASIN page → get image + price
+        const colorData = {}; // color → { image, price, inStock }
+        if (colorASINs.length) {
+          await Promise.all(colorASINs.slice(0, 15).map(async ({ color, asin }) => {
+            const h = await fetchPage(`https://www.amazon.com/dp/${asin}`, ua);
+            if (!h) return;
+            const img   = extractMainImage(h);
+            const price = extractPrice(h);
+            const stock = !h.toLowerCase().includes('currently unavailable');
+            colorData[color] = { image: img || '', price: price || 0, inStock: stock };
+            if (img && !product.images.includes(img)) product.images.push(img);
           }));
-
-          console.log(`Per-ASIN fetch done: prices=${Object.keys(asinPrice).length}/${Object.keys(asinDimVals).length}, colorImgs=${Object.keys(colorImgMap).length}`);
-
-          product.images = [...new Set(allImages)].slice(0, 12);
-          if (Object.keys(colorImgMap).length) product.variationImages['Color'] = colorImgMap;
-
-          // ── Build variation groups
-          const dimKeyToLabel = {
-            'color_name':'Color','size_name':'Size','style_name':'Style',
-            'material_type':'Material','pattern_name':'Pattern',
-            'configuration_name':'Configuration','edition_name':'Edition',
-            'scent_name':'Scent','flavor_name':'Flavor','item_package_quantity':'Package Qty',
-          };
-
-          for (const dimKey of (dimOrder.length ? dimOrder : Object.keys(variationValues))) {
-            const values = variationValues[dimKey];
-            if (!Array.isArray(values) || values.length < 2) continue;
-            const di = dimOrder.indexOf(dimKey);
-            const label = dimKeyToLabel[dimKey] || dimKey.replace(/_name$/,'').replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
-
-            const varValues = values.map(val => {
-              const strVal = String(val);
-              const matchAsins = di >= 0
-                ? Object.entries(asinDimVals).filter(([,dv]) => Array.isArray(dv) && dv[di] === strVal).map(([a]) => a)
-                : [];
-
-              let varPrice = product.price || '';
-              let inStock = true;
-
-              if (matchAsins.length) {
-                const withPrices = matchAsins.filter(a => asinPrice[a]);
-                const inStockOnes = withPrices.filter(a => asinStock[a] !== false);
-                const use = inStockOnes.length ? inStockOnes : withPrices;
-                if (use.length) {
-                  varPrice = use.reduce((a,b) => parseFloat(asinPrice[a]) <= parseFloat(asinPrice[b]) ? a : b);
-                  varPrice = asinPrice[varPrice];
-                }
-                const hasStockData = matchAsins.some(a => asinStock[a] !== undefined);
-                if (hasStockData) inStock = matchAsins.some(a => asinStock[a] !== false);
-              }
-
-              return {
-                value: strVal,
-                price: varPrice || product.price || '',
-                sourcePrice: varPrice || product.price || '',
-                stock: inStock ? 10 : 0,
-                inStock,
-                image: dimKey === 'color_name' ? (colorImgMap[strVal] || '') : '',
-                enabled: inStock,
-              };
-            });
-
-            product.variations.push({ name: label, values: varValues });
-          }
-
-          product.hasVariations = product.variations.length > 0;
-          if (product.hasVariations) {
-            const prices = product.variations.flatMap(vg => vg.values)
-              .filter(v => v.inStock && parseFloat(v.price) > 0).map(v => parseFloat(v.price));
-            if (prices.length) product.price = Math.min(...prices).toFixed(2);
-          }
-
-          // ── Description
-          const featDiv = html.match(/id="feature-bullets"[^>]*>[\s\S]*?<ul[^>]*>([\s\S]*?)<\/ul>/);
-          if (featDiv) {
-            const bullets = [...featDiv[1].matchAll(/<span class="a-list-item">([\s\S]*?)<\/span>/g)]
-              .map(m => m[1].replace(/<[^>]+>/g,'').replace(/&amp;/g,'&').replace(/&#39;/g,"'").trim())
-              .filter(b => b.length > 10 && b.length < 600 && !b.includes('{'))
-              .slice(0, 7);
-            if (bullets.length) product.description = bullets.join('\n');
-          }
-
-          // ── Item specifics from product detail table
-          for (const pat of [
-            /id="productDetails_techSpec[^"]*"[^>]*>([\s\S]*?)<\/table>/i,
-            /id="detailBullets_feature_div"[^>]*>([\s\S]*?)<\/div>/i,
-          ]) {
-            const m = html.match(pat);
-            if (!m) continue;
-            for (const row of [...m[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)].slice(0,12)) {
-              const cells = [...row[1].matchAll(/<t[hd][^>]*>([\s\S]*?)<\/t[hd]>/g)]
-                .map(c => c[1].replace(/<[^>]+>/g,'').replace(/[\u200f\u200e]/g,'').trim());
-              if (cells.length >= 2 && cells[0] && cells[1] && cells[0].length < 60)
-                product.aspects[cells[0]] = [cells[1]];
-            }
-            if (Object.keys(product.aspects).length) break;
-          }
-
-          product._debug = {
-            landingAsin, parentAsin, twisterFound: !!twisterData,
-            dims: dimOrder, varKeys: Object.keys(variationValues),
-            asinCount: Object.keys(asinDimVals).length,
-            pricesFetched: Object.keys(asinPrice).length,
-            images: allImages.length, colorMap: Object.keys(colorImgMap).length,
-          };
         }
 
-
-        // ── Top-level stock detection ────────────────────────────────────
-        // Check the page HTML for clear out-of-stock signals
-        if (url.includes('amazon.com')) {
-          const htmlLower = html.toLowerCase();
-          const outOfStockSignals = [
-            'currently unavailable',
-            'this item is currently unavailable',
-            'unavailable - we don\'t know when or if this item will be back in stock',
-            'item under review',
-            'we don\'t know when or if this item will be back in stock',
-            '"availability":"OUT_OF_STOCK"',
-            '"availability": "OUT_OF_STOCK"',
-            '"availability":"unavailable"',
-            '"outofstock"',
-          ];
-          const isOOS = outOfStockSignals.some(s => htmlLower.includes(s.toLowerCase()));
-          const hasAddToCart = html.includes('add-to-cart-button') || html.includes('addToCart') || html.includes('Add to Cart');
-
-          if (isOOS && !hasAddToCart) {
-            product.inStock = false;
-            product.quantity = 0;
-          } else {
-            // Also check from variation stock data if available
-            const allVarValues = (product.variations||[]).flatMap(vg => vg.values||[]);
-            if (allVarValues.length > 0) {
-              const anyInStock = allVarValues.some(v => v.enabled !== false && (v.stock === undefined || v.stock > 0));
-              product.inStock = anyInStock;
-              product.quantity = anyInStock ? 10 : 0;
-            } else {
-              product.inStock = true;
-              product.quantity = 10;
-            }
-          }
-          // Amazon shipping extraction
-          if (/FREE\s+(?:Delivery|Shipping)|FREE Returns/i.test(htmlLower) ||
-              html.includes('"isFreeShipping":true') || html.includes('"freeShipping":true')) {
-            product.scrapedShipping = 0;
-            product.shippingMethod = 'FREE Delivery';
-          } else {
-            const shipM = html.match(/\$([0-9]+\.[0-9]{2})\s+shipping/i) ||
-                          html.match(/"shippingPrice":\{"amount":"([0-9.]+)"/);
-            if (shipM) {
-              product.scrapedShipping = parseFloat(shipM[1]);
-              product.shippingMethod = `$${shipM[1]} shipping`;
-            } else {
-              // Default: Amazon Prime / standard items ship free
-              product.scrapedShipping = 0;
-              product.shippingMethod = 'FREE Delivery';
-            }
-          }
-          console.log(`stock: inStock=${product.inStock} oos=${isOOS} addToCart=${hasAddToCart}`);
-        }
-
-        // ── IMAGE FALLBACK: replace broken variation images with main photo ──
-        if (product.variationImages && product.images?.length) {
-          const mainImg = product.images[0];
-          const fixNested = (obj) => {
-            if (!obj || typeof obj !== 'object') return;
-            for (const key of Object.keys(obj)) {
-              if (typeof obj[key] === 'string' && !obj[key].startsWith('http')) {
-                obj[key] = mainImg;
-              } else if (typeof obj[key] === 'object') {
-                fixNested(obj[key]);
-              }
-            }
-          };
-          fixNested(product.variationImages);
-          // Also fix variation value images
-          (product.variations || []).forEach(vg => {
-            (vg.values || []).forEach(v => {
-              if (v.image && !v.image.startsWith('http')) v.image = mainImg;
-            });
+        // Fallback: if we couldn't fetch ASINs, use page images in order
+        if (!Object.keys(colorData).length && product.images.length) {
+          colors.forEach((c, i) => {
+            colorData[c] = { image: product.images[i] || product.images[0] || '', price: product.price, inStock: true };
           });
         }
 
-        return res.json({ success: true, product });
-      } catch (e) {
-        return res.json({ success: false, error: e.message, product });
+        // Build variation groups
+        if (colors.length) {
+          product.variations.push({
+            name: 'Color',
+            values: colors.map(c => ({
+              value:   c,
+              price:   colorData[c]?.price   || product.price || 0,
+              image:   colorData[c]?.image   || '',
+              inStock: colorData[c]?.inStock ?? true,
+              enabled: true,
+            })),
+          });
+          product.variationImages['Color'] = Object.fromEntries(
+            Object.entries(colorData).map(([c, d]) => [c, d.image]).filter(([, img]) => img)
+          );
+        }
+        if (sizes.length) {
+          product.variations.push({
+            name: 'Size',
+            values: sizes.map(s => ({
+              value: s, price: product.price || 0,
+              image: '', inStock: true, enabled: true,
+            })),
+          });
+        }
+
+        // Set product price to minimum color price
+        const colorPrices = colors.map(c => colorData[c]?.price).filter(Boolean);
+        if (colorPrices.length && !product.price) product.price = Math.min(...colorPrices);
       }
+
+      console.log(`[scrape] OK "${product.title.slice(0,50)}" price=$${product.price} colors=${product.variations.find(v=>v.name==='Color')?.values.length||0} imgs=${product.images.length}`);
+      return res.json({ success: true, product });
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // PUSH TO EBAY
-    // ═══════════════════════════════════════════════════════════
+    // ── PUSH: create eBay listing ─────────────────────────────────────────────
     if (action === 'push') {
       const { access_token, product, fulfillmentPolicyId, paymentPolicyId, returnPolicyId } = body;
-      if (!access_token || !product) return res.status(400).json({ error: 'Missing fields' });
-      console.log(`[push] "${(product.title||'').slice(0,60)}" hasVariations=${product.hasVariations} category=${product.categoryId||'none'} fps=${fulfillmentPolicyId||'none'}`);
+      if (!access_token || !product) return res.status(400).json({ error: 'Missing access_token or product' });
 
-      // ── AUTO CATEGORY DETECTION ──────────────────────────────────────
-      // Maps product title/aspects to correct eBay category ID
-      if (!product.categoryId || product.categoryId === '9355') {
-        const t  = (product.title||'').toLowerCase().replace(/&#39;/g,"'").replace(/&amp;/g,'&').replace(/&quot;/g,'"').replace(/&lt;/g,'<').replace(/&gt;/g,'>');
-        const br = Object.keys(product.aspects||{}).map(k=>(product.aspects[k]||[]).join(' ')).join(' ').toLowerCase();
-        const tx = t + ' ' + br; // combined signal
+      const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
+      console.log(`[push] "${product.title?.slice(0,60)}" hasVariations=${product.hasVariations}`);
 
-        const CAT = (id, label) => { product.categoryId = String(id); console.log(`auto-cat [${id}] ${label} — "${product.title?.slice(0,50)}"`); };
+      // Resolve policies
+      let policies;
+      try { policies = await resolvePolicies(access_token, { fulfillmentPolicyId, paymentPolicyId, returnPolicyId }); }
+      catch (e) { return res.status(400).json({ error: e.message }); }
 
-        // ── CLOTHING ────────────────────────────────────────────────────
-        if      (/\b(men.?s jeans?|boy.?s jeans?|denim pant|men.?s skinny|men.?s straight|men.?s slim jean|bootcut)\b/.test(tx)) CAT(11554,'Men Jeans');
-        else if (/\b(women.?s jeans?|girl.?s jeans?|ladies jeans?|jegging|skinny jeans?|high waist jeans?|plus size jeans?|womens jeans?|womens skinny|high waisted jeans?)\b/.test(tx)) CAT(11555,'Women Jeans');
-        else if (/\b(yoga pant|yoga legging|legging|athletic pant|workout pant|jogger|sweatpant|trackpant|lounge pant|capri pant|capris|cargo pant|cargo capri|palazzo|culottes|wide leg pant|women.?s pant|women.?s trouser|ladies pant)\b/.test(tx)) CAT(63862,'Women Pants');
-        else if (/\b(men.?s pant|men.?s trouser|dress pant|chino|khaki|cargo short|slack)\b/.test(tx)) CAT(57989,'Men Pants');
-        else if (/\b(men.?s short|board short|cargo short|swim trunk|swim short)\b/.test(tx)) CAT(15689,'Men Shorts');
-        else if (/\b(women.?s short|biker short|high waist short)\b/.test(tx)) CAT(11555,'Women Shorts');
-        else if (/\b(hoodie|sweatshirt|pullover|crewneck sweat)\b/.test(tx)) CAT(155183,'Hoodies Sweatshirts');
-        else if (/\b(men.?s t.?shirt|men.?s tee|graphic tee|crew tee)\b/.test(tx)) CAT(15687,'Men T-Shirts');
-        else if (/\b(women.?s t.?shirt|women.?s tee|women.?s top|crop top|tank top|cami)\b/.test(tx)) CAT(53159,'Women Tops');
-        else if (/\b(polo shirt|golf shirt)\b/.test(tx)) CAT(2403,'Polo Shirts');
-        else if (/\b(dress shirt|button down|button up|oxford shirt|flannel shirt)\b/.test(tx)) CAT(57990,'Dress Shirts');
-        else if (/\b(men.?s shirt)\b/.test(tx)) CAT(57990,'Men Shirts');
-        else if (/\b(blouse|women.?s shirt)\b/.test(tx)) CAT(53159,'Women Shirts');
-        else if (/\b(sweater|cardigan|pullover knit|turtleneck)\b/.test(tx)) CAT(11484,'Sweaters');
-        else if (/\b(dress|maxi dress|midi dress|mini dress|sun dress|wrap dress|bodycon)\b/.test(tx)) CAT(2311,'Women Dresses');
-        else if (/\b(skirt|mini skirt|maxi skirt|midi skirt|pleated skirt)\b/.test(tx)) CAT(2312,'Skirts');
-        else if (/\b(jumpsuit|romper|playsuit|overalls)\b/.test(tx)) CAT(152763,'Jumpsuits Rompers');
-        else if (/\b(men.?s jacket|puffer jacket|bomber jacket|denim jacket|parka|anorak|windbreaker|rain jacket)\b/.test(tx)) CAT(57988,'Men Jackets Coats');
-        else if (/\b(women.?s jacket|women.?s coat|blazer|trench coat)\b/.test(tx)) CAT(63862,'Women Jackets');
-        else if (/\b(wide.?leg pant|wide leg trouser|palazzo|culottes)\b/.test(tx)) CAT(63862,'Women Wide Leg Pants');
-        else if (/\b(suit|tuxedo|blazer jacket)\b/.test(tx)) CAT(3001,'Men Suits');
-        else if (/\b(vest|waistcoat)\b/.test(tx)) CAT(11476,'Vests');
-        else if (/\b(compression|rash guard|swim shirt|uv shirt)\b/.test(tx)) CAT(185100,'Athletic Shirts');
-        else if (/\b(underwear|boxer|brief|trunk|panty|bra|lingerie|thong)\b/.test(tx)) CAT(11511,'Underwear');
-        else if (/\b(sock|no.?show sock|ankle sock|compression sock|knee.?high sock)\b/.test(tx)) CAT(11471,'Socks');
-        else if (/\b(glove|mitten)\b/.test(tx)) CAT(131534,'Gloves');
-        else if (/\b(scarf|wrap|shawl|poncho)\b/.test(tx)) CAT(45238,'Scarves');
-        else if (/\b(beanie|winter hat|knit hat|bobble hat)\b/.test(tx)) CAT(52365,'Beanies');
-        else if (/\b(baseball cap|snapback|trucker hat|dad hat|bucket hat|sun hat|fedora|cowboy hat|cap)\b/.test(tx)) CAT(52365,'Hats Caps');
-        else if (/\b(swimsuit|bikini|one.?piece swim|monokini|swimwear|bathing suit)\b/.test(tx)) CAT(11491,'Swimwear');
-        else if (/\b(pajama|pyjama|sleepwear|nightgown|robe|lounge wear)\b/.test(tx)) CAT(11510,'Sleepwear');
-        else if (/\b(maternity|nursing|pregnancy)\b/.test(tx)) CAT(31848,'Maternity Clothing');
-        else if (/\b(uniform|scrub|workwear|hi.?vis|safety vest)\b/.test(tx)) CAT(57991,'Workwear');
-        else if (/\b(costume|halloween|cosplay)\b/.test(tx)) CAT(2435,'Costumes');
+      // AI category + aspects
+      const suggestions = await getCategories(product.title || '', access_token);
+      const ai = await aiEnrich(product.title, product.breadcrumbs || [], product.aspects || {}, suggestions);
+      const categoryId = ai?.categoryId || suggestions[0]?.id || '11450';
+      const listingTitle = (ai?.title || product.title || 'Product').slice(0, 80);
+      const aspects = { ...(product.aspects || {}), ...(ai?.aspects || {}) };
+      console.log(`[push] cat=${categoryId} "${listingTitle.slice(0,50)}"`);
 
-        // ── FOOTWEAR ─────────────────────────────────────────────────────
-        else if (/\b(sneaker|athletic shoe|running shoe|training shoe|tennis shoe)\b/.test(tx)) CAT(15709,'Sneakers');
-        else if (/\b(boot|ankle boot|chelsea boot|combat boot|cowboy boot|rain boot|snow boot|ugg)\b/.test(tx)) CAT(63889,'Boots');
-        else if (/\b(sandal|flip flop|thong sandal|slide|birkenstock)\b/.test(tx)) CAT(11632,'Sandals');
-        else if (/\b(loafer|moccasin|slip.?on|flat shoe|ballet flat|oxford shoe|derby)\b/.test(tx)) CAT(53120,'Flats Loafers');
-        else if (/\b(heel|stiletto|pump|wedge shoe|platform shoe)\b/.test(tx)) CAT(55793,'Heels');
-        else if (/\b(slipper|house shoe|clog)\b/.test(tx)) CAT(11632,'Slippers');
-        else if (/\b(shoe|footwear)\b/.test(tx)) CAT(63889,'Shoes');
+      // Merchant location
+      const locationKey = await ensureLocation(auth);
+      const basePrice   = parseFloat(product.price || 0).toFixed(2);
+      const groupSku    = `DS-${Date.now()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`;
 
-        // ── BAGS & ACCESSORIES ───────────────────────────────────────────
-        else if (/\b(backpack|rucksack|school bag|laptop bag backpack)\b/.test(tx)) CAT(169291,'Backpacks');
-        else if (/\b(handbag|purse|tote bag|shoulder bag|crossbody|clutch|satchel)\b/.test(tx)) CAT(169291,'Handbags');
-        else if (/\b(duffel|duffle|gym bag|travel bag|weekender)\b/.test(tx)) CAT(169291,'Duffel Bags');
-        else if (/\b(suitcase|luggage|carry.?on|hardshell luggage|rolling bag)\b/.test(tx)) CAT(48749,'Luggage');
-        else if (/\b(wallet|bifold|money clip|card holder|cardholder|card wallet)\b/.test(tx)) CAT(2996,'Wallets');
-        else if (/\b(belt|suspender|brace)\b/.test(tx)) CAT(2089,'Belts');
-        else if (/\b(sunglasses|sunglass|eyewear|uv400 glasses|polarized glasses)\b/.test(tx)) CAT(79720,'Sunglasses');
-        else if (/\b(glasses frame|eyeglass|spectacle|reading glasses)\b/.test(tx)) CAT(79720,'Eyeglasses');
-        else if (/\b(umbrella|parasol)\b/.test(tx)) CAT(2996,'Umbrellas');
-        else if (/\b(hair accessory|hair tie|scrunchie|headband|hair clip|barrette)\b/.test(tx)) CAT(50606,'Hair Accessories');
-
-        // ── JEWELRY ──────────────────────────────────────────────────────
-        else if (/\b(necklace|pendant|chain necklace|choker)\b/.test(tx)) CAT(164,'Necklaces');
-        else if (/\b(bracelet|bangle|charm bracelet|cuff bracelet)\b/.test(tx)) CAT(10978,'Bracelets');
-        else if (/\b(earring|stud earring|hoop earring|drop earring)\b/.test(tx)) CAT(10985,'Earrings');
-        else if (/\b(ring|engagement ring|band ring|promise ring)\b/.test(tx)) CAT(67726,'Rings');
-        else if (/\b(watch|smartwatch|chronograph|timepiece)\b/.test(tx)) CAT(31387,'Watches');
-        else if (/\b(jewelry set|jewellery set|jewelry bundle)\b/.test(tx)) CAT(10968,'Jewelry Sets');
-
-        // ── ELECTRONICS ──────────────────────────────────────────────────
-        else if (/\b(iphone|ipad|airpod|macbook|apple watch)\b/.test(tx)) CAT(9355,'Apple');
-        else if (/\b(samsung galaxy|samsung phone|android phone|smartphone|cell phone|mobile phone)\b/.test(tx)) CAT(9355,'Cell Phones');
-        else if (/\b(laptop|notebook computer|chromebook|macbook)\b/.test(tx)) CAT(177,'Laptops');
-        else if (/\b(tablet|ipad|kindle|e.?reader|android tablet)\b/.test(tx)) CAT(171485,'Tablets');
-        else if (/\b(headphone|earphone|earpiece|airpod|earbud|over.?ear|in.?ear)\b/.test(tx)) CAT(112529,'Headphones');
-        else if (/\b(bluetooth speaker|portable speaker|soundbar|speaker system)\b/.test(tx)) CAT(14969,'Speakers');
-        else if (/\b(keyboard|mechanical keyboard|gaming keyboard)\b/.test(tx)) CAT(3676,'Keyboards');
-        else if (/\b(mouse|gaming mouse|wireless mouse|trackpad)\b/.test(tx)) CAT(3676,'Computer Mouse');
-        else if (/\b(monitor|display screen|gaming monitor|4k monitor)\b/.test(tx)) CAT(80053,'Monitors');
-        else if (/\b(charger|charging cable|usb cable|lightning cable|power bank|power adapter)\b/.test(tx)) CAT(44980,'Chargers Cables');
-        else if (/\b(phone case|iphone case|samsung case|screen protector|tempered glass)\b/.test(tx)) CAT(9394,'Phone Cases');
-        else if (/\b(camera|dslr|mirrorless|action camera|gopro|webcam|dashcam)\b/.test(tx)) CAT(625,'Cameras');
-        else if (/\b(drone|quadcopter|fpv)\b/.test(tx)) CAT(179697,'Drones');
-        else if (/\b(smart home|alexa|google home|smart plug|smart bulb|ring doorbell)\b/.test(tx)) CAT(184435,'Smart Home');
-        else if (/\b(gaming chair|gaming headset|controller|joystick|gamepad|nintendo|playstation|xbox)\b/.test(tx)) CAT(139971,'Video Games');
-        else if (/\b(led strip|led light|ring light|desk lamp|floor lamp|string light)\b/.test(tx)) CAT(112581,'Lighting');
-        else if (/\b(extension cord|surge protector|power strip)\b/.test(tx)) CAT(44980,'Power Strips');
-        else if (/\b(printer|scanner|ink cartridge|toner)\b/.test(tx)) CAT(1245,'Printers');
-
-        // ── HOME & KITCHEN ───────────────────────────────────────────────
-        else if (/\b(air fryer|instant pot|pressure cooker|slow cooker|crockpot)\b/.test(tx)) CAT(20625,'Kitchen Appliances');
-        else if (/\b(coffee maker|espresso machine|french press|pour over|keurig|nespresso)\b/.test(tx)) CAT(20625,'Coffee Makers');
-        else if (/\b(blender|nutribullet|smoothie maker|food processor|juicer|mixer)\b/.test(tx)) CAT(20625,'Blenders');
-        else if (/\b(knife|chef knife|knife set|cutting board|kitchen shear|peeler|grater)\b/.test(tx)) CAT(20625,'Kitchen Knives');
-        else if (/\b(pan|skillet|frying pan|cast iron|wok|saute pan|griddle)\b/.test(tx)) CAT(20625,'Pans');
-        else if (/\b(pot|saucepan|dutch oven|stockpot|cookware set)\b/.test(tx)) CAT(20625,'Pots Cookware');
-        else if (/\b(baking sheet|baking pan|muffin tin|cake pan|pie dish|baking mat)\b/.test(tx)) CAT(20625,'Bakeware');
-        else if (/\b(food storage|meal prep container|tupperware|glass container|lunch box)\b/.test(tx)) CAT(20625,'Food Storage');
-        else if (/\b(water bottle|tumbler|travel mug|thermos|insulated bottle|stanley cup|hydro flask)\b/.test(tx)) CAT(20625,'Water Bottles');
-        else if (/\b(wine glass|cocktail glass|mug|cup|glassware|drinkware)\b/.test(tx)) CAT(20625,'Glassware');
-        else if (/\b(dish|plate|bowl|dinnerware|tableware|flatware|silverware|spoon|fork)\b/.test(tx)) CAT(20625,'Dinnerware');
-        else if (/\b(towel|bath towel|hand towel|washcloth|kitchen towel|dish towel)\b/.test(tx)) CAT(20625,'Towels');
-        else if (/\b(bedsheet|pillowcase|duvet cover|comforter|blanket|throw|quilt|pillow)\b/.test(tx)) CAT(20444,'Bedding');
-        else if (/\b(mattress|memory foam mattress|mattress topper|box spring)\b/.test(tx)) CAT(175758,'Mattresses');
-        else if (/\b(shower curtain|bath mat|toilet|bathroom accessory)\b/.test(tx)) CAT(20487,'Bathroom');
-        else if (/\b(candle|wax melt|diffuser|essential oil|air freshener|incense)\b/.test(tx)) CAT(116023,'Candles Scents');
-        else if (/\b(picture frame|wall art|poster|canvas print|wall decor|mirror)\b/.test(tx)) CAT(10033,'Wall Decor');
-        else if (/\b(storage bin|organizer|closet organizer|shelf|storage rack|drawer organizer)\b/.test(tx)) CAT(20580,'Storage Organization');
-        else if (/\b(vacuum|steam mop|mop|broom|dustpan|cleaning brush|sponge|microfiber)\b/.test(tx)) CAT(20580,'Cleaning');
-        else if (/\b(plant pot|planter|vase|garden pot|flower pot)\b/.test(tx)) CAT(181015,'Planters');
-        else if (/\b(tool|drill|saw|hammer|wrench|screwdriver|tape measure|level|power tool)\b/.test(tx)) CAT(631,'Tools');
-        else if (/\b(rug|area rug|floor mat|door mat|carpet runner)\b/.test(tx)) CAT(20571,'Rugs');
-        else if (/\b(curtain|drape|window blind|roman shade|valance)\b/.test(tx)) CAT(20580,'Window Treatment');
-        else if (/\b(lock|padlock|door handle|door knob|deadbolt|security camera|baby monitor)\b/.test(tx)) CAT(631,'Home Security');
-
-        // ── BEAUTY & PERSONAL CARE ───────────────────────────────────────
-        else if (/\b(lipstick|lip gloss|lip liner|lip balm|chapstick)\b/.test(tx)) CAT(11863,'Lip Makeup');
-        else if (/\b(mascara|eyeliner|eyeshadow|eye primer|eye makeup)\b/.test(tx)) CAT(11863,'Eye Makeup');
-        else if (/\b(foundation|concealer|blush|bronzer|highlighter|primer|bb cream|cc cream)\b/.test(tx)) CAT(11863,'Face Makeup');
-        else if (/\b(nail polish|nail gel|nail kit|nail art|nail file|nail clipper)\b/.test(tx)) CAT(11863,'Nail Care');
-        else if (/\b(perfume|cologne|fragrance|eau de toilette|eau de parfum)\b/.test(tx)) CAT(180345,'Fragrances');
-        else if (/\b(shampoo|conditioner|hair mask|hair serum|hair oil|dry shampoo)\b/.test(tx)) CAT(11858,'Hair Care');
-        else if (/\b(hair dryer|hair straightener|flat iron|curling iron|curling wand|hot tool)\b/.test(tx)) CAT(26397,'Hair Tools');
-        else if (/\b(face wash|facial cleanser|face mask|serum|moisturizer|toner|retinol|vitamin c serum)\b/.test(tx)) CAT(11858,'Skin Care');
-        else if (/\b(sunscreen|spf|sunblock)\b/.test(tx)) CAT(11858,'Sun Care');
-        else if (/\b(electric toothbrush|toothbrush|toothpaste|mouthwash|dental floss|whitening strip)\b/.test(tx)) CAT(26395,'Dental');
-        else if (/\b(razor|shaver|electric razor|trimmer|shaving cream|aftershave)\b/.test(tx)) CAT(26395,'Shaving');
-        else if (/\b(deodorant|antiperspirant|body spray|body wash|lotion|body butter)\b/.test(tx)) CAT(11858,'Body Care');
-
-        // ── SPORTS & FITNESS ─────────────────────────────────────────────
-        else if (/\b(yoga mat|exercise mat|foam roller|resistance band|pull up bar|ab roller)\b/.test(tx)) CAT(15273,'Fitness Equipment');
-        else if (/\b(dumbbell|barbell|weight plate|kettlebell|weight set)\b/.test(tx)) CAT(15273,'Weights');
-        else if (/\b(treadmill|elliptical|stationary bike|rowing machine|exercise bike)\b/.test(tx)) CAT(15273,'Cardio Equipment');
-        else if (/\b(protein powder|whey|creatine|pre.?workout|bcaa|mass gainer|protein shake)\b/.test(tx)) CAT(180959,'Sports Supplements');
-        else if (/\b(camping|tent|sleeping bag|hiking|trekking|backpacking|trail|outdoor gear)\b/.test(tx)) CAT(181389,'Camping Hiking');
-        else if (/\b(bike|bicycle|mountain bike|road bike|ebike|cycling)\b/.test(tx)) CAT(7294,'Cycling');
-        else if (/\b(fishing|fishing rod|fishing reel|tackle|lure|bait)\b/.test(tx)) CAT(11117,'Fishing');
-        else if (/\b(golf club|golf ball|golf bag|golf glove|golf tee|driver iron wedge)\b/.test(tx)) CAT(1513,'Golf');
-        else if (/\b(tennis racket|tennis ball|badminton|pickleball)\b/.test(tx)) CAT(159043,'Tennis');
-        else if (/\b(basketball|football|soccer ball|baseball|volleyball|football glove)\b/.test(tx)) CAT(888,'Team Sports');
-        else if (/\b(boxing glove|punching bag|mma|martial art|kickboxing)\b/.test(tx)) CAT(73991,'Boxing MMA');
-        else if (/\b(skateboard|longboard|roller skate|inline skate)\b/.test(tx)) CAT(2989,'Skating');
-        else if (/\b(ski|snowboard|snow goggle|ski jacket|ski boot)\b/.test(tx)) CAT(36261,'Skiing Snowboarding');
-        else if (/\b(swim goggle|swim cap|swimfin|swim training)\b/.test(tx)) CAT(26443,'Swimming');
-        else if (/\b(jump rope|speed rope|skipping rope)\b/.test(tx)) CAT(15273,'Jump Ropes');
-
-        // ── HEALTH & WELLNESS ────────────────────────────────────────────
-        else if (/\b(vitamin|multivitamin|fish oil|omega.?3|magnesium|zinc|iron supplement|probiotic|collagen)\b/.test(tx)) CAT(180959,'Vitamins Supplements');
-        else if (/\b(blood pressure|glucometer|pulse oximeter|thermometer|stethoscope)\b/.test(tx)) CAT(67784,'Health Monitors');
-        else if (/\b(heating pad|ice pack|back brace|knee brace|ankle brace|compression sleeve)\b/.test(tx)) CAT(73966,'Braces Supports');
-        else if (/\b(cpap|nebulizer|inhaler|blood sugar|glucose)\b/.test(tx)) CAT(67784,'Medical Equipment');
-        else if (/\b(scale|body fat scale|smart scale|bathroom scale)\b/.test(tx)) CAT(67784,'Scales');
-        else if (/\b(massage gun|massager|foam roller|neck massager|foot massager)\b/.test(tx)) CAT(67784,'Massage Relaxation');
-
-        // ── TOYS & KIDS ──────────────────────────────────────────────────
-        else if (/\b(lego|building block|construction toy)\b/.test(tx)) CAT(183446,'Building Blocks');
-        else if (/\b(rc car|remote control car|rc truck|rc drone|remote control toy)\b/.test(tx)) CAT(2562,'RC Toys');
-        else if (/\b(doll|barbie|action figure|stuffed animal|plush|teddy bear)\b/.test(tx)) CAT(19068,'Dolls Stuffed Animals');
-        else if (/\b(board game|card game|puzzle|jigsaw|tabletop game)\b/.test(tx)) CAT(2550,'Board Card Games');
-        else if (/\b(baby toy|infant toy|toddler toy|sensory toy|teether)\b/.test(tx)) CAT(19068,'Baby Toys');
-        else if (/\b(arts and craft|paint set|drawing|coloring book|slime|kinetic sand)\b/.test(tx)) CAT(11731,'Arts Crafts');
-        else if (/\b(scooter|kids bike|balance bike|tricycle|kids ride.?on)\b/.test(tx)) CAT(2989,'Kids Bikes Scooters');
-        else if (/\b(car seat|baby seat|booster seat)\b/.test(tx)) CAT(66692,'Car Seats');
-        else if (/\b(stroller|pram|baby carriage|baby carrier|baby wrap)\b/.test(tx)) CAT(182115,'Strollers');
-        else if (/\b(diaper|nappy|wipe|baby bottle|pacifier|nursing|breast pump)\b/.test(tx)) CAT(20394,'Baby Feeding');
-        else if (/\b(kids clothing|toddler clothing|baby clothing|onesie|romper baby|baby outfit)\b/.test(tx)) CAT(3082,'Kids Clothing');
-        else if (/\b(backpack kids|school bag kids|lunch bag kids)\b/.test(tx)) CAT(19068,'Kids Bags');
-
-        // ── PET ──────────────────────────────────────────────────────────
-        else if (/\b(dog leash|dog collar|dog harness|dog bed|dog crate|dog toy|puppy)\b/.test(tx)) CAT(20743,'Dog Supplies');
-        else if (/\b(cat litter|cat bed|cat toy|cat tree|cat scratching|kitten)\b/.test(tx)) CAT(20741,'Cat Supplies');
-        else if (/\b(dog food|cat food|pet food|pet treat|bird food|fish food)\b/.test(tx)) CAT(20741,'Pet Food');
-        else if (/\b(pet grooming|dog shampoo|cat shampoo|pet brush|nail grinder pet)\b/.test(tx)) CAT(20741,'Pet Grooming');
-        else if (/\b(fish tank|aquarium|terrarium|reptile|hamster|guinea pig|bird cage)\b/.test(tx)) CAT(20748,'Other Pets');
-
-        // ── AUTOMOTIVE ───────────────────────────────────────────────────
-        else if (/\b(car seat cover|steering wheel cover|car mat|trunk organizer|car phone mount)\b/.test(tx)) CAT(33637,'Car Accessories');
-        else if (/\b(jumper cable|jump starter|car battery charger|tire inflator|air compressor)\b/.test(tx)) CAT(33637,'Car Tools');
-        else if (/\b(motor oil|engine oil|synthetic oil|oil filter|car wax|car wash|detailing|ceramic coat|windshield washer|antifreeze|coolant)\b/.test(tx)) CAT(179819,'Motor Oil & Fluids');
-        else if (/\b(dashcam|backup camera|car camera|gps|car gps)\b/.test(tx)) CAT(33637,'Car Electronics');
-        else if (/\b(motorcycle|dirt bike|atv|helmet motorcycle|biker)\b/.test(tx)) CAT(10063,'Motorcycle');
-
-        // ── OFFICE & SCHOOL ──────────────────────────────────────────────
-        else if (/\b(notebook|journal|planner|bullet journal|diary)\b/.test(tx)) CAT(29223,'Notebooks Journals');
-        else if (/\b(pen|marker|highlighter|pencil|ballpoint|fountain pen|gel pen)\b/.test(tx)) CAT(29223,'Pens');
-        else if (/\b(desk organizer|file folder|binder|stapler|tape dispenser|paper clip)\b/.test(tx)) CAT(29223,'Office Supplies');
-        else if (/\b(monitor stand|desk mat|mouse pad|laptop stand|desk pad|cable management)\b/.test(tx)) CAT(58058,'Desk Accessories');
-        else if (/\b(whiteboard|corkboard|bulletin board|dry erase)\b/.test(tx)) CAT(29223,'Boards');
-        else if (/\b(calculator|scientific calculator)\b/.test(tx)) CAT(29223,'Calculators');
-
-        // ── GARDEN & OUTDOOR ─────────────────────────────────────────────
-        else if (/\b(garden hose|sprinkler|watering can|garden tool|shovel|rake|trowel|pruner)\b/.test(tx)) CAT(181015,'Garden Tools');
-        else if (/\b(outdoor furniture|patio chair|garden chair|adirondack|hammock|swing chair)\b/.test(tx)) CAT(3197,'Outdoor Furniture');
-        else if (/\b(bbq|grill|charcoal grill|gas grill|smoker|barbecue)\b/.test(tx)) CAT(42231,'Grills BBQ');
-        else if (/\b(bird feeder|bird bath|wind chime|garden statue|garden gnome)\b/.test(tx)) CAT(181015,'Garden Decor');
-        else if (/\b(seed|fertilizer|potting soil|compost|pesticide|weed killer|plant food)\b/.test(tx)) CAT(181015,'Gardening');
-        else if (/\b(solar light|pathway light|outdoor light|landscape light|string light outdoor)\b/.test(tx)) CAT(112581,'Outdoor Lighting');
-        else if (/\b(pool|hot tub|spa|inflatable pool|pool float|swim ring)\b/.test(tx)) CAT(20716,'Pools Spas');
-
-        // ── MUSIC & INSTRUMENTS ──────────────────────────────────────────
-        else if (/\b(guitar|electric guitar|acoustic guitar|bass guitar|ukulele)\b/.test(tx)) CAT(33034,'Guitars');
-        else if (/\b(piano|keyboard instrument|midi keyboard|synthesizer)\b/.test(tx)) CAT(180010,'Pianos Keyboards');
-        else if (/\b(drum|drum kit|drum pad|drumstick|percussion)\b/.test(tx)) CAT(180011,'Drums Percussion');
-        else if (/\b(microphone|condenser mic|dynamic mic|usb mic|recording)\b/.test(tx)) CAT(18872,'Microphones');
-        else if (/\b(vinyl record|turntable|record player)\b/.test(tx)) CAT(14969,'Turntables');
-
-        // ── FOOD & GROCERY ────────────────────────────────────────────────
-        else if (/\b(coffee bean|ground coffee|instant coffee|k.?cup|coffee pod)\b/.test(tx)) CAT(4438,'Coffee');
-        else if (/\b(tea|green tea|herbal tea|matcha|chai)\b/.test(tx)) CAT(4438,'Tea');
-        else if (/\b(snack|chip|candy|chocolate|cookie|cracker|popcorn|nut|trail mix)\b/.test(tx)) CAT(4438,'Snacks');
-        else if (/\b(protein bar|energy bar|granola bar|meal replacement)\b/.test(tx)) CAT(180959,'Nutrition Bars');
-        else if (/\b(hot sauce|seasoning|spice|condiment|olive oil|vinegar)\b/.test(tx)) CAT(4438,'Condiments Spices');
-
-        // ── FALLBACK ─────────────────────────────────────────────────────
-        else if (/\b(clothing|apparel|fashion|outfit|wear|garment)\b/.test(tx)) CAT(11450,'General Clothing');
-        // Last-resort fallback — use a multi-variation safe general category
-        else if (/\bjeans?\b/.test(tx) && /\bwom|girl|lad|female/.test(tx)) CAT(11555,'Women Jeans — fallback');
-        else if (/\bjeans?\b/.test(tx)) CAT(11554,'Men Jeans — fallback');
-        else if (/\bpant|trouser|legging|short\b/.test(tx) && /\bwom|girl|lad|female/.test(tx)) CAT(63862,'Women Pants — fallback');
-        else CAT(11450,'General — fallback');
-      }
-
-      // SKU must be alphanumeric + hyphens only, max 50 chars
-      const groupSku = `GRP${Date.now()}${Math.random().toString(36).slice(2,6).toUpperCase()}`;
-      const varSkuBase = `ITM${Date.now()}${Math.random().toString(36).slice(2,6).toUpperCase()}`;
-      const policies = {
-        fulfillmentPolicyId: (body.fulfillmentPolicyId||'').split('?')[0].trim(),
-        paymentPolicyId:     (body.paymentPolicyId||'').split('?')[0].trim(),
-        returnPolicyId:      (body.returnPolicyId||'').split('?')[0].trim(),
-      };
-      const authHeader = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
-
-      // ── Auto-resolve ALL 3 policies from eBay account ─────────────────────
-      // Fixes: 25007 (no shipping service) and 25009 (invalid return policy)
-      // If any policy ID is missing or invalid, fetch all policies and pick the best one.
-      const needsAnyPolicy = !policies.fulfillmentPolicyId || !policies.paymentPolicyId || !policies.returnPolicyId;
-      if (needsAnyPolicy) {
-        try {
-          const [fpRes, ppRes, rpRes] = await Promise.all([
-            fetch(`${EBAY_API}/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US`, { headers: authHeader }).then(r=>r.json()),
-            fetch(`${EBAY_API}/sell/account/v1/payment_policy?marketplace_id=EBAY_US`,     { headers: authHeader }).then(r=>r.json()),
-            fetch(`${EBAY_API}/sell/account/v1/return_policy?marketplace_id=EBAY_US`,      { headers: authHeader }).then(r=>r.json()),
-          ]);
-          console.log('[push] account policies - fp:', (fpRes.fulfillmentPolicies||[]).length, 'pp:', (ppRes.paymentPolicies||[]).length, 'rp:', (rpRes.returnPolicies||[]).length);
-
-          if (!policies.fulfillmentPolicyId) {
-            const fp = (fpRes.fulfillmentPolicies||[])[0];
-            if (fp?.fulfillmentPolicyId) { policies.fulfillmentPolicyId = fp.fulfillmentPolicyId; console.log('[push] auto fulfillment:', fp.name, fp.fulfillmentPolicyId); }
-          }
-          if (!policies.paymentPolicyId) {
-            const pp = (ppRes.paymentPolicies||[])[0];
-            if (pp?.paymentPolicyId) { policies.paymentPolicyId = pp.paymentPolicyId; console.log('[push] auto payment:', pp.name, pp.paymentPolicyId); }
-          }
-          if (!policies.returnPolicyId) {
-            const rp = (rpRes.returnPolicies||[]).find(p => p.returnsAccepted) || (rpRes.returnPolicies||[])[0];
-            if (rp?.returnPolicyId) { policies.returnPolicyId = rp.returnPolicyId; console.log('[push] auto return:', rp.name, rp.returnPolicyId); }
-          }
-        } catch(e) { console.error('[push] policy fetch error:', e.message); }
-      }
-
-      // If still no fulfillment policy — auto-create a free shipping one (fixes 25007)
-      if (!policies.fulfillmentPolicyId) {
-        try {
-          const fpNew = await fetch(`${EBAY_API}/sell/account/v1/fulfillment_policy`, {
-            method: 'POST', headers: authHeader,
-            body: JSON.stringify({
-              name: 'DropSync Free Shipping', marketplaceId: 'EBAY_US',
-              categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
-              handlingTime: { value: 3, unit: 'DAY' },
-              shippingOptions: [{
-                optionType: 'DOMESTIC', costType: 'FLAT_RATE',
-                shippingServices: [{ shippingServiceCode: 'USPSFirstClass', buyerResponsibleForShipping: false, freeShipping: true, shippingCost: { value: '0.00', currency: 'USD' } }],
-              }],
-            }),
-          });
-          const fpData = await fpNew.json();
-          if (fpData.fulfillmentPolicyId) { policies.fulfillmentPolicyId = fpData.fulfillmentPolicyId; console.log('[push] created fulfillment policy:', fpData.fulfillmentPolicyId); }
-          else console.error('[push] fulfillment policy create failed:', JSON.stringify(fpData).slice(0,300));
-        } catch(e) { console.error('[push] fulfillment create error:', e.message); }
-      }
-
-      // If still no return policy — auto-create one (fixes 25009)
-      if (!policies.returnPolicyId) {
-        try {
-          const rpNew = await fetch(`${EBAY_API}/sell/account/v1/return_policy`, {
-            method: 'POST', headers: authHeader,
-            body: JSON.stringify({
-              name: 'DropSync Returns', marketplaceId: 'EBAY_US',
-              categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
-              returnsAccepted: true, returnPeriod: { value: 30, unit: 'DAY' },
-              returnShippingCostPayer: 'BUYER', refundMethod: 'MONEY_BACK',
-            }),
-          });
-          const rpData = await rpNew.json();
-          if (rpData.returnPolicyId) { policies.returnPolicyId = rpData.returnPolicyId; console.log('[push] created return policy:', rpData.returnPolicyId); }
-          else console.error('[push] return policy create failed:', JSON.stringify(rpData).slice(0,300));
-        } catch(e) { console.error('[push] return create error:', e.message); }
-      }
-
-      if (!policies.fulfillmentPolicyId) return res.status(400).json({ error: 'No fulfillment (shipping) policy found. Go to eBay Seller Hub → Business Policies and create a shipping policy.', errorId: 25007 });
-      if (!policies.returnPolicyId)      return res.status(400).json({ error: 'No return policy found. Go to eBay Seller Hub → Business Policies and create a return policy.', errorId: 25009 });
-      console.log('[push] policies final:', JSON.stringify(policies));
-
-      // Simple listing — no variations
+      // ── SIMPLE LISTING ─────────────────────────────────────────────────────
       if (!product.hasVariations || !product.variations?.length) {
-        const invRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(groupSku)}`, {
-          method: 'PUT', headers: authHeader,
+        const ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(groupSku)}`, {
+          method: 'PUT', headers: auth,
           body: JSON.stringify({
             availability: { shipToLocationAvailability: { quantity: parseInt(product.quantity)||10 } },
-            condition: product.condition || 'NEW',
-            product: { title: product.title.slice(0,80), description: product.description||product.title, imageUrls: (product.images||[]).slice(0,12), aspects: product.aspects||{} },
+            condition: 'NEW',
+            product: { title: listingTitle, description: product.description || listingTitle, imageUrls: product.images.slice(0,12), aspects },
           }),
         });
-        if (!invRes.ok) return res.status(400).json({ error: 'Inventory failed', details: await invRes.text() });
-        const offerRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, { method:'POST', headers:authHeader, body:JSON.stringify(buildOffer(groupSku, product, policies)) });
-        const offerData = await offerRes.json();
-        if (!offerRes.ok) return res.status(400).json({ error: 'Offer failed', details: offerData });
-        const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerData.offerId}/publish`, { method:'POST', headers:authHeader });
-        const pubData = await pubRes.json();
-        return res.json({ success:true, sku:groupSku, offerId:offerData.offerId, listingId:pubData.listingId });
-      }
+        if (!ir.ok) return res.status(400).json({ error: 'Inventory PUT failed', details: await ir.text() });
 
-      // Clean up variations before building:
-      // 1. Remove groups with only 1 value (eBay rejects single-value variation groups)
-      // 2. Remove groups where all values have the same value as another group (duplicates)
-      // 3. Move single-value groups to aspects instead
-      const cleanVariations = product.variations.filter(vg => {
-        const enabledVals = vg.values.filter(v => v.enabled !== false);
-        return enabledVals.length >= 2; // eBay requires at least 2 values per variation dimension
-      });
-      // If we filtered out some groups, add their single values to aspects
-      product.variations.filter(vg => {
-        const enabledVals = vg.values.filter(v => v.enabled !== false);
-        return enabledVals.length === 1;
-      }).forEach(vg => {
-        const v = vg.values.find(v => v.enabled !== false);
-        if (v && !product.aspects[vg.name]) product.aspects[vg.name] = [v.value];
-      });
-
-      if (!cleanVariations.length) {
-        // No valid variation groups — fall back to single listing
-        const invRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(groupSku)}`, {
-          method: 'PUT', headers: authHeader,
-          body: JSON.stringify({
-            availability: { shipToLocationAvailability: { quantity: parseInt(product.quantity)||10 } },
-            condition: product.condition || 'NEW',
-            product: { title: product.title.slice(0,80), description: product.description||product.title, imageUrls: (product.images||[]).slice(0,12), aspects: product.aspects||{} },
-          }),
+        const or = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, {
+          method: 'POST', headers: auth,
+          body: JSON.stringify(buildOffer(groupSku, basePrice, categoryId, policies, locationKey)),
         });
-        if (!invRes.ok) return res.status(400).json({ error: 'Inventory failed', details: await invRes.text() });
-        const offerRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, { method:'POST', headers:authHeader, body:JSON.stringify(buildOffer(groupSku, product, policies)) });
-        const offerData = await offerRes.json();
-        if (!offerRes.ok) return res.status(400).json({ error: 'Offer failed', details: offerData });
-        const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerData.offerId}/publish`, { method:'POST', headers:authHeader });
-        const pubData = await pubRes.json();
-        return res.json({ success:true, sku:groupSku, offerId:offerData.offerId, listingId:pubData.listingId });
+        const od = await or.json();
+        if (!or.ok) return res.status(400).json({ error: 'Offer failed', details: od });
+
+        const pr  = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${od.offerId}/publish`, { method: 'POST', headers: auth });
+        const pd  = await pr.json();
+        return res.json({ success: true, sku: groupSku, offerId: od.offerId, listingId: pd.listingId });
       }
 
-      // Use cleaned variations for combos
-      product.variations = cleanVariations;
+      // ── VARIATION LISTING ──────────────────────────────────────────────────
+      const colorGroup = product.variations.find(v => /color|colour/i.test(v.name));
+      const sizeGroup  = product.variations.find(v => /size/i.test(v.name));
+      const colorImgs  = product.variationImages?.['Color'] || {};
 
-      // Ensure Brand is always set — required by most eBay categories
-      if (!product.aspects) product.aspects = {};
-      if (!product.aspects['Brand'] || !product.aspects['Brand'].length) {
-        const brandFromTitle = product.brand
-          || (product.title||'').match(/^([A-Z][a-zA-Z0-9&]+(?:\s+[A-Z][a-zA-Z0-9&]+)?)/)?.[1]
-          || 'Unbranded';
-        product.aspects['Brand'] = [brandFromTitle];
+      // Build flat variant list
+      const variants = [];
+      const mkSku = parts => `${groupSku}-${parts.join('-').replace(/[^A-Z0-9]/gi,'_').toUpperCase().slice(0,40)}`;
+
+      if (colorGroup && sizeGroup) {
+        for (const cv of colorGroup.values.filter(v => v.enabled!==false)) {
+          for (const sv of sizeGroup.values.filter(v => v.enabled!==false)) {
+            variants.push({ sku: mkSku([cv.value, sv.value]), color: cv.value, size: sv.value,
+              price: parseFloat(cv.price || basePrice).toFixed(2),
+              image: colorImgs[cv.value] || product.images[0] || '',
+              qty:   cv.inStock ? (parseInt(product.quantity)||10) : 0 });
+          }
+        }
+      } else if (colorGroup) {
+        for (const cv of colorGroup.values.filter(v => v.enabled!==false)) {
+          variants.push({ sku: mkSku([cv.value]), color: cv.value, size: null,
+            price: parseFloat(cv.price || basePrice).toFixed(2),
+            image: colorImgs[cv.value] || product.images[0] || '',
+            qty:   cv.inStock ? (parseInt(product.quantity)||10) : 0 });
+        }
+      } else if (sizeGroup) {
+        for (const sv of sizeGroup.values.filter(v => v.enabled!==false)) {
+          variants.push({ sku: mkSku([sv.value]), color: null, size: sv.value,
+            price: parseFloat(sv.price || basePrice).toFixed(2),
+            image: product.images[0] || '', qty: parseInt(product.quantity)||10 });
+        }
       }
 
-      // Auto-fill required clothing aspects ONLY for clothing/fashion categories
-      const clothingCats = new Set(['11554','11555','63862','57989','15689','155183','15687','53159','2403','57990','11484','2311','2312','152763','57988','11491','11510','31848','57991','2435','11476','185100','11511','11471','131534','45238','52365','63889','15709','169291','2996','2089','3001']);
-      const allSizeValues = (product.variations||[])
-        .filter(vg => /size/i.test(vg.name))
-        .flatMap(vg => vg.values.map(v => (v.value||'').toLowerCase()));
-      const tx2 = (product.title||'').replace(/&#39;/g,"'").replace(/&amp;/g,'&').toLowerCase();
+      const final = variants.slice(0, 250);
+      console.log(`[push] ${final.length} variants`);
 
-      if (clothingCats.has(String(product.categoryId)) && !product.aspects['Size Type']) {
-        const hasPlus   = allSizeValues.some(v => /plus|\b(1x|2x|3x|4x|0x)\b/.test(v)) || /plus.?size/.test(tx2);
-        const hasPetite = allSizeValues.some(v => /petite/.test(v)) || /petite/.test(tx2);
-        const hasTall   = allSizeValues.some(v => /\btall\b/.test(v)) || /\btall\b/.test(tx2);
-        if      (hasPlus)   product.aspects['Size Type'] = ['Plus'];
-        else if (hasPetite) product.aspects['Size Type'] = ['Petite'];
-        else if (hasTall)   product.aspects['Size Type'] = ['Tall'];
-        else                product.aspects['Size Type'] = ['Regular'];
-      }
-
-      if (clothingCats.has(String(product.categoryId)) && !product.aspects['Department']) {
-        if      (/\bwomen|\bwomens|\bladies|\bgirls/.test(tx2)) product.aspects['Department'] = ["Women's"];
-        else if (/\bmen|\bmens|\bboys/.test(tx2))                product.aspects['Department'] = ["Men's"];
-        else if (/\bkids|\bchildren|\bjunior|\btoddler/.test(tx2)) product.aspects['Department'] = ['Kids'];
-        else                                                          product.aspects['Department'] = ['Unisex'];
-      }
-
-      if (clothingCats.has(String(product.categoryId)) && !product.aspects['Type']) {
-        const cat = product.categoryId;
-        const t3  = tx2;
-        let type = null;
-        if      (/capri|cropped/.test(t3))                type = 'Capri';
-        else if (/cargo/.test(t3))                        type = 'Cargo';
-        else if (/jogger|sweatpant|trackpant/.test(t3))   type = 'Jogger';
-        else if (/legging/.test(t3))                      type = 'Leggings';
-        else if (/wide.?leg|palazzo|culottes/.test(t3))   type = 'Wide Leg';
-        else if (/straight.?leg/.test(t3))                type = 'Straight Leg';
-        else if (/slim.?fit|skinny/.test(t3))             type = 'Slim';
-        else if (/bootcut|boot.?cut/.test(t3))            type = 'Bootcut';
-        else if (/shorts?/.test(t3))                      type = 'Shorts';
-        else if (/dress/.test(t3))                        type = 'Dress';
-        else if (/skirt/.test(t3))                        type = 'Skirt';
-        else if (/hoodie/.test(t3))                       type = 'Hoodie';
-        else if (/jacket|coat/.test(t3))                  type = 'Jacket';
-        else if (/shirt|tee|top|blouse/.test(t3))         type = 'Shirt';
-        else if (/pant|trouser/.test(t3))                 type = 'Pants';
-        else if (cat === '181389')                        type = 'Pants';
-        else if (cat === '63862' || cat === '57989')      type = 'Pants';
-        else if (cat === '11554' || cat === '11555')      type = 'Jeans';
-        else if (cat === '185100')                        type = 'Athletic';
-        if (type) product.aspects['Type'] = [type];
-      }
-
-      if (clothingCats.has(String(product.categoryId)) && !product.aspects['Outer Shell Material'] && !product.aspects['Material']) {
-        // Search title + description + all aspects for material keywords
-        const matTx = [
-          tx2,
-          (product.description||'').toLowerCase(),
-          Object.entries(product.aspects||{}).map(([k,v])=>k+' '+v.join(' ')).join(' ').toLowerCase(),
-        ].join(' ');
-        let mat = 'Polyester'; // safe default
-        if      (/\b100%?\s*cotton|\bcotton\b/.test(matTx))           mat = 'Cotton';
-        else if (/\bdenim\b/.test(matTx))                              mat = 'Denim';
-        else if (/\bfleece\b/.test(matTx))                             mat = 'Fleece';
-        else if (/\bfrench terry|terry cloth|terrycloth\b/.test(matTx)) mat = 'Cotton';
-        else if (/\bcashmere\b/.test(matTx))                           mat = 'Cashmere';
-        else if (/\bwool\b/.test(matTx))                               mat = 'Wool';
-        else if (/\bsilk\b/.test(matTx))                               mat = 'Silk';
-        else if (/\blinen\b/.test(matTx))                              mat = 'Linen';
-        else if (/\bvelvet\b/.test(matTx))                             mat = 'Velvet';
-        else if (/\bsuede\b/.test(matTx))                              mat = 'Suede';
-        else if (/\bfaux leather|vegan leather|pu leather\b/.test(matTx)) mat = 'Faux Leather';
-        else if (/\bleather\b/.test(matTx))                            mat = 'Leather';
-        else if (/\brayon|viscose\b/.test(matTx))                      mat = 'Rayon';
-        else if (/\bspandex|elastane\b/.test(matTx))                   mat = 'Spandex';
-        else if (/\bnylon\b/.test(matTx))                              mat = 'Nylon';
-        else if (/\bpolyester\b/.test(matTx))                          mat = 'Polyester';
-        else if (/\bacrylic\b/.test(matTx))                            mat = 'Acrylic';
-        else if (/\bbamboo\b/.test(matTx))                             mat = 'Bamboo';
-        else if (/\bmodal\b/.test(matTx))                              mat = 'Modal';
-        // Also check Amazon's own Material aspect if scraped
-        const amazonMat = (product.aspects['Material Type']||product.aspects['material_type']||[])[0];
-        if (amazonMat) mat = amazonMat;
-        product.aspects['Outer Shell Material'] = [mat];
-        console.log('material:', mat);
-      }
-
-      product.variations.forEach((vg, gi) => {
-        if (gi > 0) vg.values.forEach(v => { delete v.price; delete v.sourcePrice; });
-      });
-
-      // Cap at 100 combos to avoid timeout
-      let combos = buildCombos(product.variations);
-      if (combos.length > 100) {
-        const inStock  = combos.filter(c => c.every(v => (v.stock||0) > 0));
-        const outStock = combos.filter(c => c.some(v => (v.stock||0) === 0));
-        combos = [...inStock, ...outStock].slice(0, 100);
-        console.log('Trimmed combos to 100');
-      }
-
-      // ── STEP 1: Build combo metadata & deduplicate SKUs ──────────────
-      const usedSkus  = new Set();
-      const comboList = [];
-      for (const [idx, combo] of combos.entries()) {
-        if (combo.every(v => v.enabled === false)) continue;
-        const seg = combo.map(v => (String(v.value||'').replace(/[^a-zA-Z0-9]/g,'').slice(0,6).toUpperCase()) || 'VAR');
-        let varSku = `${varSkuBase}${seg.join('').slice(0,16)}`;
-        if (usedSkus.has(varSku)) varSku = `${varSkuBase}${String(idx).padStart(4,'0')}`;
-        usedSkus.add(varSku);
-        // Price + qty from LAST variation group value in this combo
-        const lastVg  = product.variations[product.variations.length - 1];
-        const lastVal = combo[combo.length - 1];
-        const lastVv  = lastVg?.values.find(v => v.value === lastVal?.value);
-        const varPrice = (lastVv?.price && parseFloat(lastVv.price) > 0) ? lastVv.price : product.price;
-        const varStock = lastVv?.stock !== undefined ? lastVv.stock : (parseInt(product.quantity)||10);
-        const varImages = getVarImages(combo, product.variationImages, product.images);
-        const varAspects = { ...(product.aspects||{}) };
-        combo.forEach(v => { varAspects[v.name] = [v.value]; });
-        comboList.push({ varSku, varPrice, varStock, varImages, varAspects });
-      }
-
-      // ── STEP 2: Create inventory_item per CHILD variant ─────────────
-      // Each child has its own: stock quantity, images, variant-specific aspects
-      // NO price here — price lives on the offer
-      const createdSkus = [];
-      for (let i = 0; i < comboList.length; i += 10) {
-        await Promise.all(comboList.slice(i, i+10).map(async ({ varSku, varStock, varImages, varAspects }) => {
-          const r = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(varSku)}`, {
-            method: 'PUT', headers: authHeader,
+      // PUT each inventory_item (batched)
+      let okInv = 0;
+      for (let i = 0; i < final.length; i += 8) {
+        await Promise.all(final.slice(i, i+8).map(async v => {
+          const asp = { ...aspects };
+          if (v.color) asp['Color'] = [v.color];
+          if (v.size)  asp['Size']  = [v.size];
+          const r = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(v.sku)}`, {
+            method: 'PUT', headers: auth,
             body: JSON.stringify({
-              availability: { shipToLocationAvailability: { quantity: Math.max(0, parseInt(varStock)||0) } },
-              condition: product.condition || 'NEW',
+              availability: { shipToLocationAvailability: { quantity: v.qty } },
+              condition: 'NEW',
               product: {
-                title:     product.title.slice(0,80),
-                imageUrls: varImages.slice(0,1), // one image per child variant
-                aspects:   varAspects,
+                title: listingTitle, description: product.description || listingTitle,
+                imageUrls: [v.image, ...product.images.filter(x => x !== v.image)].filter(Boolean).slice(0, 12),
+                aspects: asp,
               },
             }),
           });
-          if (r.ok) { createdSkus.push(varSku); if (createdSkus.length===1) console.log('first varSku ok:', varSku); }
-          else console.error('varSku failed:', varSku, (await r.text()).slice(0,200));
+          if (r.ok || r.status === 204) okInv++;
+          else console.warn(`[push] inv ${v.sku.slice(-15)}: ${r.status}`);
         }));
+        if (i+8 < final.length) await sleep(150);
       }
-      if (!createdSkus.length) return res.status(400).json({ error: 'No variant inventory items created' });
+      console.log(`[push] inventory items: ${okInv}/${final.length}`);
 
-      // ── Collect all unique child images for the group (no cap — one per child)
-      const allChildImages = [...new Set(comboList.map(c => c.varImages[0]).filter(Boolean))];
-      // Use all child images for the group, falling back to product images if needed
-      const groupImageUrls = allChildImages.length ? allChildImages : (product.images||[]);
+      // PUT inventory_item_group
+      const varAspects = {};
+      if (colorGroup) varAspects['Color'] = colorGroup.values.map(v => v.value);
+      if (sizeGroup)  varAspects['Size']  = sizeGroup.values.map(v => v.value);
 
-      // ── STEP 3: Create inventory_item_group (PARENT) ─────────────────
-      // Normalize variesBy aspect names to match eBay's expected names
-      // eBay requires exact aspect names — "Size" → "Size", "Color" → "Color" etc.
-      const normalizeVarName = n => {
-        const map = { 'colour':'Color','colours':'Color','colors':'Color','size':'Size','sizes':'Size','style':'Style','material':'Material','pattern':'Pattern','pack quantity':'Package Quantity','package quantity':'Package Quantity','package qty':'Package Quantity','configuration':'Configuration','edition':'Edition','scent':'Scent','flavor':'Flavor','flavour':'Flavor' };
-        return map[n.toLowerCase()] || n;
-      };
-      product.variations.forEach(vg => { vg.name = normalizeVarName(vg.name); });
-
-      // Re-sync varAspects names after normalisation (use varAspects keys that match old names)
-      comboList.forEach(({ varAspects }) => {
-        product.variations.forEach(vg => {
-          // varAspects was built with old names — update keys to normalised names
-          const oldKeys = Object.keys(varAspects).filter(k => normalizeVarName(k) !== k);
-          oldKeys.forEach(k => { varAspects[normalizeVarName(k)] = varAspects[k]; delete varAspects[k]; });
+      let groupOk = false;
+      for (let attempt = 1; attempt <= 3 && !groupOk; attempt++) {
+        const gr = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(groupSku)}`, {
+          method: 'PUT', headers: auth,
+          body: JSON.stringify({
+            inventoryItemGroupKey: groupSku, title: listingTitle,
+            description: product.description || listingTitle,
+            imageUrls: product.images.slice(0, 12),
+            variantSKUs: final.map(v => v.sku),
+            aspects: varAspects, variesBy: Object.keys(varAspects),
+          }),
         });
-      });
-
-      const groupRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(groupSku)}`, {
-        method: 'PUT', headers: authHeader,
-        body: JSON.stringify({
-          inventoryItemGroupKey: groupSku,
-          title:       product.title.slice(0,80),
-          description: product.description || product.title,
-          imageUrls:   groupImageUrls,
-          aspects:     product.aspects || {},
-          variantSKUs: createdSkus,
-          variesBy: {
-            aspectsImageVariesBy: Object.keys(product.variationImages||{}).slice(0,1),
-            specifications: product.variations.map(vg => ({
-              name:   vg.name,
-              values: vg.values.filter(v=>v.enabled!==false).map(v=>v.value),
-            })),
-          },
-        }),
-      });
-      if (!groupRes.ok) return res.status(400).json({ error: 'Group failed', details: await groupRes.text() });
-      console.log('groupRes ok:', groupRes.status);
-
-      // ── STEP 4: Get/create merchant location ─────────────────────────
-      let merchantLocationKey = 'MainWarehouse';
-      try {
-        const locRes  = await fetch(`${EBAY_API}/sell/inventory/v1/location`, { headers: authHeader });
-        const locData = await locRes.json();
-        if (locData.locations?.length) {
-          merchantLocationKey = locData.locations[0].merchantLocationKey;
-        } else {
-          await fetch(`${EBAY_API}/sell/inventory/v1/location/MainWarehouse`, {
-            method: 'POST', headers: authHeader,
-            body: JSON.stringify({
-              location: { address: { addressLine1:'1 Main St', city:'San Jose', stateOrProvince:'CA', postalCode:'95125', country:'US' } },
-              locationTypes: ['WAREHOUSE'], name: 'Main Warehouse', merchantLocationStatus: 'ENABLED',
-            }),
-          });
+        if (gr.ok || gr.status === 204) { groupOk = true; console.log('[push] group ok'); }
+        else {
+          const gt = await gr.text();
+          console.warn(`[push] group attempt ${attempt}: ${gr.status}`, gt.slice(0,200));
+          if (attempt < 3) await sleep(600); else return res.status(400).json({ error: 'Group PUT failed', details: gt.slice(0,400) });
         }
-      } catch(e) { console.log('location error:', e.message); }
-      console.log('merchantLocationKey:', merchantLocationKey);
-
-      // ── STEP 5 (was): Return policy now resolved at top of push action ──
-
-      // ── STEP 6: bulkCreateOffer — one per CHILD variant ──────────────
-      // Each child offer has: sku, price, availableQuantity, policies
-      // Description lives on the GROUP — do NOT set listingDescription on child offers
-      const listingPolicies = {};
-      if (policies.fulfillmentPolicyId) listingPolicies.fulfillmentPolicyId = policies.fulfillmentPolicyId;
-      if (policies.paymentPolicyId)     listingPolicies.paymentPolicyId     = policies.paymentPolicyId;
-      if (policies.returnPolicyId)      listingPolicies.returnPolicyId      = policies.returnPolicyId;
-
-      const offerRequests = createdSkus.map((varSku) => {
-        const c = comboList.find(x => x.varSku === varSku);
-        return {
-          sku:             varSku,
-          marketplaceId:  'EBAY_US',
-          format:         'FIXED_PRICE',
-          listingDuration:'GTC',
-          categoryId:      product.categoryId || '9355',
-          merchantLocationKey,
-          listingPolicies,
-          pricingSummary:  { price: { value: String(parseFloat(c?.varPrice||product.price||0).toFixed(2)), currency:'USD' } },
-          availableQuantity: Math.max(0, parseInt(c?.varStock||product.quantity)||0),
-        };
-      });
-
-      const offerIds = [];
-      for (let i = 0; i < offerRequests.length; i += 25) {
-        const bulkRes  = await fetch(`${EBAY_API}/sell/inventory/v1/bulk_create_offer`, {
-          method: 'POST', headers: authHeader,
-          body: JSON.stringify({ requests: offerRequests.slice(i, i+25) }),
-        });
-        const bulkData = await bulkRes.json();
-        console.log(`offer batch ${i/25+1}: ${bulkRes.status}, ${bulkData.responses?.length} responses`);
-        (bulkData.responses||[]).forEach(r => {
-          if (r.offerId) offerIds.push(r.offerId);
-          else console.log('offer failed:', JSON.stringify(r).slice(0,300));
-        });
       }
-      console.log(`Created ${offerIds.length}/${createdSkus.length} offers`);
-      if (!offerIds.length) return res.status(400).json({ error: 'No offers created' });
 
-      // ── STEP 7: publish_by_inventory_item_group ───────────────────────
-      let pubData, pubStatus;
+      // Bulk create offers (25 at a time)
+      const allOfferIds = [];
+      for (let i = 0; i < final.length; i += 25) {
+        const batch = final.slice(i, i+25).map(v => buildOffer(v.sku, v.price, categoryId, policies, locationKey));
+        const or = await fetch(`${EBAY_API}/sell/inventory/v1/bulk_create_offer`, {
+          method: 'POST', headers: auth, body: JSON.stringify({ requests: batch }),
+        });
+        const od = await or.json();
+        for (const resp of (od.responses || [])) { if (resp.offerId) allOfferIds.push(resp.offerId); }
+        console.log(`[push] offers batch ${Math.floor(i/25)+1}: ${(od.responses||[]).filter(r=>r.offerId).length} ok`);
+      }
+
+      // Publish by group
       for (let attempt = 1; attempt <= 3; attempt++) {
-        const pubRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/publish_by_inventory_item_group`, {
-          method: 'POST', headers: authHeader,
+        const pr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/publish_by_inventory_item_group`, {
+          method: 'POST', headers: auth,
           body: JSON.stringify({ inventoryItemGroupKey: groupSku, marketplaceId: 'EBAY_US' }),
         });
-        pubData   = await pubRes.json();
-        pubStatus = pubRes.status;
-        console.log(`publishByGroup attempt ${attempt}:`, pubStatus, JSON.stringify(pubData).slice(0,500));
-        if (pubRes.ok) break;
-        if (pubStatus === 500) {
-          await new Promise(r => setTimeout(r, 3000 * attempt));
-          continue;
+        const pd = await pr.json();
+        if (pd.listingId) {
+          console.log(`[push] published! listingId=${pd.listingId}`);
+          return res.json({ success: true, sku: groupSku, listingId: pd.listingId, variantsCreated: final.length });
         }
-
-        // If missing item specifics — fill them in and retry via updateOffer
-        const missingAspects = (pubData.errors||[])
-          .filter(e => e.errorId === 25002 && e.parameters?.some(p => p.name === '2'))
-          .map(e => e.parameters.find(p => p.name === '2')?.value)
-          .filter(Boolean);
-        if (missingAspects.length && attempt < 3) {
-          console.log('filling missing aspects:', missingAspects);
-          missingAspects.forEach(asp => { if (!product.aspects[asp]) product.aspects[asp] = ['Not Specified']; });
-          // Update the inventory item group with new aspects
-          await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(groupSku)}`, {
-            method: 'PUT', headers: authHeader,
-            body: JSON.stringify({
-              inventoryItemGroupKey: groupSku,
-              title: product.title.slice(0,80),
-              description: product.description || product.title,
-              imageUrls: groupImageUrls,
-              aspects: product.aspects,
-              variantSKUs: createdSkus,
-              variesBy: {
-                aspectsImageVariesBy: Object.keys(product.variationImages||{}).slice(0,1),
-                specifications: product.variations.map(vg => ({
-                  name: vg.name,
-                  values: vg.values.filter(v=>v.enabled!==false).map(v=>v.value),
-                })),
-              },
-            }),
-          });
-          // Also update inventory items aspects
-          for (let i = 0; i < comboList.length; i += 10) {
-            await Promise.all(comboList.slice(i,i+10).map(async ({ varSku, varStock, varImages, varAspects }) => {
-              missingAspects.forEach(asp => { if (!varAspects[asp]) varAspects[asp] = ['Not Specified']; });
-              await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(varSku)}`, {
-                method: 'PUT', headers: authHeader,
-                body: JSON.stringify({
-                  availability: { shipToLocationAvailability: { quantity: Math.max(0, parseInt(varStock)||0) } },
-                  condition: product.condition || 'NEW',
-                  product: { title: product.title.slice(0,80), imageUrls: varImages.slice(0,1), aspects: varAspects }, // one image per child
-                }),
-              });
-            }));
+        const errId = (pd.errors||[])[0]?.errorId;
+        console.warn(`[push] publish attempt ${attempt}: ${JSON.stringify(pd).slice(0,300)}`);
+        if (attempt === 3) return res.status(400).json({ error: 'Publish failed', details: pd, errorId: errId });
+        // Add missing aspects if required
+        if (errId === 25004 || errId === 25003) {
+          for (const param of (pd.errors||[])[0]?.parameters||[]) {
+            if (!aspects[param.value]) aspects[param.value] = ['Unbranded'];
           }
-          continue; // retry publish
         }
-        break;
+        await sleep(800);
       }
-      if (pubStatus !== 200 && pubStatus !== 201) return res.status(400).json({ error: 'Publish failed', details: pubData });
-      return res.json({ success:true, sku:groupSku, listingId:pubData.listingId, variationsCreated:offerIds.length });
     }
 
-    if (action === 'policies') {
-      const token = req.query.access_token || body.access_token;
-      if (!token) return res.status(400).json({ error: 'No token' });
-      const h = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
-      const [fp, pp, rp] = await Promise.all([
-        fetch(`${EBAY_API}/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US`, { headers: h }).then(r => r.json()),
-        fetch(`${EBAY_API}/sell/account/v1/payment_policy?marketplace_id=EBAY_US`, { headers: h }).then(r => r.json()),
-        fetch(`${EBAY_API}/sell/account/v1/return_policy?marketplace_id=EBAY_US`, { headers: h }).then(r => r.json()),
-      ]);
-      console.log('fp:', JSON.stringify(fp).slice(0,300));
-      console.log('pp:', JSON.stringify(pp).slice(0,300));
-      console.log('rp:', JSON.stringify(rp).slice(0,300));
-      return res.json({
-        fulfillment: (fp.fulfillmentPolicies || []).map(p => ({ id: p.fulfillmentPolicyId, name: p.name })),
-        payment:     (pp.paymentPolicies    || []).map(p => ({ id: p.paymentPolicyId,     name: p.name })),
-        return:      (rp.returnPolicies     || []).map(p => ({ id: p.returnPolicyId,      name: p.name })),
-        _raw: { fp, pp, rp }
-      });
-    }
-
-    if (action === 'orders') {
-      const token = req.query.access_token || body.access_token;
-      const r = await fetch(`${EBAY_API}/sell/fulfillment/v1/order?limit=50`, { headers: { Authorization:`Bearer ${token}` } });
-      return res.json(await r.json());
-    }
-
-    // ── SYNC: receive frontend price/stock data, push changes to eBay ──────────
-    // The frontend (_runPriceStockCheck) already scraped Amazon and computed new prices.
-    // This action just takes those computed values and updates eBay accordingly.
+    // ── SYNC: re-scrape Amazon, push diffs to eBay ────────────────────────────
     if (action === 'sync') {
-      const { access_token, products } = body;
-      if (!access_token || !products?.length) return res.status(400).json({ error: 'Missing fields' });
+      const { access_token, ebaySku, sourceUrl, hasVariations, quantity, variations, variationImages } = body;
+      if (!access_token || !ebaySku) return res.status(400).json({ error: 'Missing fields' });
+      const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
 
-      const results = [];
+      // Re-scrape to get fresh data
+      const ua   = randUA();
+      const html = await fetchPage(sourceUrl, ua);
+      if (!html) return res.json({ success: false, error: 'Could not re-fetch Amazon page' });
 
-      for (const product of products) {
-        if (!product.ebaySku) { results.push({ id: product.id, skipped: true, reason: 'no sku' }); continue; }
+      const freshPrice = extractPrice(html);
+      const freshStock = !html.toLowerCase().includes('currently unavailable');
 
-        try {
-          const authHeader = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' };
-          const groupSku = product.ebaySku;
-
-          // ── Step 1: fetch current group to get all variant SKUs ──────────
-          let varSkus = [];
-          const grpRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(groupSku)}`, { headers: authHeader });
-          if (grpRes.ok) {
-            const grpData = await grpRes.json();
-            varSkus = grpData.variantSKUs || [];
-          }
-
-          const isSimple = varSkus.length === 0;
-          let updated = 0;
-          let priceChanged = false;
-          let stockChanged = false;
-          let imagesChanged = false;
-
-          // ── Step 2: build a map of variation value → { price, stock, image } ──
-          // from the frontend's product.variations (which already have updated prices/stock)
-          // Key format: "Color:Black", "Size:XL" etc — matches eBay aspect values
-          const varMap = {}; // "value" → { price, stock, inStock }
-          (product.variations || []).forEach(vg => {
-            (vg.values || []).forEach(v => {
-              varMap[v.value.toLowerCase()] = {
-                price:   parseFloat(v.price || product.price || 0),
-                stock:   v.inStock === false || v.stock === 0 ? 0 : (v.stock || 10),
-                inStock: v.inStock !== false && v.stock !== 0,
-                image:   v.image || '',
-              };
-            });
+      if (!hasVariations) {
+        const offerList = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(ebaySku)}`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
+        const offerId = (offerList.offers||[])[0]?.offerId;
+        if (offerId && freshPrice) {
+          await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerId}`, {
+            method: 'PUT', headers: auth,
+            body: JSON.stringify({ pricingSummary: { price: { value: String(freshPrice.toFixed(2)), currency: 'USD' } } }),
           });
-
-          const hasVariations = product.hasVariations && (product.variations||[]).length > 0;
-
-          // ── Step 3: For simple (non-variation) listings ──────────────────
-          if (isSimple || !hasVariations) {
-            const newPrice = parseFloat(product.price || 0);
-            const newQty   = product.quantity ?? 10;
-
-            // Find the single offer for this SKU
-            const offRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(groupSku)}&limit=1`, { headers: authHeader });
-            if (offRes.ok) {
-              const offData = await offRes.json();
-              const offer = offData.offers?.[0];
-              if (offer) {
-                const oldPrice = parseFloat(offer.pricingSummary?.price?.value || 0);
-                const oldQty   = offer.availableQuantity ?? 10;
-                priceChanged = Math.abs(newPrice - oldPrice) > 0.01;
-                stockChanged = newQty !== oldQty;
-                if (priceChanged || stockChanged) {
-                  const updateBody = { ...offer };
-                  if (priceChanged) updateBody.pricingSummary = { price: { value: newPrice.toFixed(2), currency: 'USD' } };
-                  updateBody.availableQuantity = Math.max(0, newQty);
-                  const upRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}`, {
-                    method: 'PUT', headers: authHeader, body: JSON.stringify(updateBody),
-                  });
-                  if (upRes.ok || upRes.status === 204) {
-                    // Also update inventory item qty
-                    await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(groupSku)}`, {
-                      method: 'PUT', headers: authHeader,
-                      body: JSON.stringify({ availability: { shipToLocationAvailability: { quantity: Math.max(0, newQty) } }, condition: 'NEW' }),
-                    });
-                    updated++;
-                  }
-                } else {
-                  results.push({ id: product.id, unchanged: true }); continue;
-                }
-              }
-            }
-          }
-
-          // ── Step 4: For variation listings — update each variant's offer + inventory ──
-          if (hasVariations && varSkus.length > 0) {
-            // Fetch all offers for all variant SKUs in batches of 20
-            const offerList = [];
-            for (let i = 0; i < varSkus.length; i += 20) {
-              const batch = varSkus.slice(i, i + 20);
-              const bRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${batch.map(s=>encodeURIComponent(s)).join(',')}&limit=20`, { headers: authHeader });
-              if (bRes.ok) {
-                const bData = await bRes.json();
-                (bData.offers || []).forEach(o => offerList.push(o));
-              }
-            }
-
-            // For each offer, match to a variation value via its SKU's inventory item aspects
-            // We process in batches of 5 to avoid rate limits
-            for (let i = 0; i < offerList.length; i += 5) {
-              await Promise.all(offerList.slice(i, i+5).map(async (offer) => {
-                try {
-                  // Fetch inventory item to get its aspects (Color=Black, Size=XL etc)
-                  const ivRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(offer.sku)}`, { headers: authHeader });
-                  if (!ivRes.ok) return;
-                  const iv = await ivRes.json();
-                  const aspects = iv.product?.aspects || {};
-
-                  // Find matching variation value from our map
-                  let matchedVar = null;
-                  for (const [dim, vals] of Object.entries(aspects)) {
-                    const val = Array.isArray(vals) ? vals[0] : vals;
-                    if (val && varMap[val.toLowerCase()]) {
-                      matchedVar = varMap[val.toLowerCase()];
-                      break;
-                    }
-                  }
-
-                  // Fall back to overall product price/stock if no match
-                  const newPrice = matchedVar ? matchedVar.price : parseFloat(product.price || 0);
-                  const newQty   = matchedVar ? matchedVar.stock : (product.quantity ?? 10);
-                  const varImg   = matchedVar?.image || '';
-
-                  const oldPrice = parseFloat(offer.pricingSummary?.price?.value || 0);
-                  const oldQty   = offer.availableQuantity ?? 10;
-                  const thisChanged = Math.abs(newPrice - oldPrice) > 0.01 || newQty !== oldQty;
-
-                  if (thisChanged) {
-                    priceChanged = priceChanged || Math.abs(newPrice - oldPrice) > 0.01;
-                    stockChanged = stockChanged || (newQty === 0 && oldQty > 0) || (newQty > 0 && oldQty === 0);
-
-                    // Update offer price + quantity
-                    const updateBody = {
-                      ...offer,
-                      pricingSummary: { price: { value: newPrice.toFixed(2), currency: 'USD' } },
-                      availableQuantity: Math.max(0, newQty),
-                    };
-                    const upRes = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}`, {
-                      method: 'PUT', headers: authHeader, body: JSON.stringify(updateBody),
-                    });
-
-                    // Update inventory item quantity + image
-                    const ivUpdate = {
-                      availability: { shipToLocationAvailability: { quantity: Math.max(0, newQty) } },
-                      condition: iv.condition || 'NEW',
-                      product: { ...iv.product },
-                    };
-                    if (varImg) ivUpdate.product.imageUrls = [varImg];
-                    await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(offer.sku)}`, {
-                      method: 'PUT', headers: authHeader, body: JSON.stringify(ivUpdate),
-                    });
-
-                    if (upRes.ok || upRes.status === 204) updated++;
-                    console.log(`sync var [${offer.sku}]: $${oldPrice}→$${newPrice}, qty ${oldQty}→${newQty}`);
-                  }
-                } catch(e2) { console.warn('var sync error:', offer.sku, e2.message); }
-              }));
-            }
-
-            // Update group images if changed
-            const oldImgs = (product.images || []).slice(0,3).join(',');
-            // We don't have fresh images here — frontend handles image detection
-            // Only update group-level images if product.images changed (frontend detects this)
-          }
-
-          const topInStock = product.quantity > 0;
-          results.push({
-            id: product.id, updated, priceChanged, stockChanged, imagesChanged,
-            inStock: topInStock,
-            backInStock: product.syncStatus === 'oos' && topInStock,
-            newSourcePrice: parseFloat(product.sourcePrice || 0),
-            newEbayPrice: parseFloat(product.price || 0),
-          });
-          console.log(`sync [${product.id}]: updated=${updated} priceChanged=${priceChanged} stockChanged=${stockChanged}`);
-
-        } catch(e) {
-          console.error('sync error for', product.id, e.message);
-          results.push({ id: product.id, error: e.message });
         }
+        await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(ebaySku)}`, {
+          method: 'PUT', headers: auth,
+          body: JSON.stringify({ availability: { shipToLocationAvailability: { quantity: freshStock ? parseInt(quantity)||10 : 0 } }, condition: 'NEW', product: {} }),
+        });
+        return res.json({ success: true, price: freshPrice, inStock: freshStock });
       }
 
-      return res.json({ success: true, results });
+      // Variation sync: update each color ASIN's price/stock
+      const colorGroup = (variations||[]).find(v => /color/i.test(v.name));
+      const colorImgs  = variationImages?.['Color'] || {};
+      const colorToAsin = {};
+      // Re-extract ASIN map
+      const dimMatches = [...html.matchAll(/"([A-Z0-9]{10})"\s*:\s*\{([^}]{0,200})\}/g)];
+      for (const [,a,b] of dimMatches) {
+        const cM = b.match(/"color_name"\s*:\s*"([^"]+)"/);
+        if (cM) colorToAsin[cM[1]] = a;
+      }
+
+      const updated = [];
+      if (colorGroup?.values?.length) {
+        // Fetch prices for each color ASIN
+        await Promise.all(colorGroup.values.slice(0,12).map(async cv => {
+          const asin = colorToAsin[cv.value];
+          if (!asin) return;
+          const h = await fetchPage(`https://www.amazon.com/dp/${asin}`, ua);
+          if (!h) return;
+          const p = extractPrice(h);
+          const s = !h.toLowerCase().includes('currently unavailable');
+          if (p) updated.push({ color: cv.value, price: p, inStock: s });
+        }));
+      }
+
+      // Push updates to eBay inventory items
+      const groupRes = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
+      const skus = groupRes.variantSKUs || [];
+      let syncCount = 0;
+      for (const sku of skus.slice(0, 100)) {
+        const skuLower = sku.toLowerCase();
+        const match = updated.find(u => skuLower.includes(u.color.replace(/\s+/g,'_').toLowerCase()));
+        if (!match) continue;
+        // Update inventory item qty
+        await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
+          method: 'PUT', headers: auth,
+          body: JSON.stringify({ availability: { shipToLocationAvailability: { quantity: match.inStock ? parseInt(quantity)||10 : 0 } }, condition: 'NEW', product: {} }),
+        });
+        // Update offer price
+        const ol = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
+        const oid = (ol.offers||[])[0]?.offerId;
+        if (oid) {
+          await fetch(`${EBAY_API}/sell/inventory/v1/offer/${oid}`, {
+            method: 'PUT', headers: auth,
+            body: JSON.stringify({ pricingSummary: { price: { value: String(match.price.toFixed(2)), currency: 'USD' } } }),
+          });
+        }
+        syncCount++;
+      }
+      return res.json({ success: true, updatedVariants: syncCount, freshData: updated });
+    }
+
+    // ── END LISTING ───────────────────────────────────────────────────────────
+    if (action === 'endListing') {
+      const { access_token, ebaySku } = body;
+      const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
+      const ol = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(ebaySku)}`, { headers: auth }).then(r=>r.json()).catch(()=>({}));
+      let ended = 0;
+      for (const offer of (ol.offers||[])) {
+        if (offer.status === 'PUBLISHED') {
+          await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}/withdraw`, { method: 'POST', headers: auth });
+          ended++;
+        }
+      }
+      return res.json({ success: true, ended });
     }
 
     return res.status(400).json({ error: `Unknown action: ${action}` });
 
   } catch (err) {
-    console.error('[DropSync Error]', err);
+    console.error('[Error]', err.message);
     return res.status(500).json({ error: err.message });
   }
 };
-
-function buildOffer(sku, product, policies = {}, merchantLocationKey = 'default') {
-  const p = { sku, marketplaceId:'EBAY_US', format:'FIXED_PRICE', listingDuration:'GTC', pricingSummary:{ price:{ value:String(parseFloat(product.price||0).toFixed(2)), currency:'USD' } }, categoryId:product.categoryId||'9355', merchantLocationKey };
-  const lp = {};
-  if (process.env.EBAY_FULFILLMENT_POLICY_ID) lp.fulfillmentPolicyId = process.env.EBAY_FULFILLMENT_POLICY_ID;
-  if (process.env.EBAY_PAYMENT_POLICY_ID)     lp.paymentPolicyId     = process.env.EBAY_PAYMENT_POLICY_ID;
-  if (process.env.EBAY_RETURN_POLICY_ID)      lp.returnPolicyId      = process.env.EBAY_RETURN_POLICY_ID;
-  if (policies.fulfillmentPolicyId) lp.fulfillmentPolicyId = policies.fulfillmentPolicyId;
-  if (policies.paymentPolicyId)     lp.paymentPolicyId     = policies.paymentPolicyId;
-  if (policies.returnPolicyId)      lp.returnPolicyId      = policies.returnPolicyId;
-  if (Object.keys(lp).length) p.listingPolicies = lp;
-  // eBay requires a return policy (errorId 25009). If no returnPolicyId resolved, block the push
-  // to surface the error clearly rather than sending a bad offer.
-  if (!lp.returnPolicyId) {
-    console.warn('[buildOffer] WARNING: no returnPolicyId — offer will likely fail with 25009');
-  }
-  return p;
-}
-
-function buildCombos(variations) {
-  if (!variations?.length) return [];
-  let combos = [[]];
-  for (const vg of variations) {
-    const next = [];
-    for (const existing of combos)
-      for (const v of (vg.values||[]))
-        next.push([...existing, { name:vg.name, value:v.value, price:v.price, stock:v.stock, image:v.image, enabled:v.enabled }]);
-    combos = next;
-  }
-  return combos;
-}
-
-function getVarImages(combo, variationImages, fallback) {
-  // Try to find a variant-specific image (e.g. color image)
-  if (variationImages) {
-    for (const v of combo) {
-      const img = variationImages[v.name]?.[v.value];
-      if (img) return [img]; // one image only
-    }
-  }
-  // Try inline image on combo value
-  for (const v of combo) {
-    if (v.image) return [v.image];
-  }
-  // Fallback to first product image
-  return fallback?.[0] ? [fallback[0]] : [];
-}
