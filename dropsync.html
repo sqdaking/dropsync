@@ -294,7 +294,10 @@ async function doScrape() {
       body: JSON.stringify({ url }),
     });
     const d = await r.json();
-    if (!d.success || !d.product?.title) throw new Error(d.error || 'Scrape failed — no product data returned');
+    if (!d.success || !d.product?.title) {
+      const msg = d.error || 'No product data returned — Amazon may be blocking the request.';
+      throw new Error(msg);
+    }
     IMP = d.product;
     IMP.url = url;
     IMP.markup = S.markup;
