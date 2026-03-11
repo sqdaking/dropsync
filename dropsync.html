@@ -110,7 +110,13 @@ label{display:block;font-size:11px;font-weight:700;color:var(--text3);margin-bot
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>Bulk Import
   </div>
   <div class="nav-item" onclick="nav('products')" id="nav-products">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>My Products
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>Listed
+  </div>
+  <div class="nav-item" onclick="nav('drafts')" id="nav-drafts">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>Drafts
+  </div>
+  <div class="nav-item" onclick="nav('orders')" id="nav-orders">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>Orders
   </div>
   <div class="nav-item" onclick="nav('ebayimport')" id="nav-ebayimport">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>eBay Import
@@ -297,12 +303,12 @@ async function nav(view) {
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   const el = document.getElementById(`nav-${view}`);
   if (el) el.classList.add('active');
-  const titles = { import: 'Import Product', products: 'My Products', logs: 'Activity Log', settings: 'Settings' };
+  const titles = { import: 'Import Product', products: 'Listed Products', drafts: 'Drafts', orders: 'Orders', logs: 'Activity Log', settings: 'Settings' };
   document.getElementById('topbar-title').textContent = titles[view] || view;
   document.getElementById('topbar-actions').innerHTML = '';
-  if (view === 'products') await loadProductsFromServer();
+  if (view === 'products' || view === 'drafts') await loadProductsFromServer();
   if (view === 'logs') await loadLogsFromServer();
-  const renders = { import: renderImport, bulk: renderBulk, ebayimport: renderEbayImport, products: renderProducts, logs: renderLogs, settings: renderSettings };
+  const renders = { import: renderImport, bulk: renderBulk, ebayimport: renderEbayImport, products: renderProducts, drafts: renderDrafts, orders: renderOrders, logs: renderLogs, settings: renderSettings };
   renders[view]?.();
 }
 const $ = id => document.getElementById(id);
@@ -1223,17 +1229,16 @@ async function eiImportSelected() {
 
 
 function renderProducts() {
-  const prods = S.products || [];
+  const prods = (S.products || []).filter(p => p.status === 'listed' || p.status === 'ended');
   $('topbar-actions').innerHTML = '';
   if (!prods.length) {
-    $('content').innerHTML = `<div class="empty"><div class="eico">📦</div><h3>No products yet</h3><p>Import an Amazon product to get started</p><br><button class="btn btn-primary" onclick="nav('import')">+ Import Product</button></div>`;
+    $('content').innerHTML = `<div class="empty"><div class="eico">📦</div><h3>No listed products yet</h3><p>Import a product and push it to eBay to see it here</p><br><button class="btn btn-primary" onclick="nav('import')">+ Import Product</button></div>`;
     return;
   }
-
   $('content').innerHTML = `
     <div class="card">
       <div class="card-header">
-        <span class="card-title">Products (${prods.length})</span>
+        <span class="card-title">Listed (${prods.filter(p=>p.status==='listed').length})</span>
         <div style="display:flex;align-items:center;gap:10px">
           ${S.lastAutoSync ? `<span style="font-size:11px;color:var(--text3)">Last sync: ${timeAgo(S.lastAutoSync)}</span>` : ''}
           <button class="btn btn-primary btn-sm" onclick="syncAllWithFeedback()" id="sync-all-btn">🔄 Sync All</button>
@@ -1245,9 +1250,33 @@ function renderProducts() {
   renderProdRows(prods);
 }
 
+function renderDrafts() {
+  const prods = (S.products || []).filter(p => p.status === 'draft');
+  $('topbar-actions').innerHTML = '';
+  if (!prods.length) {
+    $('content').innerHTML = `<div class="empty"><div class="eico">✏️</div><h3>No drafts</h3><p>Products saved as draft will appear here</p></div>`;
+    return;
+  }
+  $('content').innerHTML = `
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Drafts (${prods.length})</span>
+        <input class="input" id="prod-search" placeholder="Search…" style="width:160px;font-size:12px" oninput="filterDrafts()">
+      </div>
+      <div id="prod-list"></div>
+    </div>`;
+  renderProdRows(prods);
+}
+
+function filterDrafts() {
+  const q = ($('prod-search')?.value || '').toLowerCase();
+  const prods = (S.products||[]).filter(p => p.status==='draft' && (!q || p.title.toLowerCase().includes(q)));
+  renderProdRows(prods);
+}
+
 function filterProducts() {
   const q = ($('prod-search')?.value || '').toLowerCase();
-  const prods = (S.products||[]).filter(p => !q || p.title.toLowerCase().includes(q) || (p.sourceUrl||'').includes(q));
+  const prods = (S.products||[]).filter(p => (p.status==='listed'||p.status==='ended') && (!q || p.title.toLowerCase().includes(q) || (p.sourceUrl||'').includes(q)));
   renderProdRows(prods);
 }
 
@@ -1373,8 +1402,27 @@ async function syncOne(pid) {
 async function syncAllWithFeedback() {
   const btn = $('sync-all-btn');
   if (btn) { btn.disabled = true; btn.innerHTML = '<span style="display:inline-flex;align-items:center;gap:5px"><div class="spinner" style="width:11px;height:11px"></div> Syncing…</span>'; }
-  await syncAll();
-  if (btn) { btn.disabled = false; btn.innerHTML = '🔄 Sync All'; }
+  try {
+    // If Railway server is connected, trigger worker sync there (24/7 engine)
+    if (S.serverUrl) {
+      const r = await fetch(`${S.serverUrl}/api/worker/run`, { method: 'POST' });
+      const d = await r.json();
+      if (d.success || d.message) {
+        toast(`🔄 Sync triggered on Railway server — check Activity Log for results`, 'success', 5000);
+        // Reload logs after a few seconds to show results
+        setTimeout(async () => { await loadLogsFromServer(); if (S.view==='logs') renderLogs(); }, 8000);
+      } else {
+        toast('Sync trigger failed: ' + (d.error||'unknown'), 'error');
+      }
+    } else {
+      // Fallback: direct sync via Vercel
+      await syncAll();
+    }
+  } catch(e) {
+    toast(`Sync error: ${e.message}`, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '🔄 Sync All'; }
+  }
 }
 
 async function syncAll() {
@@ -1506,6 +1554,71 @@ function deleteProduct(pid) {
 // ══════════════════════════════════════════════════════
 // ACTIVITY LOG VIEW
 // ══════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════
+// ORDERS VIEW
+// ══════════════════════════════════════════════════════
+let _orders = null;
+
+async function renderOrders() {
+  $('content').innerHTML = `<div style="padding:40px;text-align:center"><div class="spinner" style="width:32px;height:32px;margin:0 auto 12px"></div><div style="color:var(--text3)">Loading orders…</div></div>`;
+  if (!S.serverUrl) {
+    $('content').innerHTML = `<div class="empty"><div class="eico">📋</div><h3>Railway server not connected</h3><p>Set your Railway Server URL in Settings to load orders</p><button class="btn btn-primary" onclick="nav('settings')" style="margin-top:12px">Go to Settings</button></div>`;
+    return;
+  }
+  try {
+    const d = await apiGet('/api/orders?limit=50');
+    _orders = d.orders || [];
+    renderOrderRows();
+  } catch(e) {
+    $('content').innerHTML = `<div class="empty"><div class="eico">❌</div><h3>Failed to load orders</h3><p>${e.message}</p></div>`;
+  }
+}
+
+function renderOrderRows() {
+  if (!_orders.length) {
+    $('content').innerHTML = `<div class="empty"><div class="eico">🛍️</div><h3>No orders yet</h3><p>Orders from the last 90 days will appear here</p></div>`;
+    return;
+  }
+  const statusColor = { PAID: 'var(--green)', SHIPPED: 'var(--accent2)', DELIVERED: 'var(--accent)', CANCELLED: 'var(--red)', IN_PROGRESS: 'var(--amber)' };
+  $('content').innerHTML = `
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Orders (${_orders.length})</span>
+        <span style="font-size:11px;color:var(--text3)">Last 90 days</span>
+      </div>
+      <div>
+        ${_orders.map(o => {
+          const item = o.lineItems?.[0];
+          const totalAmt = o.pricingSummary?.total?.value || '—';
+          const totalCur = o.pricingSummary?.total?.currency || '';
+          const buyer = o.buyer?.username || '—';
+          const date = o.creationDate ? new Date(o.creationDate).toLocaleDateString() : '—';
+          const status = o.orderFulfillmentStatus || o.orderPaymentStatus || '—';
+          const trackingNums = (o.fulfillmentStartInstructions||[]).flatMap(f => f.shippingStep?.shipTo ? [] : []).join(', ');
+          const addr = o.fulfillmentStartInstructions?.[0]?.shippingStep?.shipTo?.contactAddress;
+          const addrStr = addr ? `${addr.city}, ${addr.stateOrProvince} ${addr.postalCode}` : '';
+          return `<div style="display:flex;align-items:flex-start;gap:14px;padding:16px;border-bottom:1px solid var(--border)">
+            <div style="width:40px;height:40px;border-radius:8px;background:var(--bg);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">🛍️</div>
+            <div style="flex:1;min-width:0">
+              <div style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:3px">${item?.title?.slice(0,70) || 'Order ' + o.orderId?.slice(-8)}</div>
+              <div style="font-size:11px;color:var(--text3);display:flex;gap:10px;flex-wrap:wrap">
+                <span>🏷️ <b style="color:var(--text2)">${buyer}</b></span>
+                <span>📅 ${date}</span>
+                ${addrStr ? `<span>📍 ${addrStr}</span>` : ''}
+                ${item?.quantity ? `<span>Qty: ${item.quantity}</span>` : ''}
+              </div>
+            </div>
+            <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0">
+              <div style="font-size:15px;font-weight:700;color:var(--green)">$${parseFloat(totalAmt).toFixed(2)}</div>
+              <span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:4px;background:rgba(0,0,0,.2);color:${statusColor[status]||'var(--text3)'}">${status}</span>
+              <a href="https://www.ebay.com/sh/ord/details?orderid=${o.orderId}" target="_blank" style="font-size:10px;color:var(--accent2)">View ↗</a>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>`;
+}
+
 let _logFilter = 'all';
 
 function renderLogs() {
