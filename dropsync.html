@@ -196,15 +196,19 @@ async function serverAddLog(entry) {
 async function loadProductsFromServer() {
   if (!S.serverUrl) return;
   try {
-    const d = await apiGet('/api/products?limit=500');
-    if (d && d.products) { S.products = d.products; }
-  } catch(e) { console.warn('loadProductsFromServer failed:', e); }
+    const d = await apiGet('/api/products?limit=9000');
+    if (d && Array.isArray(d.products) && d.products.length > 0) {
+      S.products = d.products;
+      save();
+    }
+    // If server returns empty but local has data, keep local (server may be lagging)
+  } catch(e) { console.warn('loadProductsFromServer failed — using local cache:', e); }
 }
 async function loadLogsFromServer() {
   if (!S.serverUrl) return;
   try {
-    const d = await apiGet('/api/logs?limit=200');
-    if (d && d.logs) { S.logs = d.logs; }
+    const d = await apiGet('/api/logs?limit=500');
+    if (d && Array.isArray(d.logs)) { S.logs = d.logs; }
   } catch(e) { console.warn('loadLogsFromServer failed:', e); }
 }
 
