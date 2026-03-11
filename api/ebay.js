@@ -483,7 +483,7 @@ module.exports = async (req, res) => {
           } else {
             // Fallback: store in localStorage then redirect back to app
             try { localStorage.setItem('ebay_auth_pending', JSON.stringify(payload)); } catch(e){}
-            document.querySelector('p').textContent = '✅ Connected! Please close this window and return to DropSync.';
+            setTimeout(function(){ window.location.href = '/'; }, 800);
           }
         </script>
         </body></html>`
@@ -1673,33 +1673,6 @@ module.exports = async (req, res) => {
         return res.json({ success: false, error: 'Could not load Amazon pages. Try again in a moment.' });
 
       console.log('[dealsScrape] total pool after', pagesLoaded, 'pages:', Object.keys(productMap).length);
-
-      // 1) JSON "asin":"B..." pattern (richest source — JS bundles on deals page)
-      for (const m of html.matchAll(/"asin"\s*:\s*"([B][0-9A-Z]{9})"/g)) {
-        productMap[m[1]] = productMap[m[1]] || { asin: m[1], title: '' };
-      }
-
-      // 2) data-asin attributes
-      for (const m of html.matchAll(/data-asin="([B][0-9A-Z]{9})"/g)) {
-        productMap[m[1]] = productMap[m[1]] || { asin: m[1], title: '' };
-      }
-
-      // 3) URL slugs give product title hints
-      for (const m of html.matchAll(/href="([^"]*\/([^\/]+)\/dp\/([B][0-9A-Z]{9})[^"]*)"/g)) {
-        const asin = m[3];
-        const slug = decodeURIComponent(m[2]).replace(/-/g, ' ');
-        if (asin && slug.length > 5) {
-          productMap[asin] = { asin, title: slug, url: 'https://www.amazon.com/dp/' + asin };
-        }
-      }
-
-      // 4) img alt text near dp links
-      for (const m of html.matchAll(/\/dp\/([B][0-9A-Z]{9})[^"]*"[^>]*>[\s\S]{0,300}?alt="([^"]{10,120})"/g)) {
-        if (!productMap[m[1]]?.title || productMap[m[1]].title.length < 10) {
-          productMap[m[1]] = { asin: m[1], title: m[2], url: 'https://www.amazon.com/dp/' + m[1] };
-        }
-      }
-
       // Filter: exclude already-used, VeRO, and digital items
       const allProducts = Object.values(productMap).filter(p =>
         p.asin &&
