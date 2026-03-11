@@ -1,7 +1,7 @@
 // DropSync AI Agent — Amazon → eBay Dropshipping Backend
 // Clean architecture: per-ASIN prices+images, AI category detection, auto policies
 
-const SCOPES = 'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.inventory https://api.ebay.com/oauth/api_scope/sell.account https://api.ebay.com/oauth/api_scope/sell.fulfillment https://api.ebay.com/oauth/api_scope/sell.listing';
+const SCOPES = 'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.inventory https://api.ebay.com/oauth/api_scope/sell.account https://api.ebay.com/oauth/api_scope/sell.fulfillment';
 
 function getEbayUrls(sandbox) {
   return {
