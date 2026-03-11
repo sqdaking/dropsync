@@ -147,11 +147,60 @@ label{display:block;font-size:11px;font-weight:700;color:var(--text3);margin-bot
 
 const KEY = 'ds_v2';
 const DEFAULT_STATE = {
-  backendUrl: '', token: '', refreshToken: '', tokenExpiry: 0,
+  backendUrl: '', serverUrl: '', token: '', refreshToken: '', tokenExpiry: 0,
   markup: 35, minMarkup: 5, handlingCost: 2, quantity: 1,
   fulfillmentPolicyId: '', paymentPolicyId: '', returnPolicyId: '',
+  webhookUrl: '',
   products: [], logs: [], view: 'import',
 };
+
+// ── Railway API helpers ───────────────────────────────
+async function apiGet(path) {
+  if (!S.serverUrl) return null;
+  const r = await fetch(S.serverUrl + path);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function apiPost(path, body) {
+  if (!S.serverUrl) return null;
+  const r = await fetch(S.serverUrl + path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function apiPut(path, body) {
+  if (!S.serverUrl) return null;
+  const r = await fetch(S.serverUrl + path, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// ── Server-aware product/log ops ──────────────────────
+async function serverAddProduct(prod) {
+  if (!S.serverUrl) { S.products.unshift(prod); save(); return; }
+  try { await apiPost('/api/products', prod); } catch(e) { console.warn('serverAddProduct failed:', e); S.products.unshift(prod); save(); }
+}
+async function serverUpdateProduct(id, updates) {
+  if (!S.serverUrl) { const p = S.products.find(x=>x.id===id); if(p) { Object.assign(p, updates); save(); } return; }
+  try { await apiPut('/api/products/' + id, updates); } catch(e) { console.warn('serverUpdateProduct failed:', e); }
+}
+async function serverAddLog(entry) {
+  if (!S.serverUrl) { S.logs = [entry, ...(S.logs||[]).slice(0, 499)]; save(); return; }
+  try { await apiPost('/api/logs', entry); } catch(e) { console.warn('serverAddLog failed:', e); }
+}
+async function loadProductsFromServer() {
+  if (!S.serverUrl) return;
+  try {
+    const d = await apiGet('/api/products?limit=500');
+    if (d && d.products) { S.products = d.products; }
+  } catch(e) { console.warn('loadProductsFromServer failed:', e); }
+}
+async function loadLogsFromServer() {
+  if (!S.serverUrl) return;
+  try {
+    const d = await apiGet('/api/logs?limit=200');
+    if (d && d.logs) { S.logs = d.logs; }
+  } catch(e) { console.warn('loadLogsFromServer failed:', e); }
+}
 
 let S = { ...DEFAULT_STATE };
 try { const saved = JSON.parse(localStorage.getItem(KEY)||'{}'); S = { ...S, ...saved }; } catch {}
@@ -182,6 +231,7 @@ function addLog(type, title, detail = '', meta = {}) {
   const entry = { id: Date.now() + Math.random(), ts: new Date().toISOString(), type, title, detail, ...meta };
   S.logs = [entry, ...(S.logs||[]).slice(0, 499)];
   save();
+  serverAddLog(entry).catch(()=>{});
   // Refresh log view if open
   if (S.view === 'logs') renderLogs();
 }
@@ -242,7 +292,7 @@ document.getElementById('modal-overlay').addEventListener('click', e => { if (e.
 // ══════════════════════════════════════════════════════
 // NAVIGATION
 // ══════════════════════════════════════════════════════
-function nav(view) {
+async function nav(view) {
   S.view = view; save();
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   const el = document.getElementById(`nav-${view}`);
@@ -250,6 +300,8 @@ function nav(view) {
   const titles = { import: 'Import Product', products: 'My Products', logs: 'Activity Log', settings: 'Settings' };
   document.getElementById('topbar-title').textContent = titles[view] || view;
   document.getElementById('topbar-actions').innerHTML = '';
+  if (view === 'products') await loadProductsFromServer();
+  if (view === 'logs') await loadLogsFromServer();
   const renders = { import: renderImport, bulk: renderBulk, ebayimport: renderEbayImport, products: renderProducts, logs: renderLogs, settings: renderSettings };
   renders[view]?.();
 }
@@ -475,10 +527,11 @@ function toggleVar(groupName, idx) {
   renderPreview();
 }
 
-function saveAsDraft() {
+async function saveAsDraft() {
   if (!IMP) return;
   const prod = buildProd();
   S.products.unshift(prod); save();
+  await serverAddProduct(prod);
   toast('Saved as draft!', 'success');
 }
 
@@ -580,8 +633,7 @@ async function doPush() {
     prod.ebayListingId = d.listingId || '';
     prod.pushedAt = new Date().toISOString();
     S.products.unshift(prod); save();
-
-    addLog('push', `Listed: ${prod.title.slice(0,50)}`, `eBay ID ${prod.ebayListingId} · ${d.variantsCreated||1} variants`, { productId: prod.id, ebayId: prod.ebayListingId });
+    serverAddProduct(prod).catch(()=>{});
     setStatus(`✅ Listed on eBay! ${d.variantsCreated ? `${d.variantsCreated} variants` : ''} · <a href="https://www.ebay.com/itm/${prod.ebayListingId}" target="_blank" style="color:var(--accent2)">View listing</a>`, 'success');
     toast(`🎉 Live on eBay!`, 'success');
     IMP = null;
@@ -1172,7 +1224,7 @@ async function eiImportSelected() {
 
 function renderProducts() {
   const prods = S.products || [];
-  $('topbar-actions').innerHTML = prods.length ? `<button class="btn btn-outline btn-sm" onclick="syncAll()">🔄 Sync All</button>` : '';
+  $('topbar-actions').innerHTML = '';
   if (!prods.length) {
     $('content').innerHTML = `<div class="empty"><div class="eico">📦</div><h3>No products yet</h3><p>Import an Amazon product to get started</p><br><button class="btn btn-primary" onclick="nav('import')">+ Import Product</button></div>`;
     return;
@@ -1182,7 +1234,11 @@ function renderProducts() {
     <div class="card">
       <div class="card-header">
         <span class="card-title">Products (${prods.length})</span>
-        <input class="input" id="prod-search" placeholder="Search…" style="width:180px;font-size:12px" oninput="filterProducts()">
+        <div style="display:flex;align-items:center;gap:10px">
+          ${S.lastAutoSync ? `<span style="font-size:11px;color:var(--text3)">Last sync: ${timeAgo(S.lastAutoSync)}</span>` : ''}
+          <button class="btn btn-primary btn-sm" onclick="syncAllWithFeedback()" id="sync-all-btn">🔄 Sync All</button>
+          <input class="input" id="prod-search" placeholder="Search…" style="width:160px;font-size:12px" oninput="filterProducts()">
+        </div>
       </div>
       <div id="prod-list"></div>
     </div>`;
@@ -1314,12 +1370,22 @@ async function syncOne(pid) {
   } catch (e) { toast(`Sync failed: ${e.message}`, 'error'); }
 }
 
+async function syncAllWithFeedback() {
+  const btn = $('sync-all-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span style="display:inline-flex;align-items:center;gap:5px"><div class="spinner" style="width:11px;height:11px"></div> Syncing…</span>'; }
+  await syncAll();
+  if (btn) { btn.disabled = false; btn.innerHTML = '🔄 Sync All'; }
+}
+
 async function syncAll() {
-  const listed = (S.products||[]).filter(p => p.status==='listed' && p.sourceUrl);
+  const listed = (S.products||[]).filter(p => p.status==='listed');
   if (!listed.length) { toast('No listed products to sync', 'info'); return; }
-  toast(`Syncing ${listed.length} products…`, 'info');
-  let ok = 0;
-  for (const p of listed) {
+  const syncable = listed.filter(p => p.sourceUrl && p.ebaySku);
+  const skipped  = listed.length - syncable.length;
+  if (!syncable.length) { toast('No products have a source URL — add Amazon URLs in My Products', 'warn'); return; }
+  toast(`Syncing ${syncable.length} products${skipped ? ` (${skipped} skipped — no source URL)` : ''}…`, 'info');
+  let ok = 0, totalPriceChanges = 0, totalStockChanges = 0;
+  for (const p of syncable) {
     try {
       const token = await ensureToken();
       const r = await fetch(`${S.backendUrl}/api/ebay?action=sync`, {
@@ -1341,15 +1407,44 @@ async function syncAll() {
               variant.price = u.price; variant.inStock = u.inStock;
             }
           }
-          if (pChanges.length) addLog('price', `Price changes: ${p.title.slice(0,40)}`, pChanges.join(' · '), { productId: p.id, changes: pChanges });
-          if (sChanges.length) addLog('stock', `Stock changes: ${p.title.slice(0,40)}`, sChanges.join(' · '), { productId: p.id, changes: sChanges });
+          if (pChanges.length) { addLog('price', `Price changes: ${p.title.slice(0,40)}`, pChanges.join(' · '), { productId: p.id, changes: pChanges }); totalPriceChanges++; sendWebhook('price', p, pChanges); }
+          if (sChanges.length) { addLog('stock', `Stock changes: ${p.title.slice(0,40)}`, sChanges.join(' · '), { productId: p.id, changes: sChanges }); totalStockChanges++; sendWebhook('stock', p, sChanges); }
         }
+        // Single-variant changes from backend
+        if (d.priceChanges?.length) { addLog('price', `Price changes: ${p.title.slice(0,40)}`, d.priceChanges.join(' · '), { productId: p.id, changes: d.priceChanges }); totalPriceChanges++; sendWebhook('price', p, d.priceChanges); }
+        if (d.stockChanges?.length) { addLog('stock', `Stock changes: ${p.title.slice(0,40)}`, d.stockChanges.join(' · '), { productId: p.id, changes: d.stockChanges }); totalStockChanges++; sendWebhook('stock', p, d.stockChanges); }
       }
     } catch {}
     await new Promise(r => setTimeout(r, 500));
   }
   save(); renderProducts();
-  toast(`Synced ${ok}/${listed.length} products`, 'success');
+  const parts = [`Synced ${ok}/${syncable.length}`];
+  if (skipped) parts.push(`${skipped} skipped (no URL)`);
+  if (totalPriceChanges) parts.push(`${totalPriceChanges} price ∆`);
+  if (totalStockChanges) parts.push(`${totalStockChanges} stock ∆`);
+  toast(parts.join(' · '), 'success');
+}
+
+function sendWebhook(type, product, changes) {
+  if (!S.webhookUrl) return;
+  const emoji = type === 'price' ? '💰' : '📦';
+  const label = type === 'price' ? 'Price Change' : 'Stock Change';
+  const ebayUrl = product.ebayListingId ? `https://www.ebay.com/itm/${product.ebayListingId}` : '';
+  const payload = {
+    text: `${emoji} *DropSync ${label}*\n*${product.title?.slice(0,60)}*\n${changes.join('\n')}${ebayUrl ? `\n${ebayUrl}` : ''}`,
+    content: `${emoji} **DropSync ${label}**\n**${product.title?.slice(0,60)}**\n${changes.join('\n')}${ebayUrl ? `\n<${ebayUrl}>` : ''}`,
+    embeds: [{
+      title: `${emoji} ${label}: ${product.title?.slice(0,60)}`,
+      description: changes.join('\n'),
+      color: type === 'price' ? 0xf59e0b : 0x8b5cf6,
+      url: ebayUrl || undefined,
+      timestamp: new Date().toISOString(),
+    }],
+    type, product_title: product.title, changes, ebay_url: ebayUrl,
+    timestamp: new Date().toISOString(),
+  };
+  fetch(S.webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    .catch(() => {});
 }
 
 function confirmEnd(pid) {
@@ -1517,14 +1612,26 @@ function renderSettings() {
 
       <!-- Backend URL -->
       <div class="card">
-        <div class="card-header"><span class="card-title">🔗 Backend URL</span></div>
-        <div class="card-body">
-          <label>Vercel Backend URL</label>
-          <div style="display:flex;gap:8px">
-            <input class="input" id="burl" placeholder="https://your-app.vercel.app" value="${S.backendUrl}" style="flex:1">
-            <button class="btn btn-primary" onclick="saveBackendUrl()">Save</button>
+        <div class="card-header"><span class="card-title">🔗 Backend URLs</span></div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:12px">
+          <div>
+            <label>Vercel Backend URL <span style="color:var(--text3);font-weight:400">(eBay scraping & push)</span></label>
+            <div style="display:flex;gap:8px">
+              <input class="input" id="burl" placeholder="https://your-app.vercel.app" value="${S.backendUrl}" style="flex:1">
+              <button class="btn btn-primary" onclick="saveBackendUrl()">Save</button>
+            </div>
+            <div style="font-size:11px;color:var(--text3);margin-top:4px">From your Vercel deployment dashboard</div>
           </div>
-          <div style="font-size:11px;color:var(--text3);margin-top:6px">From your Vercel deployment dashboard</div>
+          <div>
+            <label>Railway Server URL <span style="color:var(--text3);font-weight:400">(products, logs, 24/7 sync)</span></label>
+            <div style="display:flex;gap:8px">
+              <input class="input" id="surl" placeholder="https://dropsync-server-production.up.railway.app" value="${S.serverUrl||''}" style="flex:1">
+              <button class="btn btn-primary" onclick="saveServerUrl()">Save</button>
+            </div>
+            <div id="server-status" style="font-size:11px;margin-top:4px;color:var(--text3)">
+              ${S.serverUrl ? 'Checking...' : 'Not connected — enter Railway URL above'}
+            </div>
+          </div>
         </div>
       </div>
 
@@ -1581,6 +1688,23 @@ function renderSettings() {
           </div>
         </div>
       </div>` : ''}
+
+      <!-- Notifications -->
+      <div class="card">
+        <div class="card-header"><span class="card-title">🔔 Notifications</span></div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:10px">
+          <label style="font-size:13px">Webhook URL <span style="color:var(--text3);font-weight:400">(Discord, Slack, Make, Zapier, etc.)</span></label>
+          <div style="display:flex;gap:8px">
+            <input class="input" id="webhook-url" placeholder="https://discord.com/api/webhooks/..." value="${S.webhookUrl||''}" style="flex:1;font-size:12px;font-family:var(--font-mono)"
+              oninput="S.webhookUrl=this.value.trim();save()">
+            <button class="btn btn-outline btn-sm" onclick="testWebhook()">Test</button>
+          </div>
+          <div style="font-size:11px;color:var(--text3);line-height:1.6">
+            Sends a POST request whenever a price or stock change is detected during sync.<br>
+            Works with <b>Discord webhooks</b>, <b>Slack incoming webhooks</b>, <b>Make.com</b>, <b>Zapier</b>, or any HTTP endpoint.
+          </div>
+        </div>
+      </div>
 
       <!-- Pricing Defaults -->
       <div class="card">
@@ -1655,12 +1779,48 @@ function renderSettings() {
     </div>`;
 
   if (S.token && S.backendUrl) loadPolicies();
+  if (S.serverUrl) {
+    fetch(S.serverUrl + '/').then(r=>r.json()).then(d => {
+      const el = $('server-status');
+      if (el) el.innerHTML = d.status==='ok'
+        ? `<span style="color:var(--green)">✅ Connected — ${d.service}</span>`
+        : `<span style="color:var(--red)">❌ Bad response</span>`;
+    }).catch(() => {
+      const el = $('server-status');
+      if (el) el.innerHTML = `<span style="color:var(--red)">❌ Cannot reach server</span>`;
+    });
+  }
+}
+
+function testWebhook() {
+  if (!S.webhookUrl) { toast('Enter a webhook URL first', 'warn'); return; }
+  sendWebhook('price', { title: 'DropSync Test Product', ebayListingId: '' }, ['$19.99 → $21.49 (test)']);
+  toast('Test notification sent!', 'success');
 }
 
 function saveBackendUrl() {
   S.backendUrl = ($('burl')?.value || '').trim().replace(/\/+$/, '');
   save(); toast('Backend URL saved', 'success');
   updateStatus();
+}
+
+async function saveServerUrl() {
+  const url = ($('surl')?.value || '').trim().replace(/\/+$/, '');
+  S.serverUrl = url; save();
+  if (!url) { toast('Server URL cleared', 'info'); return; }
+  const statusEl = $('server-status');
+  if (statusEl) statusEl.textContent = 'Testing connection...';
+  try {
+    const r = await fetch(url + '/');
+    const d = await r.json();
+    if (d.status === 'ok') {
+      toast('✅ Railway server connected!', 'success');
+      if (statusEl) statusEl.innerHTML = '<span style="color:var(--green)">✅ Connected — ' + d.service + '</span>';
+    } else throw new Error('Bad response');
+  } catch(e) {
+    toast('❌ Could not reach Railway server', 'error');
+    if (statusEl) statusEl.innerHTML = '<span style="color:var(--red)">❌ Connection failed — check URL</span>';
+  }
 }
 
 function savePricingDefaults() {
@@ -1695,7 +1855,7 @@ async function connectEbay() {
       if (resolved) return;
       resolved = true;
       S.token = data.token; S.refreshToken = data.refresh; S.tokenExpiry = data.expiry;
-      save(); updateStatus(); renderSettings();
+      save(); updateStatus(); renderSettings(); setupAutoSync();
       toast('✅ Connected to eBay!', 'success');
       try { loadPolicies(); } catch(e) {}
     }
