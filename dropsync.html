@@ -201,7 +201,7 @@ async function loadProductsFromServer() {
       // Only use server data if it has richer info (data column populated)
       // Check if first product has full data (images array, ebayListingId)
       const sample = d.products[0];
-      const hasFullData = sample && (Array.isArray(sample.images) || sample.ebayListingId || sample.bullets);
+      const hasFullData = sample && (Array.isArray(sample.images) || !!sample.ebayListingId || sample.bullets?.length > 0);
       if (hasFullData) {
         S.products = d.products;
         save();
@@ -1227,6 +1227,7 @@ async function eiImportSelected() {
     };
     if (!S.products) S.products = [];
     S.products.push(prod);
+    if (S.serverUrl) { apiPost("/api/products", prod).catch(e => console.warn("eBay import DB save failed:", e)); }
     count++;
   }
   save();
@@ -1435,6 +1436,12 @@ async function syncAllWithFeedback() {
                   if (srv.lastSynced) local.lastSynced = srv.lastSynced;
                   if (srv.quantity != null) local.quantity = srv.quantity;
                   if (srv.status && srv.status !== 'pending') local.status = srv.status;
+                  // Restore ebayListingId: prefer local (source of truth), fall back to server
+                  if (!local.ebayListingId && srv.ebayListingId) local.ebayListingId = srv.ebayListingId;
+                  // If server is missing ebayListingId but local has it, re-upsert to DB to fix the gap
+                  if (local.ebayListingId && !srv.ebayListingId) {
+                    apiPost('/api/products', local).catch(() => {});
+                  }
                   changed++;
                 }
               });
