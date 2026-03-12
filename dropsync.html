@@ -1619,48 +1619,116 @@ async function renderOrders() {
   }
 }
 
+let _orderFilter = 'all';
+
+window.setOrderFilter = function(f) {
+  _orderFilter = f;
+  renderOrderRows();
+};
+
 function renderOrderRows() {
-  if (!_orders.length) {
+  if (!_orders || !_orders.length) {
     $('content').innerHTML = `<div class="empty"><div class="eico">🛍️</div><h3>No orders yet</h3><p>Orders from the last 90 days will appear here</p></div>`;
     return;
   }
-  const statusColor = { PAID: 'var(--green)', SHIPPED: 'var(--accent2)', DELIVERED: 'var(--accent)', CANCELLED: 'var(--red)', IN_PROGRESS: 'var(--amber)' };
+
+  const STATUS = {
+    FULFILLED:   { label:'Shipped',    color:'#10b981', bg:'rgba(16,185,129,.15)', dot:'#10b981' },
+    NOT_STARTED: { label:'New Order',  color:'#f59e0b', bg:'rgba(245,158,11,.15)', dot:'#f59e0b' },
+    IN_PROGRESS: { label:'Processing', color:'#3b82f6', bg:'rgba(59,130,246,.15)', dot:'#3b82f6' },
+    CANCELLED:   { label:'Cancelled',  color:'#ef4444', bg:'rgba(239,68,68,.15)',  dot:'#ef4444' },
+  };
+
+  const total      = _orders.length;
+  const shipped    = _orders.filter(o => o.orderFulfillmentStatus === 'FULFILLED').length;
+  const newOrders  = _orders.filter(o => o.orderFulfillmentStatus === 'NOT_STARTED').length;
+  const processing = _orders.filter(o => o.orderFulfillmentStatus === 'IN_PROGRESS').length;
+  const cancelled  = _orders.filter(o => o.orderFulfillmentStatus === 'CANCELLED').length;
+  const revenue    = _orders.reduce((s,o) => s + parseFloat(o.pricingSummary?.total?.value||0), 0);
+  const net        = _orders.reduce((s,o) => s + parseFloat(o.pricingSummary?.totalDueSeller?.value||0), 0);
+
+  const filtered = _orderFilter === 'all' ? _orders
+    : _orderFilter === 'new'        ? _orders.filter(o => o.orderFulfillmentStatus === 'NOT_STARTED')
+    : _orderFilter === 'shipped'    ? _orders.filter(o => o.orderFulfillmentStatus === 'FULFILLED')
+    : _orderFilter === 'processing' ? _orders.filter(o => o.orderFulfillmentStatus === 'IN_PROGRESS')
+    : _orders.filter(o => o.orderFulfillmentStatus === 'CANCELLED');
+
+  const card = o => {
+    const item  = o.lineItems?.[0];
+    const cfg   = STATUS[o.orderFulfillmentStatus] || { label: o.orderFulfillmentStatus||'—', color:'var(--text3)', bg:'rgba(255,255,255,.05)', dot:'var(--text3)' };
+    const buyer = o.buyer?.buyerRegistrationAddress?.fullName || o.buyer?.username || '—';
+    const city  = o.buyer?.buyerRegistrationAddress?.contactAddress?.city || o.buyer?.taxAddress?.city || '';
+    const state = o.buyer?.buyerRegistrationAddress?.contactAddress?.stateOrProvince || o.buyer?.taxAddress?.stateOrProvince || '';
+    const date  = new Date(o.creationDate).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
+    const amt   = parseFloat(o.pricingSummary?.total?.value||0).toFixed(2);
+    const netAmt= parseFloat(o.pricingSummary?.totalDueSeller?.value||0).toFixed(2);
+    const qty   = (o.lineItems||[]).reduce((s,l)=>s+(l.quantity||1),0)||1;
+    const title = (item?.title||'Order #'+o.orderId?.slice(-8)).slice(0,65);
+    const img   = item?.image?.imageUrl || '';
+    return `<div style="background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px 16px;display:flex;gap:14px;align-items:center;transition:border-color .15s"
+         onmouseover="this.style.borderColor='var(--accent2)'" onmouseout="this.style.borderColor='var(--border)'">
+      <div style="width:52px;height:52px;border-radius:10px;overflow:hidden;background:var(--bg2,var(--bg));flex-shrink:0;display:flex;align-items:center;justify-content:center">
+        ${img ? `<img src="${img}" style="width:100%;height:100%;object-fit:cover">` : `<span style="font-size:24px">🛍️</span>`}
+      </div>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:5px">${title}</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+          <span style="font-size:11px;color:var(--text3)">👤 <span style="color:var(--text2);font-weight:600">${buyer}</span></span>
+          ${city ? `<span style="font-size:11px;color:var(--text3)">📍 ${city}, ${state}</span>` : ''}
+          <span style="font-size:11px;color:var(--text3)">📅 ${date}</span>
+          ${qty > 1 ? `<span style="font-size:11px;background:rgba(255,255,255,.07);padding:1px 7px;border-radius:10px;color:var(--text2)">×${qty}</span>` : ''}
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:5px;flex-shrink:0">
+        <div style="font-size:16px;font-weight:700;color:#10b981">$${amt}</div>
+        <div style="font-size:10px;color:var(--text3)">Net <span style="color:var(--text2)">$${netAmt}</span></div>
+        <span style="display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;padding:3px 10px;border-radius:20px;background:${cfg.bg};color:${cfg.color}">
+          <span style="width:6px;height:6px;border-radius:50%;background:${cfg.dot};flex-shrink:0;display:inline-block"></span>${cfg.label}
+        </span>
+      </div>
+      <a href="https://www.ebay.com/sh/ord/details?orderid=${o.orderId}" target="_blank"
+         style="width:30px;height:30px;border-radius:8px;border:1px solid var(--border);display:flex;align-items:center;justify-content:center;color:var(--text3);text-decoration:none;flex-shrink:0;font-size:13px"
+         onmouseover="this.style.borderColor='var(--accent2)';this.style.color='var(--accent2)'"
+         onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text3)'">↗</a>
+    </div>`;
+  };
+
+  const tabs = [
+    { key:'all',        label:'All',        count: total      },
+    { key:'new',        label:'🆕 New',      count: newOrders  },
+    { key:'shipped',    label:'📦 Shipped',  count: shipped    },
+    { key:'processing', label:'⏳ Processing',count: processing },
+    { key:'cancelled',  label:'❌ Cancelled', count: cancelled  },
+  ];
+
   $('content').innerHTML = `
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">Orders (${_orders.length})</span>
-        <span style="font-size:11px;color:var(--text3)">Last 90 days</span>
-      </div>
-      <div>
-        ${_orders.map(o => {
-          const item = o.lineItems?.[0];
-          const totalAmt = o.pricingSummary?.total?.value || '—';
-          const totalCur = o.pricingSummary?.total?.currency || '';
-          const buyer = o.buyer?.username || '—';
-          const date = o.creationDate ? new Date(o.creationDate).toLocaleDateString() : '—';
-          const status = o.orderFulfillmentStatus || o.orderPaymentStatus || '—';
-          const trackingNums = (o.fulfillmentStartInstructions||[]).flatMap(f => f.shippingStep?.shipTo ? [] : []).join(', ');
-          const addr = o.fulfillmentStartInstructions?.[0]?.shippingStep?.shipTo?.contactAddress;
-          const addrStr = addr ? `${addr.city}, ${addr.stateOrProvince} ${addr.postalCode}` : '';
-          return `<div style="display:flex;align-items:flex-start;gap:14px;padding:16px;border-bottom:1px solid var(--border)">
-            <div style="width:40px;height:40px;border-radius:8px;background:var(--bg);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">🛍️</div>
-            <div style="flex:1;min-width:0">
-              <div style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:3px">${item?.title?.slice(0,70) || 'Order ' + o.orderId?.slice(-8)}</div>
-              <div style="font-size:11px;color:var(--text3);display:flex;gap:10px;flex-wrap:wrap">
-                <span>🏷️ <b style="color:var(--text2)">${buyer}</b></span>
-                <span>📅 ${date}</span>
-                ${addrStr ? `<span>📍 ${addrStr}</span>` : ''}
-                ${item?.quantity ? `<span>Qty: ${item.quantity}</span>` : ''}
-              </div>
-            </div>
-            <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0">
-              <div style="font-size:15px;font-weight:700;color:var(--green)">$${parseFloat(totalAmt).toFixed(2)}</div>
-              <span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:4px;background:rgba(0,0,0,.2);color:${statusColor[status]||'var(--text3)'}">${status}</span>
-              <a href="https://www.ebay.com/sh/ord/details?orderid=${o.orderId}" target="_blank" style="font-size:10px;color:var(--accent2)">View ↗</a>
-            </div>
-          </div>`;
-        }).join('')}
-      </div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px">
+      ${[
+        { label:'Total Orders',  value: total,                icon:'🛍️', color:'var(--accent2)' },
+        { label:'Gross Revenue', value:'$'+revenue.toFixed(2),icon:'💵', color:'#10b981' },
+        { label:'Net Earnings',  value:'$'+net.toFixed(2),   icon:'💰', color:'#10b981' },
+        { label:'Awaiting Ship', value: newOrders,           icon:'⏰', color:'#f59e0b' },
+      ].map(s=>`
+        <div style="background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px 18px;display:flex;align-items:center;gap:12px">
+          <div style="font-size:26px;line-height:1">${s.icon}</div>
+          <div>
+            <div style="font-size:19px;font-weight:700;color:${s.color};line-height:1.2">${s.value}</div>
+            <div style="font-size:11px;color:var(--text3);margin-top:2px">${s.label}</div>
+          </div>
+        </div>`).join('')}
+    </div>
+    <div style="display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap">
+      ${tabs.map(t=> {
+        const active = t.key === _orderFilter;
+        return `<button onclick="setOrderFilter('${t.key}')"
+          style="padding:6px 14px;border-radius:20px;border:1px solid ${active?'var(--accent)':'var(--border)'};background:${active?'var(--accent)':'var(--card)'};color:${active?'#fff':'var(--text2)'};font-size:12px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px">
+          ${t.label}
+          <span style="background:rgba(255,255,255,.15);padding:1px 7px;border-radius:10px;font-size:10px">${t.count}</span>
+        </button>`;
+      }).join('')}
+    </div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      ${filtered.length ? filtered.map(card).join('') : `<div style="text-align:center;padding:50px;color:var(--text3)">No ${_orderFilter} orders</div>`}
     </div>`;
 }
 
