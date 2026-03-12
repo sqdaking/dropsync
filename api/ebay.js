@@ -999,6 +999,14 @@ module.exports = async (req, res) => {
 
       // ── SIMPLE LISTING ─────────────────────────────────────────────────────
       if (!product.hasVariations || !product.variations?.length) {
+        const simpleMarkupPct = parseFloat(product.markup || 35);
+        const simpleHandling  = 2;
+        const simpleEbayFee   = 0.1335;
+        const simpleCost      = parseFloat(product.price || 0);
+        const simplePrice     = simpleCost > 0
+          ? (Math.ceil(((simpleCost + simpleHandling) * (1 + simpleMarkupPct / 100) / (1 - simpleEbayFee) + 0.30) * 100) / 100).toFixed(2)
+          : basePrice;
+
         const ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(groupSku)}`, {
           method: 'PUT', headers: auth,
           body: JSON.stringify({
@@ -1011,7 +1019,7 @@ module.exports = async (req, res) => {
 
         const or = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, {
           method: 'POST', headers: auth,
-          body: JSON.stringify(buildOffer(groupSku, basePrice, categoryId, policies, locationKey)),
+          body: JSON.stringify(buildOffer(groupSku, simplePrice, categoryId, policies, locationKey)),
         });
         const od = await or.json();
         if (!or.ok) return res.status(400).json({ error: 'Offer failed', details: od });
@@ -1798,6 +1806,18 @@ Return ONLY the optimized title text, nothing else. No quotes, no explanation.` 
 
       console.log(`[end] done ended=${ended} deletedItems=${variantSkus.length}`);
       return res.json({ success: true, ended, deleted: variantSkus.length });
+    }
+
+    if (action === 'getOrders') {
+      const { access_token, limit = 50 } = body;
+      const fromDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+      const r = await fetch(
+        `https://api.ebay.com/sell/fulfillment/v1/order?limit=${limit}&filter=lastmodifieddate:[${fromDate}..]`,
+        { headers: { 'Authorization': `Bearer ${access_token}`, 'Content-Type': 'application/json' } }
+      );
+      const d = await r.json();
+      if (!r.ok) return res.status(r.status).json({ error: d.errors?.[0]?.message || JSON.stringify(d) });
+      return res.json({ orders: d.orders || [], total: d.total || 0 });
     }
 
     return res.status(400).json({ error: `Unknown action: ${action}` });
