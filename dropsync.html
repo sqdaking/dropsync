@@ -198,10 +198,16 @@ async function loadProductsFromServer() {
   try {
     const d = await apiGet('/api/products?limit=9000');
     if (d && Array.isArray(d.products) && d.products.length > 0) {
-      S.products = d.products;
-      save();
+      // Only use server data if it has richer info (data column populated)
+      // Check if first product has full data (images array, ebayListingId)
+      const sample = d.products[0];
+      const hasFullData = sample && (Array.isArray(sample.images) || sample.ebayListingId || sample.bullets);
+      if (hasFullData) {
+        S.products = d.products;
+        save();
+      }
+      // Otherwise keep local - server has stripped data from old schema
     }
-    // If server returns empty but local has data, keep local (server may be lagging)
   } catch(e) { console.warn('loadProductsFromServer failed — using local cache:', e); }
 }
 async function loadLogsFromServer() {
@@ -310,7 +316,6 @@ async function nav(view) {
   const titles = { import: 'Import Product', products: 'Listed Products', drafts: 'Drafts', orders: 'Orders', logs: 'Activity Log', settings: 'Settings' };
   document.getElementById('topbar-title').textContent = titles[view] || view;
   document.getElementById('topbar-actions').innerHTML = '';
-  if (view === 'products' || view === 'drafts') await loadProductsFromServer();
   if (view === 'logs') await loadLogsFromServer();
   const renders = { import: renderImport, bulk: renderBulk, ebayimport: renderEbayImport, products: renderProducts, drafts: renderDrafts, orders: renderOrders, logs: renderLogs, settings: renderSettings };
   renders[view]?.();
@@ -1407,19 +1412,44 @@ async function syncAllWithFeedback() {
   const btn = $('sync-all-btn');
   if (btn) { btn.disabled = true; btn.innerHTML = '<span style="display:inline-flex;align-items:center;gap:5px"><div class="spinner" style="width:11px;height:11px"></div> Syncing…</span>'; }
   try {
-    // If Railway server is connected, trigger worker sync there (24/7 engine)
     if (S.serverUrl) {
       const r = await fetch(`${S.serverUrl}/api/worker/run`, { method: 'POST' });
       const d = await r.json();
       if (d.success || d.message) {
-        toast(`🔄 Sync triggered on Railway server — check Activity Log for results`, 'success', 5000);
-        // Reload logs after a few seconds to show results
-        setTimeout(async () => { await loadLogsFromServer(); if (S.view==='logs') renderLogs(); }, 8000);
+        toast(`🔄 Sync running — prices will update in ~30 seconds`, 'success', 5000);
+        // After worker finishes, patch ONLY price/stock fields back into local products
+        setTimeout(async () => {
+          try {
+            const pr = await fetch(`${S.serverUrl}/api/products?limit=9000`);
+            const pd = await pr.json();
+            if (pd.products?.length) {
+              const byId = {};
+              pd.products.forEach(p => byId[p.id] = p);
+              let changed = 0;
+              (S.products || []).forEach(local => {
+                const srv = byId[local.id];
+                if (srv) {
+                  // Only patch fields the worker updates — never replace the full object
+                  if (srv.myPrice != null) local.myPrice = srv.myPrice;
+                  if (srv.amazonPrice != null) local.amazonPrice = srv.amazonPrice;
+                  if (srv.lastSynced) local.lastSynced = srv.lastSynced;
+                  if (srv.quantity != null) local.quantity = srv.quantity;
+                  if (srv.status && srv.status !== 'pending') local.status = srv.status;
+                  changed++;
+                }
+              });
+              save();
+              if (S.view === 'products') renderProducts();
+              toast(`✅ Synced — ${changed} products updated`, 'success');
+            }
+            await loadLogsFromServer();
+            if (S.view === 'logs') renderLogs();
+          } catch(e) { console.warn('Post-sync patch failed:', e); }
+        }, 35000);
       } else {
-        toast('Sync trigger failed: ' + (d.error||'unknown'), 'error');
+        toast('Sync trigger failed: ' + (d.error || 'unknown'), 'error');
       }
     } else {
-      // Fallback: direct sync via Vercel
       await syncAll();
     }
   } catch(e) {
