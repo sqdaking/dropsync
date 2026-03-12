@@ -201,7 +201,7 @@ async function loadProductsFromServer() {
       // Only use server data if it has richer info (data column populated)
       // Check if first product has full data (images array, ebayListingId)
       const sample = d.products[0];
-      const hasFullData = sample && (Array.isArray(sample.images) || !!sample.ebayListingId || sample.bullets?.length > 0);
+      const hasFullData = sample && (Array.isArray(sample.images) || sample.ebayListingId || sample.bullets);
       if (hasFullData) {
         S.products = d.products;
         save();
@@ -1227,7 +1227,6 @@ async function eiImportSelected() {
     };
     if (!S.products) S.products = [];
     S.products.push(prod);
-    if (S.serverUrl) { apiPost("/api/products", prod).catch(e => console.warn("eBay import DB save failed:", e)); }
     count++;
   }
   save();
@@ -1436,12 +1435,6 @@ async function syncAllWithFeedback() {
                   if (srv.lastSynced) local.lastSynced = srv.lastSynced;
                   if (srv.quantity != null) local.quantity = srv.quantity;
                   if (srv.status && srv.status !== 'pending') local.status = srv.status;
-                  // Restore ebayListingId: prefer local (source of truth), fall back to server
-                  if (!local.ebayListingId && srv.ebayListingId) local.ebayListingId = srv.ebayListingId;
-                  // If server is missing ebayListingId but local has it, re-upsert to DB to fix the gap
-                  if (local.ebayListingId && !srv.ebayListingId) {
-                    apiPost('/api/products', local).catch(() => {});
-                  }
                   changed++;
                 }
               });
@@ -1602,16 +1595,27 @@ let _orders = null;
 
 async function renderOrders() {
   $('content').innerHTML = `<div style="padding:40px;text-align:center"><div class="spinner" style="width:32px;height:32px;margin:0 auto 12px"></div><div style="color:var(--text3)">Loading orders…</div></div>`;
-  if (!S.serverUrl) {
-    $('content').innerHTML = `<div class="empty"><div class="eico">📋</div><h3>Railway server not connected</h3><p>Set your Railway Server URL in Settings to load orders</p><button class="btn btn-primary" onclick="nav('settings')" style="margin-top:12px">Go to Settings</button></div>`;
+  if (!S.token) {
+    $('content').innerHTML = `<div class="empty"><div class="eico">🔑</div><h3>Not connected to eBay</h3><p>Go to Settings and click Connect eBay first</p><button class="btn btn-primary" onclick="nav('settings')" style="margin-top:12px">Go to Settings</button></div>`;
+    return;
+  }
+  if (!S.backendUrl) {
+    $('content').innerHTML = `<div class="empty"><div class="eico">🔗</div><h3>Backend URL not set</h3><p>Set your Vercel Backend URL in Settings</p><button class="btn btn-primary" onclick="nav('settings')" style="margin-top:12px">Go to Settings</button></div>`;
     return;
   }
   try {
-    const d = await apiGet('/api/orders?limit=50');
+    const token = await ensureToken();
+    const r = await fetch(`${S.backendUrl}/api/ebay?action=getOrders`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ access_token: token, limit: 50 })
+    });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
     _orders = d.orders || [];
     renderOrderRows();
   } catch(e) {
-    $('content').innerHTML = `<div class="empty"><div class="eico">❌</div><h3>Failed to load orders</h3><p>${e.message}</p></div>`;
+    $('content').innerHTML = `<div class="empty"><div class="eico">❌</div><h3>Failed to load orders</h3><p>${e.message}</p><button class="btn btn-outline" onclick="renderOrders()" style="margin-top:12px">Retry</button></div>`;
   }
 }
 
