@@ -2183,19 +2183,22 @@ module.exports = async (req, res) => {
       const fallbackInStock = body.fallbackInStock !== false;
       const fallbackTitle   = typeof body.fallbackTitle === 'string' ? body.fallbackTitle : '';
 
-      if (!product && fallbackImages.length) {
-        console.log(`[sync] scrape failed — using ${fallbackImages.length} cached fallback images`);
-        product = {
-          title: fallbackTitle || 'Product', price: fallbackPrice, images: fallbackImages,
-          inStock: fallbackInStock, hasVariations: false, variations: [], variationImages: {},
-          comboPrices: {}, sizePrices: {}, aspects: {}, breadcrumbs: [], bullets: [], descriptionPara: '',
-        };
-      } else if (product && !product.images?.length && fallbackImages.length) {
+      if (!product) {
+        // Amazon blocked — use any cached data from frontend (images, price, title)
+        if (fallbackTitle || fallbackPrice > 0 || fallbackImages.length) {
+          console.log(`[sync] scrape blocked — using cached fallback: title="${fallbackTitle?.slice(0,40)}" imgs=${fallbackImages.length} price=$${fallbackPrice}`);
+          product = {
+            title: fallbackTitle || 'Product', price: fallbackPrice, images: fallbackImages,
+            inStock: fallbackInStock, hasVariations: false, variations: [], variationImages: {},
+            comboPrices: {}, sizePrices: {}, aspects: {}, breadcrumbs: [], bullets: [], descriptionPara: '',
+          };
+        }
+      } else if (!product.images?.length && fallbackImages.length) {
         product.images = fallbackImages;
       }
 
-      if (!product || !product.images?.length) {
-        return res.status(400).json({ error: 'Amazon is blocking requests — could not fetch product data. Try again in 30–60 seconds.' });
+      if (!product) {
+        return res.status(400).json({ error: 'Amazon is blocking requests and no cached data is available. Open the product on the Import tab to refresh it first.' });
       }
       console.log(`[sync] scraped: "${product.title?.slice(0,50)}" imgs=${product.images.length} price=$${product.price} hasVar=${product.hasVariations}`);
 
