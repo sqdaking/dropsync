@@ -565,12 +565,14 @@ async function scrapeAmazonProduct(inputUrl) {
     if (!sizes.length && colors[0]) sizeToFetchAsin[''] = Object.values(colorSizeMap[colors[0]]||{})[0] || '';
 
     const sizePrices = {};
+    const asinInStock = {};  // ASIN → boolean (in stock on Amazon)
     await Promise.all(Object.entries(sizeToFetchAsin).map(async ([size, a]) => {
       if (!a) return;
       const h = await fetchPage(`https://www.amazon.com/dp/${a}`, ua);
       if (!h) return;
       const p = extractPrice(h);
-      if (p) { sizePrices[size] = p; console.log(`[price] "${size}" = $${p}`); }
+      asinInStock[a] = !h.toLowerCase().includes('currently unavailable');
+      if (p) { sizePrices[size] = p; console.log(`[price] "${size}" = $${p} inStock=${asinInStock[a]}`); }
     }));
 
     const asinToPrice = {};
@@ -581,12 +583,17 @@ async function scrapeAmazonProduct(inputUrl) {
         const h = await fetchPage(`https://www.amazon.com/dp/${a}`, ua);
         if (!h) return;
         const p = extractPrice(h);
+        asinInStock[a] = !h.toLowerCase().includes('currently unavailable');
         if (p) asinToPrice[a] = p;
       }));
       if (i + 5 < uniqueAsins.length) await sleep(300);
     }
     const comboPrices = {};
-    for (const [key, a] of Object.entries(comboAsin)) comboPrices[key] = asinToPrice[a] || sizePrices[key.split('|')[1]] || 0;
+    const comboInStock = {};  // "Color|Size" → boolean
+    for (const [key, a] of Object.entries(comboAsin)) {
+      comboPrices[key] = asinToPrice[a] || sizePrices[key.split('|')[1]] || 0;
+      comboInStock[key] = asinInStock[a] !== false;  // default true if we couldn't check
+    }
 
     const mainPrice = product.price || 0;
     if (!Object.keys(sizePrices).length && mainPrice) { sizes.forEach(s => { sizePrices[s] = mainPrice; }); if (!sizes.length) sizePrices[''] = mainPrice; }
@@ -606,7 +613,9 @@ async function scrapeAmazonProduct(inputUrl) {
 
     if (colors.length) {
       product.variations.push({ name:'Color', values: colors.map(c => {
-        const inStock = sizes.length ? sizes.some(s=>comboAsin[`${c}|${s}`]) : !!comboAsin[`${c}|`];
+        const inStock = sizes.length
+          ? sizes.some(s => comboInStock[`${c}|${s}`] !== false && comboAsin[`${c}|${s}`])
+          : (comboInStock[`${c}|`] !== false && !!comboAsin[`${c}|`]);
         const availPrices = sizes.filter(s=>comboAsin[`${c}|${s}`]&&sizePrices[s]).map(s=>sizePrices[s]);
         const colorPrice = availPrices.length ? Math.min(...availPrices) : (sizePrices[sizes[0]]||mainPrice);
         return { value:c, price:colorPrice, image:colorData[c].image||'', inStock:Object.keys(comboAsin).length>0?inStock:true, enabled:Object.keys(comboAsin).length>0?inStock:true };
@@ -615,11 +624,12 @@ async function scrapeAmazonProduct(inputUrl) {
     }
     if (sizes.length) {
       product.variations.push({ name:'Size', values: sizes.map(s => {
-        const inStock = colors.some(c=>comboAsin[`${c}|${s}`]);
-        return { value:s, price:sizePrices[s]||mainPrice, inStock:Object.keys(comboAsin).length>0?inStock:true, enabled:true, image:'' };
+        const inStock = colors.some(c => comboAsin[`${c}|${s}`] && comboInStock[`${c}|${s}`] !== false);
+        return { value:s, price:sizePrices[s]||mainPrice, inStock:Object.keys(comboAsin).length>0?inStock:true, enabled:Object.keys(comboAsin).length>0?inStock:true, image:'' };
       })});
     }
-    product.comboAsin  = comboAsin;
+    product.comboAsin   = comboAsin;
+    product.comboInStock = comboInStock;
     product.sizePrices = sizePrices;
     product.comboPrices = comboPrices;
     const allP = Object.values(sizePrices).filter(p=>p>0);
@@ -937,6 +947,7 @@ module.exports = async (req, res) => {
 
         // Build lookup tables
         const comboAsin    = {};  // "Color|Size" → ASIN
+        const asinInStock  = {};  // ASIN → boolean (in stock on Amazon)
         const colorSizeMap = {};  // colorName → { sizeName → ASIN }
 
         for (const [code, asin] of Object.entries(dtaMap)) {
@@ -992,7 +1003,8 @@ module.exports = async (req, res) => {
             const h = await fetchPage(`https://www.amazon.com/dp/${asin}`, ua);
             if (!h) return;
             const p = extractPrice(h);
-            if (p) { sizePrices[size] = p; console.log(`[price] "${size}" = $${p} (${asin})`); }
+            asinInStock[asin] = !h.toLowerCase().includes('currently unavailable');
+            if (p) { sizePrices[size] = p; console.log(`[price] "${size}" = $${p} (${asin}) inStock=${asinInStock[asin]}`); }
             else     console.log(`[price] "${size}" FAILED (${asin})`);
           })
         );
@@ -1011,14 +1023,17 @@ module.exports = async (req, res) => {
             const h = await fetchPage(`https://www.amazon.com/dp/${asin}`, ua);
             if (!h) return;
             const p = extractPrice(h);
+            asinInStock[asin] = !h.toLowerCase().includes('currently unavailable');
             if (p) asinToPrice[asin] = p;
           }));
           if (i + BATCH < uniqueAsins.length) await sleep(300);
         }
-        // comboPrices: "Color|Size" → price
+        // comboPrices + comboInStock: "Color|Size" → price / inStock
         const comboPrices = {};
+        const comboInStock = {};
         for (const [key, asin] of Object.entries(comboAsin)) {
-          comboPrices[key] = asinToPrice[asin] || sizePrices[key.split('|')[1]] || 0;
+          comboPrices[key]  = asinToPrice[asin] || sizePrices[key.split('|')[1]] || 0;
+          comboInStock[key] = asinInStock[asin] !== false;  // default true if fetch failed
         }
         console.log(`[var] comboPrices: ${Object.keys(comboPrices).length} combos, asinToPrice: ${Object.keys(asinToPrice).length} asins`);
 
@@ -1068,8 +1083,8 @@ module.exports = async (req, res) => {
             name: 'Color',
             values: colors.map(c => {
               const inStock = sizes.length
-                ? sizes.some(s => comboAsin[`${c}|${s}`])
-                : !!comboAsin[`${c}|`];
+                ? sizes.some(s => comboAsin[`${c}|${s}`] && comboInStock[`${c}|${s}`] !== false)
+                : (!!comboAsin[`${c}|`] && comboInStock[`${c}|`] !== false);
               // Price = cheapest available size for this color
               const availPrices = sizes
                 .filter(s => comboAsin[`${c}|${s}`] && sizePrices[s])
@@ -1094,12 +1109,12 @@ module.exports = async (req, res) => {
           product.variations.push({
             name: 'Size',
             values: sizes.map(s => {
-              const inStock = colors.some(c => comboAsin[`${c}|${s}`]);
+              const inStock = colors.some(c => comboAsin[`${c}|${s}`] && comboInStock[`${c}|${s}`] !== false);
               return {
                 value: s,
                 price: sizePrices[s] || mainPrice,
                 inStock: Object.keys(comboAsin).length > 0 ? inStock : true,
-                enabled: true,
+                enabled: Object.keys(comboAsin).length > 0 ? inStock : true,
                 image: '',
               };
             }),
@@ -1107,7 +1122,8 @@ module.exports = async (req, res) => {
         }
 
         // Store on product for push step
-        product.comboAsin  = comboAsin;
+        product.comboAsin   = comboAsin;
+        product.comboInStock = comboInStock;
         product.sizePrices = sizePrices;
         product.comboPrices = comboPrices || {};
 
@@ -1312,6 +1328,8 @@ module.exports = async (req, res) => {
       // comboAsin:  "Color|Size" → ASIN  (only combos that exist on Amazon)
       // sizePrices: sizeName → price (fetched from best-coverage color, applies to all colors at that size)
       const comboAsin   = product.comboAsin   || {};
+      const comboInStock = product.comboInStock || {};
+      const comboInStock = product.comboInStock || {};
       const sizePrices  = product.sizePrices  || {};
       const comboPrices = product.comboPrices || {}; // "Color|Size" → amazon price
       // Use markup/handling from body (frontend settings), fallback to product, then defaults
@@ -1330,7 +1348,7 @@ module.exports = async (req, res) => {
         for (const cv of colorGroup.values.filter(v => v.enabled !== false)) {
           for (const sv of sizeGroup.values.filter(v => v.enabled !== false)) {
             const key = `${cv.value}|${sv.value}`;
-            const hasCombo = Object.keys(comboAsin).length === 0 || !!comboAsin[key];
+            const hasCombo = Object.keys(comboAsin).length === 0 || (!!comboAsin[key] && comboInStock[key] !== false);
             // Use comboPrices (per-combo) → sizePrices (per-size) → variant price → basePrice → myPrice fallback
             const amazonPrice = comboPrices[key]
                              || sizePrices[sv.value]
@@ -1351,7 +1369,7 @@ module.exports = async (req, res) => {
       } else if (colorGroup) {
         for (const cv of colorGroup.values.filter(v => v.enabled !== false)) {
           const key = `${cv.value}|`;
-          const hasCombo = Object.keys(comboAsin).length === 0 || !!comboAsin[key];
+          const hasCombo = Object.keys(comboAsin).length === 0 || (!!comboAsin[key] && comboInStock[key] !== false);
           const amazonPrice = comboPrices[key] || parseFloat(cv.price || basePrice || product.myPrice || 0);
           const calcedPriceC = applyMarkup(amazonPrice);
           variants.push({
@@ -1923,11 +1941,16 @@ module.exports = async (req, res) => {
 
         const getQtyForVariant = (color, size) => {
           if (!freshStock) return 0;
-          // If we have comboAsin data, check if this combo exists
-          const comboAsin = product.comboAsin || {};
+          // If we have comboAsin data, check if combo exists AND is in stock
+          const comboAsin   = product.comboAsin   || {};
+      const comboInStock = product.comboInStock || {};
+      const comboInStock = product.comboInStock || {};
+          const comboInStock = product.comboInStock || {};
           if (Object.keys(comboAsin).length) {
             const key = `${color||''}|${size||''}`;
-            return comboAsin[key] ? defaultQty : 0;
+            if (!comboAsin[key]) return 0;
+            if (comboInStock[key] === false) return 0;
+            return defaultQty;
           }
           return defaultQty;
         };
@@ -2252,6 +2275,8 @@ module.exports = async (req, res) => {
       const comboPrices = product.comboPrices || {};
       const sizePrices  = product.sizePrices  || {};
       const comboAsin   = product.comboAsin   || {};
+      const comboInStock = product.comboInStock || {};
+      const comboInStock = product.comboInStock || {};
       const basePrice   = parseFloat(product.price || 0);
 
       // Per-variant price — exact same logic as push/revise
@@ -2266,12 +2291,15 @@ module.exports = async (req, res) => {
         return p > 0 ? p : applyMk(basePrice) || 9.99;
       };
 
-      // Per-variant qty — use comboAsin to check if combo exists on Amazon
+      // Per-variant qty — combo must exist AND be in stock on Amazon
       const getQtyForVariant = (color, size) => {
         if (!freshStock) return 0;
         if (Object.keys(comboAsin).length) {
           const key = `${color||''}|${size||''}`;
-          return comboAsin[key] ? defaultQty : 0;
+          if (!comboAsin[key]) return 0;
+          // comboInStock[key] defaults to true if we couldn't check (unknown = assume in stock)
+          if (comboInStock[key] === false) return 0;
+          return defaultQty;
         }
         return defaultQty;
       };
