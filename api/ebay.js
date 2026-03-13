@@ -1009,31 +1009,28 @@ module.exports = async (req, res) => {
           })
         );
 
-        // 5b. Build comboPrices: unique ASINs → price (per-combo accuracy)
-        //     Batch fetch only ASINs not already covered by sizePrices
-        const asinToPrice = {}; // ASIN → price (from size fetches above)
+        // 5b. Build comboPrices from size prices (fast — no extra ASIN fetches during sync)
+        //     Per-size fetch above already tells us price + stock for each size across all colors.
+        //     Unique-ASIN batch fetch is skipped here to stay within Vercel time limits.
+        const asinToPrice = {};
         for (const [size, asin] of Object.entries(sizeToFetchAsin)) {
           if (sizePrices[size] && asin) asinToPrice[asin] = sizePrices[size];
         }
-        // Find unique ASINs that have a different price than their size bucket
-        const uniqueAsins = [...new Set(Object.values(comboAsin))].filter(a => !asinToPrice[a]);
-        const BATCH = 5;
-        for (let i = 0; i < uniqueAsins.length; i += BATCH) {
-          await Promise.all(uniqueAsins.slice(i, i+BATCH).map(async asin => {
-            const h = await fetchPage(`https://www.amazon.com/dp/${asin}`, ua);
-            if (!h) return;
-            const p = extractPrice(h);
-            asinInStock[asin] = !h.toLowerCase().includes('currently unavailable');
-            if (p) asinToPrice[asin] = p;
-          }));
-          if (i + BATCH < uniqueAsins.length) await sleep(300);
-        }
-        // comboPrices + comboInStock: "Color|Size" → price / inStock
+        // comboPrices + comboInStock: "Color|Size" — use size-level stock for all colors
         const comboPrices = {};
         const comboInStock = {};
+        // Build sizeInStock from the per-size ASIN fetches
+        const sizeInStock = {}; // size → boolean
+        for (const [size, asin] of Object.entries(sizeToFetchAsin)) {
+          sizeInStock[size] = asinInStock[asin] !== false;
+        }
         for (const [key, asin] of Object.entries(comboAsin)) {
-          comboPrices[key]  = asinToPrice[asin] || sizePrices[key.split('|')[1]] || 0;
-          comboInStock[key] = asinInStock[asin] !== false;  // default true if fetch failed
+          const size = key.split('|')[1] || '';
+          comboPrices[key]  = asinToPrice[asin] || sizePrices[size] || 0;
+          // If we have explicit ASIN stock data use it, otherwise fall back to size-level
+          comboInStock[key] = asinInStock[asin] !== undefined
+            ? asinInStock[asin]
+            : (sizeInStock[size] !== undefined ? sizeInStock[size] : true);
         }
         console.log(`[var] comboPrices: ${Object.keys(comboPrices).length} combos, asinToPrice: ${Object.keys(asinToPrice).length} asins`);
 
@@ -2091,16 +2088,20 @@ module.exports = async (req, res) => {
 
         console.log(`[revise] done — ${createdSkus.size} variants updated, ${pricesUpdated} prices updated, ${failedSkus.length} failed`);
         return res.json({
-          success:       true,
-          type:          'variant',
-          updated:       createdSkus.size,
+          success:         true,
+          type:            'variant',
+          updated:         createdSkus.size,
+          updatedVariants: createdSkus.size,
           pricesUpdated,
-          failed:        failedSkus.length,
-          total:         variantSkus.length,
-          images:        product.images.length,
-          price:         product.price,
-          inStock:       freshStock,
-          title:         listingTitle,
+          failed:          failedSkus.length,
+          total:           variantSkus.length,
+          images:          product.images.length,
+          price:           applyMk(product.price),
+          inStock:         freshStock,
+          title:           listingTitle,
+          priceChanges:    [],
+          stockChanges:    [],
+          imageChanges:    [],
         });
 
       } else {
@@ -2146,14 +2147,18 @@ module.exports = async (req, res) => {
 
         console.log(`[revise/simple] title="${listingTitle.slice(0,40)}" price=$${newPrice} qty=${newQty} imgs=${product.images.length}`);
         return res.json({
-          success:  true,
-          type:     'simple',
-          updated:  1,
-          images:   product.images.length,
-          price:    product.price,
-          ebayPrice: newPrice,
-          inStock:  freshStock,
-          title:    listingTitle,
+          success:         true,
+          type:            'simple',
+          updated:         1,
+          updatedVariants: 1,
+          images:          product.images.length,
+          price:           newPrice,
+          ebayPrice:       newPrice,
+          inStock:         freshStock,
+          title:           listingTitle,
+          priceChanges:    [],
+          stockChanges:    newQty === 0 ? ['Out of stock'] : [],
+          imageChanges:    [],
         });
       }
     }
