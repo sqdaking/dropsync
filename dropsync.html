@@ -2276,6 +2276,9 @@ async function reviseFromOrder(productId, orderIdSafe, btn) {
         handlingCost: S.handlingCost || 2,
         sandbox: S.sandboxMode || false,
         fallbackImages: p.images || [],
+        fallbackTitle: p.title || '',
+        fallbackPrice: p.cost || p.price || 0,
+        fallbackInStock: p.inStock !== false,
       })
     });
     const d = await r.json();
@@ -2355,6 +2358,9 @@ async function linkAndResync(productId, itemListingId, itemSku, orderIdSafe, url
         handlingCost: S.handlingCost || 2,
         sandbox: S.sandboxMode || false,
         fallbackImages: p.images || [],
+        fallbackTitle: p.title || '',
+        fallbackPrice: p.cost || p.price || 0,
+        fallbackInStock: p.inStock !== false,
       })
     });
     const d = await r.json();
