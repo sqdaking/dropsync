@@ -294,6 +294,23 @@ async function loadProductsFromRailway() {
   }
 }
 
+// ── loadLogsFromRailway: fetch logs from Railway DB ──
+async function loadLogsFromRailway() {
+  if (!S.serverUrl) return;
+  try {
+    const r = await fetch(S.serverUrl + '/api/logs?limit=500');
+    if (!r.ok) return;
+    const d = await r.json();
+    if (Array.isArray(d.logs) && d.logs.length > 0) {
+      // Merge: Railway logs + any local-only logs not yet pushed
+      const rwIds = new Set(d.logs.map(l => String(l.id)));
+      const localOnly = (S.logs||[]).filter(l => !rwIds.has(String(l.id)));
+      S.logs = [...d.logs, ...localOnly].sort((a,b) => new Date(b.ts||b.created_at) - new Date(a.ts||a.created_at));
+      localStorage.setItem(KEY, JSON.stringify(S));
+    }
+  } catch(e) { console.warn('[Logs] Railway fetch failed:', e.message); }
+}
+
 // Legacy compat shims
 async function serverAddProduct(prod) { await saveProduct(prod); }
 async function serverUpdateProduct(id, updates) {
@@ -397,7 +414,7 @@ async function nav(view) {
   const titles = { import: 'Import Product', products: 'Listed Products', drafts: 'Drafts', orders: 'Orders', logs: 'Activity Log', settings: 'Settings' };
   document.getElementById('topbar-title').textContent = titles[view] || view;
   document.getElementById('topbar-actions').innerHTML = '';
-  if (view === 'logs') await loadLogsFromServer();
+  if (view === 'logs') await loadLogsFromRailway();
   const renders = { import: renderImport, bulk: renderBulk, ebayimport: renderEbayImport, products: renderProducts, drafts: renderDrafts, orders: renderOrders, logs: renderLogs, settings: renderSettings };
   renders[view]?.();
 }
@@ -1332,7 +1349,7 @@ function renderProducts() {
         <span class="card-title">Listed (${prods.filter(p=>p.status==='listed').length})</span>
         <div style="display:flex;align-items:center;gap:10px">
           ${S.lastAutoSync ? `<span style="font-size:11px;color:var(--text3)">Last sync: ${timeAgo(S.lastAutoSync)}</span>` : ''}
-          <button class="btn btn-primary btn-sm" onclick="syncAllWithFeedback()" id="sync-all-btn">🔄 Sync All</button>
+          <button class="btn btn-primary btn-sm" onclick="syncAllWithFeedback()" id="revise-all-btn">🔄 Revise All</button>
           <input class="input" id="prod-search" placeholder="Search…" style="width:160px;font-size:12px" oninput="filterProducts()">
         </div>
       </div>
@@ -1389,7 +1406,7 @@ function renderProdRows(prods) {
     const syncAge = p.lastSynced ? `<span style="font-size:10px;color:var(--text3)">· synced ${timeAgo(p.lastSynced)}</span>` : '';
 
     const actionBtns = p.status==='listed' ? `
-      <button class="btn btn-outline btn-sm" onclick="syncOne('${p.id}')">🔄 Sync</button>
+      <button class="btn btn-outline btn-sm" onclick="syncOne('${p.id}')">🔄 Revise</button>
       <a href="https://www.ebay.com/itm/${p.ebayListingId}" target="_blank" class="btn btn-outline btn-sm">eBay ↗</a>
       <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="confirmEnd('${p.id}')">End</button>
     ` : p.status==='draft' ? `
@@ -1600,17 +1617,18 @@ async function syncOne(pid) {
 
   const btn = document.querySelector(`[onclick="syncOne('${pid}')"]`);
   const origText = btn?.textContent;
-  if (btn) { btn.disabled = true; btn.textContent = '⏳ Syncing…'; }
-  toast('Syncing listing from Amazon…', 'info');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Revising…'; }
+  toast('Revising listing from Amazon…', 'info');
 
   try {
     const token = await ensureToken();
-    const r = await fetch(`${S.backendUrl}/api/ebay?action=sync`, {
+    const r = await fetch(`${S.backendUrl}/api/ebay?action=revise`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token: token,
         ebaySku: p.ebaySku,
         sourceUrl: p.sourceUrl,
+        ebayListingId: p.ebayListingId || '',
         quantity: p.quantity || 1,
         markup: S.markup,
         handlingCost: S.handlingCost,
@@ -1621,7 +1639,9 @@ async function syncOne(pid) {
         fallbackInStock: p.inStock !== false && (p.quantity || 1) > 0,
       }),
     });
-    const d = await r.json();
+    const raw = await r.text();
+    let d;
+    try { d = JSON.parse(raw); } catch(e) { throw new Error('Server error: ' + raw.slice(0, 120)); }
     if (!d.success) throw new Error(d.error || 'Sync failed');
 
     p.lastSynced = new Date().toISOString();
@@ -1638,23 +1658,23 @@ async function syncOne(pid) {
 
     if (d.priceChanges?.length) { addLog('price', `Price updated: ${p.title.slice(0,40)}`, d.priceChanges.join(' · '), { productId: p.id }); sendWebhook('price', p, d.priceChanges); }
     if (d.stockChanges?.length) { addLog('stock', `Stock updated: ${p.title.slice(0,40)}`, d.stockChanges.join(' · '), { productId: p.id }); sendWebhook('stock', p, d.stockChanges); }
-    addLog('sync', `Synced: ${p.title.slice(0,40)}`, `${d.updatedVariants||1} items · ${d.images} images · $${(d.price||0).toFixed(2)}`, { productId: p.id });
+    addLog('sync', `Revised: ${p.title.slice(0,40)}`, `${d.updatedVariants||1} items · ${d.images} images · $${(d.price||0).toFixed(2)}`, { productId: p.id });
   } catch (e) {
     toast(`Sync failed: ${e.message}`, 'error', 6000);
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = origText || '🔄 Sync'; }
+    if (btn) { btn.disabled = false; btn.textContent = origText || '🔄 Revise'; }
   }
 }
 
 async function syncAllWithFeedback() {
-  const btn = $('sync-all-btn');
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span style="display:inline-flex;align-items:center;gap:5px"><div class="spinner" style="width:11px;height:11px"></div> Syncing…</span>'; }
+  const btn = $('revise-all-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span style="display:inline-flex;align-items:center;gap:5px"><div class="spinner" style="width:11px;height:11px"></div> Revising…</span>'; }
   try {
     await syncAll();
   } catch(e) {
     toast(`Sync error: ${e.message}`, 'error');
   } finally {
-    if (btn) { btn.disabled = false; btn.innerHTML = '🔄 Sync All'; }
+    if (btn) { btn.disabled = false; btn.innerHTML = '🔄 Revise All'; }
   }
 }
 
@@ -1672,19 +1692,20 @@ async function syncAll() {
   if (!syncable.length) {
     toast('No products ready to sync — add Amazon URLs and run Recover SKUs in Settings', 'warn', 5000); return;
   }
-  toast(`Syncing ${syncable.length} products${skipped ? ` (${skipped} skipped)` : ''}…`, 'info');
+  toast(`Revising ${syncable.length} products${skipped ? ` (${skipped} skipped)` : ''}…`, 'info');
 
   let ok = 0, totalPriceChanges = 0, totalStockChanges = 0, failed = 0;
 
   for (const p of syncable) {
     try {
       const token = await ensureToken();
-      const r = await fetch(`${S.backendUrl}/api/ebay?action=sync`, {
+      const r = await fetch(`${S.backendUrl}/api/ebay?action=revise`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           access_token: token,
           ebaySku: p.ebaySku,
           sourceUrl: p.sourceUrl,
+          ebayListingId: p.ebayListingId || '',
           quantity: p.quantity || 1,
           markup: S.markup,
           handlingCost: S.handlingCost,
@@ -1927,7 +1948,7 @@ function renderOrderRows() {
            ${ebaySku ? `<button onclick="reviseFromOrder('${productId}','${orderId_safe}',this)"
              style="display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:600;color:var(--accent2);background:rgba(99,179,237,.1);border:1px solid rgba(99,179,237,.25);padding:3px 9px;border-radius:6px;cursor:pointer"
              onmouseover="this.style.background='rgba(99,179,237,.2)'" onmouseout="this.style.background='rgba(99,179,237,.1)'">
-             🔄 Resync Listing
+             🔄 Revise Listing
            </button>` : ''}
          </div>`
       : `<div style="display:flex;align-items:center;gap:6px;margin-top:7px;flex-wrap:wrap">
@@ -1939,7 +1960,7 @@ function renderOrderRows() {
            </div>
            <button onclick="linkAndResync('${productId}','${itemListingId}','${itemSku}','${orderId_safe}',$('url-input-${orderId_safe}').value)"
              style="flex-shrink:0;font-size:11px;font-weight:600;color:#fff;background:var(--accent);border:none;padding:4px 11px;border-radius:6px;cursor:pointer">
-             Link & Resync
+             Link & Revise
            </button>
          </div>`;
 
@@ -2466,7 +2487,7 @@ async function reviseFromOrder(productId, orderIdSafe, btn) {
   if (!S.token) { toast('Connect eBay first', 'error'); return; }
 
   const orig = btn.textContent;
-  btn.textContent = '⏳ Syncing…';
+  btn.textContent = '⏳ Revising…';
   btn.disabled = true;
   try {
     const token = await ensureToken();
@@ -2492,7 +2513,7 @@ async function reviseFromOrder(productId, orderIdSafe, btn) {
     p.lastSynced = new Date().toISOString();
     if (d.price) { p.price = d.price; p.cost = d.price; }
     save();
-    btn.textContent = '✅ Resynced!';
+    btn.textContent = '✅ Revised!';
     btn.style.color = '#10b981';
     toast(`✅ Listing updated — ${d.images} photos, price $${d.price}, ${d.inStock ? 'In Stock' : 'Out of Stock'}`, 'success', 5000);
     addLog('sync', `Revised: ${p.title?.slice(0,50)}`, `${d.updated} variants updated via order card`, { productId: p.id });
@@ -2500,7 +2521,7 @@ async function reviseFromOrder(productId, orderIdSafe, btn) {
   } catch(e) {
     btn.textContent = orig;
     btn.disabled = false;
-    toast(`Resync failed: ${e.message}`, 'error', 6000);
+    toast(`Revise failed: ${e.message}`, 'error', 6000);
   }
 }
 
@@ -2542,14 +2563,14 @@ async function linkAndResync(productId, itemListingId, itemSku, orderIdSafe, url
   // If no real eBay SKU, prompt recovery first
   if (!p.ebaySku || p.ebaySku.startsWith('DS-RECOVERED') || p.ebaySku.startsWith('DS-EXISTING')) {
     // Save URL and re-render, but can't revise without real SKU
-    toast('URL saved! Go to Settings → Recover SKUs to enable Resync.', 'info', 5000);
+    toast('URL saved! Go to Settings → Recover SKUs to enable Revise.', 'info', 5000);
     renderOrderRows();
     return;
   }
 
   // Run revise inline
   const btn = document.querySelector(`#order-card-${orderIdSafe} button[onclick*="linkAndResync"]`);
-  if (btn) { btn.textContent = '⏳ Linking & Syncing…'; btn.disabled = true; }
+  if (btn) { btn.textContent = '⏳ Linking & Revising…'; btn.disabled = true; }
   try {
     const token = await ensureToken();
     const r = await fetch(`${S.backendUrl}/api/ebay?action=revise`, {
@@ -2574,11 +2595,11 @@ async function linkAndResync(productId, itemListingId, itemSku, orderIdSafe, url
     p.lastSynced = new Date().toISOString();
     if (d.price) { p.price = d.price; p.cost = d.price; }
     save();
-    toast(`✅ Linked & resynced — ${d.images} photos, price $${d.price}`, 'success', 5000);
+    toast(`✅ Linked & revised — ${d.images} photos, price $${d.price}`, 'success', 5000);
     addLog('sync', `Linked & revised: ${p.title?.slice(0,50)}`, `Amazon: ${cleanUrl.slice(0,60)}`, { productId: p.id });
     renderOrderRows(); // re-render to show the Amazon link
   } catch(e) {
-    if (btn) { btn.textContent = 'Link & Resync'; btn.disabled = false; }
+    if (btn) { btn.textContent = 'Link & Revise'; btn.disabled = false; }
     toast(`Failed: ${e.message}`, 'error', 6000);
   }
 }
