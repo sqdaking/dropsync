@@ -1823,29 +1823,86 @@ module.exports = async (req, res) => {
       }
 
       if (!product || !product.images?.length) {
-        // Last resort: pull existing images off the live eBay inventory item
+        // Last resort: pull existing images + stock from the live eBay listing
         console.log('[revise] no images from Amazon or cache — fetching from eBay inventory');
         try {
-          const invR = await fetch(
-            `${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(ebaySku)}`,
+          // First check if this is a variation listing (has an inventory item group)
+          const grpR = await fetch(
+            `${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`,
             { headers: auth }
-          );
-          if (invR.ok) {
-            const invD = await invR.json();
-            const ebayImgs = invD.product?.imageUrls || [];
-            if (ebayImgs.length) {
-              console.log(`[revise] using ${ebayImgs.length} images from live eBay listing`);
-              // Build a minimal product from cached title/price + eBay images
-              const cachedPrice = parseFloat(body.fallbackPrice) || 0;
-              product = {
-                title: body.fallbackTitle || invD.product?.title || 'Product',
-                price: cachedPrice,
-                images: ebayImgs,
-                inStock: body.fallbackInStock !== false,
-                hasVariations: false, variations: [], variationImages: {},
-                comboPrices: {}, sizePrices: {}, aspects: invD.product?.aspects || {},
-                breadcrumbs: [], bullets: [], descriptionPara: '',
-              };
+          ).then(r => r.ok ? r.json() : null).catch(() => null);
+          const existingVarSkus = grpR?.variantSKUs || [];
+
+          if (existingVarSkus.length) {
+            // Variation listing — fetch each variant's current qty + images from eBay
+            console.log(`[revise] variation fallback: ${existingVarSkus.length} variants`);
+            const allImgs = [];
+            const comboAsin = {};    // we won't have ASINs but we need keys for getQtyForVariant
+            const comboInStock = {}; // key → boolean from current eBay qty
+            const skuQtys = {};      // sku → qty
+
+            // Batch fetch all variant inventory items
+            for (let i = 0; i < existingVarSkus.length; i += 20) {
+              const batch = existingVarSkus.slice(i, i + 20);
+              const qs = batch.map(s => `sku=${encodeURIComponent(s)}`).join('&');
+              const bd = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item?${qs}`, { headers: auth })
+                .then(r => r.json()).catch(() => ({}));
+              for (const item of (bd.inventoryItems || [])) {
+                const asp = item.inventoryItem?.product?.aspects || {};
+                const color = (asp['Color'] || asp['color'] || [])[0] || '';
+                const size  = (asp['Size']  || asp['size']  || [])[0] || '';
+                const key   = `${color}|${size}`;
+                const qty   = item.inventoryItem?.availability?.shipToLocationAvailability?.quantity ?? 1;
+                comboAsin[key]    = item.sku;  // use sku as stand-in ASIN key
+                comboInStock[key] = qty > 0;
+                skuQtys[item.sku] = qty;
+                const imgs = item.inventoryItem?.product?.imageUrls || [];
+                imgs.forEach(u => { if (!allImgs.includes(u)) allImgs.push(u); });
+              }
+            }
+            // Also grab group images
+            const grpImgs = grpR.variantSKUSpecifics?.flatMap(s => []) || [];
+            const finalImgs = allImgs.length ? allImgs : (grpR.aspects ? [] : []);
+
+            const cachedPrice = parseFloat(body.fallbackPrice) || 0;
+            product = {
+              title: body.fallbackTitle || 'Product',
+              price: cachedPrice,
+              images: finalImgs,
+              inStock: Object.values(comboInStock).some(Boolean),
+              hasVariations: true,
+              variations: [], variationImages: {},
+              comboPrices: {}, sizePrices: {}, comboAsin, comboInStock,
+              aspects: {}, breadcrumbs: [], bullets: [], descriptionPara: '',
+            };
+            // If we couldn't get images from variants, fall through to simple item fetch
+            if (!product.images.length) product = null;
+          }
+
+          if (!product || !product.images?.length) {
+            // Simple listing or group had no images — fetch the single inventory item
+            const invR = await fetch(
+              `${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(ebaySku)}`,
+              { headers: auth }
+            );
+            if (invR.ok) {
+              const invD = await invR.json();
+              const ebayImgs = invD.product?.imageUrls || [];
+              if (ebayImgs.length) {
+                console.log(`[revise] using ${ebayImgs.length} images from live eBay simple item`);
+                const currentQty = invD.availability?.shipToLocationAvailability?.quantity ?? 1;
+                const cachedPrice = parseFloat(body.fallbackPrice) || 0;
+                product = {
+                  title: body.fallbackTitle || invD.product?.title || 'Product',
+                  price: cachedPrice,
+                  images: ebayImgs,
+                  inStock: currentQty > 0,
+                  hasVariations: false, variations: [], variationImages: {},
+                  comboPrices: {}, sizePrices: {}, comboAsin: {}, comboInStock: {},
+                  aspects: invD.product?.aspects || {},
+                  breadcrumbs: [], bullets: [], descriptionPara: '',
+                };
+              }
             }
           }
         } catch(e) { console.warn('[revise] eBay inventory fallback failed:', e.message); }
@@ -1923,7 +1980,8 @@ module.exports = async (req, res) => {
         { headers: auth }
       ).then(r => r.json()).catch(() => null);
       const variantSkus = groupRes?.variantSKUs || [];
-      const isVariation = product.hasVariations && product.variations?.length && variantSkus.length > 0;
+      // isVariation: trust eBay's existing group SKUs (handles eBay-fallback case where variations[] may be empty)
+      const isVariation = variantSkus.length > 0;
       console.log(`[revise] mode=${isVariation?'variation':'simple'} existingVarSkus=${variantSkus.length}`);
 
       // ── STEP 5: Read existing variant aspects to get color+size per SKU ──────
@@ -2066,8 +2124,16 @@ module.exports = async (req, res) => {
 
         // ── STEP 6B: Full-replace the inventory_item_group ───────────────────────
         const varAspects = {};
-        if (colorGroup) varAspects['Color'] = colorGroup.values.map(v => v.value);
-        if (sizeGroup)  varAspects['Size']  = sizeGroup.values.map(v => v.value);
+        if (colorGroup) {
+          varAspects['Color'] = colorGroup.values.map(v => v.value);
+        } else {
+          // eBay fallback: derive Color/Size lists from what eBay already has on the variants
+          const colors = [...new Set(Object.values(skuAspects).map(a => a.Color).filter(Boolean))];
+          const sizes  = [...new Set(Object.values(skuAspects).map(a => a.Size).filter(Boolean))];
+          if (colors.length) varAspects['Color'] = colors;
+          if (sizes.length)  varAspects['Size']  = sizes;
+        }
+        if (sizeGroup) varAspects['Size'] = sizeGroup.values.map(v => v.value);
         const colorUrlList = Object.values(colorImgs).filter(Boolean).slice(0, 12);
         const groupImageUrls = colorUrlList.length ? colorUrlList : product.images.slice(0, 12);
         const groupAspects = { ...aspects };
