@@ -1882,6 +1882,7 @@ function renderSettings() {
             ${S.token ? `<button class="btn btn-outline" onclick="refreshToken()">Refresh Token</button>` : ''}
             ${S.token ? `<button class="btn" style="background:var(--red);color:#fff;font-weight:700" onclick="forceReconnect()" title="Clears token and re-authorizes with full permissions. Use this if you get 401 errors on push.">🔑 Force Reconnect (fix 401)</button>` : ''}
             ${S.token ? `<button class="btn btn-ghost" style="color:var(--red)" onclick="disconnectEbay()">Disconnect</button>` : ''}
+            ${S.token ? `<button class="btn btn-outline" onclick="recoverSkusFromEbay()" title="Re-syncs eBay SKUs for all listed products. Run this if sync fails or after re-importing listings.">🔧 Recover SKUs</button>` : ''}
           </div>
           ${S.token ? `<div style="font-size:11px;color:var(--text3);margin-top:6px">Getting <b>401 errors</b> on push? Click <b>Force Reconnect</b> to re-authorize with full inventory permissions.</div>` : ''}
         </div>
@@ -2193,6 +2194,32 @@ function forceReconnect() {
   save(); renderSettings();
   toast('Token cleared — re-authorizing...', 'info');
   setTimeout(() => connectEbay(), 500);
+}
+
+async function recoverSkusFromEbay() {
+  if (!S.token) { toast('Connect eBay first', 'error'); return; }
+  toast('🔧 Fetching SKUs from eBay — may take 30s…', 'info', 5000);
+  try {
+    const token = await ensureToken();
+    const r = await fetch(`${S.backendUrl}/api/ebay?action=recoverSkus`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ access_token: token }),
+    });
+    const d = await r.json();
+    if (!d.skuMap) throw new Error(d.error || 'Failed to fetch SKUs');
+    let updated = 0;
+    for (const p of S.products) {
+      if (!p.ebayListingId) continue;
+      const realSku = d.skuMap[p.ebayListingId];
+      if (realSku && p.ebaySku !== realSku) {
+        p.ebaySku = realSku;
+        updated++;
+      }
+    }
+    save();
+    toast(`✅ Recovered ${updated} SKUs from ${d.total} eBay listings`, 'success', 4000);
+    addLog('info', `SKU Recovery`, `Updated ${updated} SKUs from eBay`);
+  } catch(e) { toast(`SKU recovery failed: ${e.message}`, 'error', 5000); }
 }
 
 async function loadPolicies() {
