@@ -926,7 +926,16 @@ module.exports = async (req, res) => {
       const sandbox = body.sandbox === true || body.sandbox === 'true';
       const EBAY_API = getEbayUrls(sandbox).EBAY_API;
       const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
-      console.log(`[push] "${product.title?.slice(0,60)}" hasVariations=${product.hasVariations}`);
+      console.log(`[push] "${product.title?.slice(0,60)}" hasVariations=${product.hasVariations} images=${product.images?.length||0} price=${product.price}`);
+
+      // Guard: must have at least 1 image
+      if (!product.images?.length) {
+        return res.status(400).json({ error: 'No images found for this product. Try re-importing it from the Import tab to refresh the images.' });
+      }
+      // Guard: must have a price
+      if (!product.hasVariations && !product.price && !product.cost && !product.myPrice) {
+        return res.status(400).json({ error: 'No price found for this product. Try re-importing it from the Import tab to get the current price.' });
+      }
 
       // Resolve policies
       let policies;
@@ -994,18 +1003,28 @@ module.exports = async (req, res) => {
 
       // Merchant location
       const locationKey = await ensureLocation(auth, sandbox);
-      const basePrice   = parseFloat(product.price || 0).toFixed(2);
-      const groupSku    = `DS-${Date.now()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`;
+      // basePrice: scraped price → stored cost → stored myPrice → 0
+      const basePrice = parseFloat(product.price || product.cost || product.myPrice || 0);
+      const groupSku  = `DS-${Date.now()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`;
 
       // ── SIMPLE LISTING ─────────────────────────────────────────────────────
       if (!product.hasVariations || !product.variations?.length) {
-        const simpleMarkupPct = parseFloat(product.markup || 35);
-        const simpleHandling  = 2;
+        const simpleMarkupPct = parseFloat(body.markup ?? product.markup ?? 35);
+        const simpleHandling  = parseFloat(body.handlingCost ?? product.handlingCost ?? 2);
         const simpleEbayFee   = 0.1335;
-        const simpleCost      = parseFloat(product.price || 0);
-        const simplePrice     = simpleCost > 0
-          ? (Math.ceil(((simpleCost + simpleHandling) * (1 + simpleMarkupPct / 100) / (1 - simpleEbayFee) + 0.30) * 100) / 100).toFixed(2)
-          : basePrice;
+        // Price priority: product.price (freshly scraped) → product.cost → product.myPrice (pre-calculated)
+        const simpleCost = parseFloat(product.price || product.cost || 0);
+        let simplePrice;
+        if (simpleCost > 0) {
+          simplePrice = (Math.ceil(((simpleCost + simpleHandling) * (1 + simpleMarkupPct / 100) / (1 - simpleEbayFee) + 0.30) * 100) / 100).toFixed(2);
+        } else if (parseFloat(product.myPrice) > 0) {
+          simplePrice = parseFloat(product.myPrice).toFixed(2);
+        } else {
+          simplePrice = '9.99'; // safe fallback — never $0
+        }
+        // eBay price floor
+        if (parseFloat(simplePrice) < 0.99) simplePrice = '0.99';
+        console.log(`[push/simple] cost=$${simpleCost} myPrice=$${product.myPrice} markup=${simpleMarkupPct}% handling=$${simpleHandling} → price=$${simplePrice}`);
 
         const ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(groupSku)}`, {
           method: 'PUT', headers: auth,
@@ -1056,13 +1075,15 @@ module.exports = async (req, res) => {
       const comboAsin   = product.comboAsin   || {};
       const sizePrices  = product.sizePrices  || {};
       const comboPrices = product.comboPrices || {}; // "Color|Size" → amazon price
-      const markupPct   = parseFloat(product.markup || 35);
-      const handling    = 2; // $2 handling cost
+      // Use markup/handling from body (frontend settings), fallback to product, then defaults
+      const markupPct   = parseFloat(body.markup ?? product.markup ?? 35);
+      const handling    = parseFloat(body.handlingCost ?? product.handlingCost ?? 2);
       const ebayFee     = 0.1335;
       const applyMarkup = (cost) => {
         const c = parseFloat(cost) || 0;
-        if (c <= 0) return c;
-        return Math.ceil(((c + handling) * (1 + markupPct / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
+        if (c <= 0) return 0; // will be caught by floor below
+        const result = Math.ceil(((c + handling) * (1 + markupPct / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
+        return Math.max(result, 0.99); // eBay price floor
       };
       console.log(`[push] comboAsin entries=${Object.keys(comboAsin).length} comboPrices entries=${Object.keys(comboPrices).length} markup=${markupPct}%`);
 
@@ -1071,11 +1092,12 @@ module.exports = async (req, res) => {
           for (const sv of sizeGroup.values.filter(v => v.enabled !== false)) {
             const key = `${cv.value}|${sv.value}`;
             const hasCombo = Object.keys(comboAsin).length === 0 || !!comboAsin[key];
-            // Use comboPrices (per-combo) → sizePrices (per-size) → basePrice fallback
+            // Use comboPrices (per-combo) → sizePrices (per-size) → variant price → basePrice → myPrice fallback
             const amazonPrice = comboPrices[key]
                              || sizePrices[sv.value]
-                             || parseFloat(sv.price || basePrice);
-            const price = applyMarkup(amazonPrice).toFixed(2);
+                             || parseFloat(sv.price || cv.price || basePrice || product.myPrice || 0);
+            const calcedPrice = applyMarkup(amazonPrice);
+            const price = (calcedPrice > 0 ? calcedPrice : parseFloat(product.myPrice || 9.99)).toFixed(2);
             // qty=0 means out-of-stock on eBay (combo doesn't exist on Amazon)
             const qty = hasCombo ? defaultQty : 0;
             variants.push({
@@ -1091,10 +1113,11 @@ module.exports = async (req, res) => {
         for (const cv of colorGroup.values.filter(v => v.enabled !== false)) {
           const key = `${cv.value}|`;
           const hasCombo = Object.keys(comboAsin).length === 0 || !!comboAsin[key];
-          const amazonPrice = comboPrices[key] || parseFloat(cv.price || basePrice);
+          const amazonPrice = comboPrices[key] || parseFloat(cv.price || basePrice || product.myPrice || 0);
+          const calcedPriceC = applyMarkup(amazonPrice);
           variants.push({
             sku:   mkSku([cv.value]), color: cv.value, size: null,
-            price: applyMarkup(amazonPrice).toFixed(2),
+            price: (calcedPriceC > 0 ? calcedPriceC : parseFloat(product.myPrice || 9.99)).toFixed(2),
             image: colorImgs[cv.value] || product.images[0] || '',
             qty:   hasCombo ? defaultQty : 0,
             inStock: hasCombo,
@@ -1103,10 +1126,11 @@ module.exports = async (req, res) => {
       } else if (sizeGroup) {
         for (const sv of sizeGroup.values.filter(v => v.enabled !== false)) {
           const key = `|${sv.value}`;
-          const amazonPrice = comboPrices[key] || sizePrices[sv.value] || parseFloat(sv.price || basePrice);
+          const amazonPrice = comboPrices[key] || sizePrices[sv.value] || parseFloat(sv.price || basePrice || product.myPrice || 0);
+          const calcedPriceS = applyMarkup(amazonPrice);
           variants.push({
             sku:   mkSku([sv.value]), color: null, size: sv.value,
-            price: applyMarkup(amazonPrice).toFixed(2),
+            price: (calcedPriceS > 0 ? calcedPriceS : parseFloat(product.myPrice || 9.99)).toFixed(2),
             image: product.images[0] || '',
             qty:   defaultQty,
           });
