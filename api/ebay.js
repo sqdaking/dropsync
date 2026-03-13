@@ -2073,9 +2073,9 @@ module.exports = async (req, res) => {
           else { const t = await testR.text(); console.warn(`[revise] test PUT fail: ${testR.status} ${t.slice(0,100)}`); failedSkus.push(testSku); }
         }
 
-        // Remaining variants in batches of 8
-        for (let i = 1; i < variantSkus.length; i += 8) {
-          await Promise.all(variantSkus.slice(i, i + 8).map(async (sku) => {
+        // Remaining variants in batches of 15
+        for (let i = 1; i < variantSkus.length; i += 15) {
+          await Promise.all(variantSkus.slice(i, i + 15).map(async (sku) => {
             const { Color: color, Size: size } = skuAspects[sku] || {};
             const asp = { ...aspects };
             if (color) asp['Color'] = [color];
@@ -2097,7 +2097,7 @@ module.exports = async (req, res) => {
             if (r.ok || r.status === 204) createdSkus.add(sku);
             else { const t = await r.text(); console.warn(`[revise] PUT fail ${sku.slice(-20)}: ${r.status} ${t.slice(0,80)}`); failedSkus.push(sku); }
           }));
-          if (i + 8 < variantSkus.length) await sleep(150);
+          if (i + 15 < variantSkus.length) await sleep(100);
         }
 
         // One retry pass for failed items
@@ -2164,7 +2164,7 @@ module.exports = async (req, res) => {
 
         // ── STEP 6C: Update all offer prices ────────────────────────────────────
         let pricesUpdated = 0;
-        for (let i = 0; i < variantSkus.length; i += 8) {
+        for (let i = 0; i < variantSkus.length; i += 15) {
           await Promise.all(variantSkus.slice(i, i + 8).map(async (sku) => {
             if (!createdSkus.has(sku)) return; // skip failed ones
             const { Color: color, Size: size } = skuAspects[sku] || {};
@@ -2180,7 +2180,7 @@ module.exports = async (req, res) => {
               pricesUpdated++;
             }
           }));
-          if (i + 8 < variantSkus.length) await sleep(100);
+          if (i + 15 < variantSkus.length) await sleep(80);
         }
 
         console.log(`[revise] done — ${createdSkus.size} variants updated, ${pricesUpdated} prices updated, ${failedSkus.length} failed`);
@@ -2595,7 +2595,7 @@ module.exports = async (req, res) => {
 
         // ── UPDATE OFFER PRICES: per-variant with correct color+size price ───
         let pricesUpdated = 0;
-        for (let i = 0; i < variantSkus.length; i += 8) {
+        for (let i = 0; i < variantSkus.length; i += 15) {
           await Promise.all(variantSkus.slice(i, i + 8).map(async (sku) => {
             if (!createdSkus.has(sku)) return;
             const { Color: color, Size: size } = skuAspects[sku] || {};
@@ -2617,7 +2617,7 @@ module.exports = async (req, res) => {
               pricesUpdated++;
             }
           }));
-          if (i + 8 < variantSkus.length) await sleep(100);
+          if (i + 15 < variantSkus.length) await sleep(80);
         }
 
         console.log(`[sync] done — ${createdSkus.size} updated, ${pricesUpdated} prices checked, ${priceChanges.length} price changes, ${stockChanges.length} stock changes`);
