@@ -1823,9 +1823,40 @@ module.exports = async (req, res) => {
       }
 
       if (!product || !product.images?.length) {
-        return res.status(400).json({
-          error: 'Amazon is blocking requests right now — could not fetch product data. Try again in 30–60 seconds.',
-        });
+        // Last resort: pull existing images off the live eBay inventory item
+        console.log('[revise] no images from Amazon or cache — fetching from eBay inventory');
+        try {
+          const invR = await fetch(
+            `${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(ebaySku)}`,
+            { headers: auth }
+          );
+          if (invR.ok) {
+            const invD = await invR.json();
+            const ebayImgs = invD.product?.imageUrls || [];
+            if (ebayImgs.length) {
+              console.log(`[revise] using ${ebayImgs.length} images from live eBay listing`);
+              // Build a minimal product from cached title/price + eBay images
+              const cachedPrice = parseFloat(body.fallbackPrice) || 0;
+              product = {
+                title: body.fallbackTitle || invD.product?.title || 'Product',
+                price: cachedPrice,
+                images: ebayImgs,
+                inStock: body.fallbackInStock !== false,
+                hasVariations: false, variations: [], variationImages: {},
+                comboPrices: {}, sizePrices: {}, aspects: invD.product?.aspects || {},
+                breadcrumbs: [], bullets: [], descriptionPara: '',
+              };
+            }
+          }
+        } catch(e) { console.warn('[revise] eBay inventory fallback failed:', e.message); }
+
+        if (!product || !product.images?.length) {
+          // Return 503 so the worker skips silently; frontend shows a softer message
+          return res.status(503).json({
+            error: 'Amazon is blocking right now and no cached images are available. Will retry automatically.',
+            skippable: true,
+          });
+        }
       }
       console.log(`[revise] scraped: "${product.title?.slice(0,50)}" imgs=${product.images.length} price=$${product.price} hasVar=${product.hasVariations}`);
 
