@@ -1235,7 +1235,7 @@ module.exports = async (req, res) => {
 
       // ── SIMPLE LISTING ─────────────────────────────────────────────────────
       if (!product.hasVariations || !product.variations?.length) {
-        const simpleMarkupPct = parseFloat(body.markup ?? product.markup ?? 35);
+        const simpleMarkupPct = parseFloat(body.markup ?? product.markup ?? 0);
         const simpleHandling  = parseFloat(body.handlingCost ?? product.handlingCost ?? 2);
         const simpleEbayFee   = 0.1335;
         // Price priority: product.price (freshly scraped) → product.cost → product.myPrice (pre-calculated)
@@ -1315,7 +1315,7 @@ module.exports = async (req, res) => {
       const sizePrices  = product.sizePrices  || {};
       const comboPrices = product.comboPrices || {}; // "Color|Size" → amazon price
       // Use markup/handling from body (frontend settings), fallback to product, then defaults
-      const markupPct   = parseFloat(body.markup ?? product.markup ?? 35);
+      const markupPct   = parseFloat(body.markup ?? product.markup ?? 0);
       const handling    = parseFloat(body.handlingCost ?? product.handlingCost ?? 2);
       const ebayFee     = 0.1335;
       const applyMarkup = (cost) => {
@@ -1759,7 +1759,7 @@ module.exports = async (req, res) => {
       }
       const sandbox    = body.sandbox === true || body.sandbox === 'true';
       const EBAY_API   = getEbayUrls(sandbox).EBAY_API;
-      const markupPct  = parseFloat(body.markup ?? 35);
+      const markupPct  = parseFloat(body.markup ?? 0);
       const handling   = parseFloat(body.handlingCost ?? 2);
       const ebayFee    = 0.1335;
       const defaultQty = parseInt(body.quantity) || 1;
@@ -2149,7 +2149,7 @@ module.exports = async (req, res) => {
       }
       const sandbox    = body.sandbox === true || body.sandbox === 'true';
       const EBAY_API   = getEbayUrls(sandbox).EBAY_API;
-      const markupPct  = parseFloat(body.markup ?? 35);
+      const markupPct  = parseFloat(body.markup ?? 0);
       const handling   = parseFloat(body.handlingCost ?? 2);
       const ebayFee    = 0.1335;
       const defaultQty = parseInt(body.quantity) || 1;
