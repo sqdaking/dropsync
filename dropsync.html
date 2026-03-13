@@ -262,9 +262,29 @@ async function loadProductsFromRailway() {
     // Railway has data — use it as primary source
     // For products in Railway, use Railway data (has worker-updated prices/status)
     // For products only in localStorage (not yet pushed to Railway), keep them
-    const rwMap = new Map(d.products.map(p => [p.id, p]));
+    const localMap = new Map((S.products||[]).map(p => [p.id, p]));
+    const rwMap    = new Map(d.products.map(p => [p.id, p]));
     const localOnly = S.products.filter(p => !rwMap.has(p.id));
-    S.products = [...d.products, ...localOnly];
+
+    // Merge: Railway is truth for status/price/sku, but preserve local ebayListingId
+    // if Railway doesn't have it (ebay_item_id column was historically not populated)
+    const merged = d.products.map(rp => {
+      const local = localMap.get(rp.id);
+      return {
+        ...rp,
+        // Keep local rich data that Railway may have stripped or never stored
+        ebayListingId: rp.ebayListingId || local?.ebayListingId || null,
+        images:        (rp.images?.length ? rp.images : null) || local?.images || [],
+        bullets:       rp.bullets?.length ? rp.bullets : (local?.bullets || []),
+        variations:    rp.variations?.length ? rp.variations : (local?.variations || []),
+        variationImages: rp.variationImages || local?.variationImages || {},
+        comboPrices:   rp.comboPrices  || local?.comboPrices  || {},
+        sizePrices:    rp.sizePrices   || local?.sizePrices   || {},
+        comboAsin:     rp.comboAsin    || local?.comboAsin    || {},
+        comboInStock:  rp.comboInStock || local?.comboInStock || {},
+      };
+    });
+    S.products = [...merged, ...localOnly];
     localStorage.setItem(KEY, JSON.stringify(S));
     console.log('[Railway] Loaded', d.products.length, 'products from Railway' + (localOnly.length ? ` + ${localOnly.length} local-only` : ''));
     return true;
