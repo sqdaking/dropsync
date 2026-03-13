@@ -1329,7 +1329,6 @@ module.exports = async (req, res) => {
       // sizePrices: sizeName → price (fetched from best-coverage color, applies to all colors at that size)
       const comboAsin   = product.comboAsin   || {};
       const comboInStock = product.comboInStock || {};
-      const comboInStock = product.comboInStock || {};
       const sizePrices  = product.sizePrices  || {};
       const comboPrices = product.comboPrices || {}; // "Color|Size" → amazon price
       // Use markup/handling from body (frontend settings), fallback to product, then defaults
@@ -1944,8 +1943,6 @@ module.exports = async (req, res) => {
           // If we have comboAsin data, check if combo exists AND is in stock
           const comboAsin   = product.comboAsin   || {};
       const comboInStock = product.comboInStock || {};
-      const comboInStock = product.comboInStock || {};
-          const comboInStock = product.comboInStock || {};
           if (Object.keys(comboAsin).length) {
             const key = `${color||''}|${size||''}`;
             if (!comboAsin[key]) return 0;
@@ -2275,7 +2272,6 @@ module.exports = async (req, res) => {
       const comboPrices = product.comboPrices || {};
       const sizePrices  = product.sizePrices  || {};
       const comboAsin   = product.comboAsin   || {};
-      const comboInStock = product.comboInStock || {};
       const comboInStock = product.comboInStock || {};
       const basePrice   = parseFloat(product.price || 0);
 
