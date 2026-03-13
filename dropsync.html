@@ -1427,82 +1427,63 @@ async function pushExisting(pid) {
 async function syncOne(pid) {
   const p = S.products.find(x => x.id === pid);
   if (!p || p.status !== 'listed') return;
-  toast('Syncing…', 'info');
+  if (!p.sourceUrl) { toast('No Amazon URL linked — add one in the product card', 'warn', 4000); return; }
+  if (!p.ebaySku || p.ebaySku.startsWith('DS-RECOVERED') || p.ebaySku.startsWith('DS-EXISTING')) {
+    toast('Real eBay SKU needed — go to Settings → Recover SKUs first', 'warn', 5000); return;
+  }
+
+  const btn = document.querySelector(`[onclick="syncOne('${pid}')"]`);
+  const origText = btn?.textContent;
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Syncing…'; }
+  toast('Syncing listing from Amazon…', 'info');
+
   try {
     const token = await ensureToken();
     const r = await fetch(`${S.backendUrl}/api/ebay?action=sync`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, sourceUrl: p.sourceUrl, hasVariations: p.hasVariations, quantity: p.quantity, variations: p.variations, variationImages: p.variationImages }),
+      body: JSON.stringify({
+        access_token: token,
+        ebaySku: p.ebaySku,
+        sourceUrl: p.sourceUrl,
+        quantity: p.quantity || 1,
+        markup: S.markup || 23,
+        handlingCost: S.handlingCost || 2,
+        sandbox: S.sandboxMode || false,
+        fallbackImages: p.images || [],
+        fallbackPrice: p.cost || p.price || 0,
+        fallbackInStock: p.inStock !== false,
+      }),
     });
     const d = await r.json();
+    if (!d.success) throw new Error(d.error || 'Sync failed');
+
     p.lastSynced = new Date().toISOString();
-    if (d.price) p.price = d.price;
+    p.inStock = d.inStock;
+    if (d.price) { p.myPrice = d.price; }
     save(); renderProducts();
-    toast(`Synced! ${d.updatedVariants||''} variants updated`, 'success');
-    // Log per-variant price/stock changes
-    if (d.freshData?.length) {
-      const pChanges = [], sChanges = [];
-      for (const u of d.freshData) {
-        const variant = (p.variations||[]).flatMap(g=>g.values).find(v=>v.value===u.color);
-        if (variant) {
-          if (variant.price && Math.abs((variant.price||0) - u.price) > 0.01)
-            pChanges.push(`${u.color}: $${(variant.price||0).toFixed(2)}→$${u.price.toFixed(2)}`);
-          if (variant.inStock !== undefined && variant.inStock !== u.inStock)
-            sChanges.push(`${u.color}: ${variant.inStock?'In Stock':'OOS'}→${u.inStock?'In Stock':'OOS'}`);
-          variant.price = u.price; variant.inStock = u.inStock;
-        }
-      }
-      if (pChanges.length) addLog('price', `Price changes: ${p.title.slice(0,40)}`, pChanges.join(' · '), { productId: p.id, changes: pChanges });
-      if (sChanges.length) addLog('stock', `Stock changes: ${p.title.slice(0,40)}`, sChanges.join(' · '), { productId: p.id, changes: sChanges });
-    }
-    addLog('sync', `Synced: ${p.title.slice(0,40)}`, `${d.updatedVariants||0} variants updated`, { productId: p.id });
-  } catch (e) { toast(`Sync failed: ${e.message}`, 'error'); }
+
+    const parts = [`✅ Synced — ${d.images} photos`];
+    if (d.price) parts.push(`price $${d.price.toFixed(2)}`);
+    parts.push(d.inStock ? 'In Stock' : 'Out of Stock');
+    if (d.priceChanges?.length) parts.push(`Price: ${d.priceChanges.join(', ')}`);
+    if (d.stockChanges?.length) parts.push(`Stock: ${d.stockChanges.join(', ')}`);
+    toast(parts.join(' · '), 'success', 6000);
+
+    if (d.priceChanges?.length) addLog('price', `Price updated: ${p.title.slice(0,40)}`, d.priceChanges.join(' · '), { productId: p.id });
+    if (d.stockChanges?.length) addLog('stock', `Stock updated: ${p.title.slice(0,40)}`, d.stockChanges.join(' · '), { productId: p.id });
+    addLog('sync', `Synced: ${p.title.slice(0,40)}`, `${d.updatedVariants||1} items · ${d.images} images · $${(d.price||0).toFixed(2)}`, { productId: p.id });
+  } catch (e) {
+    toast(`Sync failed: ${e.message}`, 'error', 6000);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = origText || '🔄 Sync'; }
+  }
 }
 
 async function syncAllWithFeedback() {
   const btn = $('sync-all-btn');
   if (btn) { btn.disabled = true; btn.innerHTML = '<span style="display:inline-flex;align-items:center;gap:5px"><div class="spinner" style="width:11px;height:11px"></div> Syncing…</span>'; }
   try {
-    if (S.serverUrl) {
-      const r = await fetch(`${S.serverUrl}/api/worker/run`, { method: 'POST' });
-      const d = await r.json();
-      if (d.success || d.message) {
-        toast(`🔄 Sync running — prices will update in ~30 seconds`, 'success', 5000);
-        // After worker finishes, patch ONLY price/stock fields back into local products
-        setTimeout(async () => {
-          try {
-            const pr = await fetch(`${S.serverUrl}/api/products?limit=9000`);
-            const pd = await pr.json();
-            if (pd.products?.length) {
-              const byId = {};
-              pd.products.forEach(p => byId[p.id] = p);
-              let changed = 0;
-              (S.products || []).forEach(local => {
-                const srv = byId[local.id];
-                if (srv) {
-                  // Only patch fields the worker updates — never replace the full object
-                  if (srv.myPrice != null) local.myPrice = srv.myPrice;
-                  if (srv.amazonPrice != null) local.amazonPrice = srv.amazonPrice;
-                  if (srv.lastSynced) local.lastSynced = srv.lastSynced;
-                  if (srv.quantity != null) local.quantity = srv.quantity;
-                  if (srv.status && srv.status !== 'pending') local.status = srv.status;
-                  changed++;
-                }
-              });
-              save();
-              if (S.view === 'products') renderProducts();
-              toast(`✅ Synced — ${changed} products updated`, 'success');
-            }
-            await loadLogsFromServer();
-            if (S.view === 'logs') renderLogs();
-          } catch(e) { console.warn('Post-sync patch failed:', e); }
-        }, 35000);
-      } else {
-        toast('Sync trigger failed: ' + (d.error || 'unknown'), 'error');
-      }
-    } else {
-      await syncAll();
-    }
+    await syncAll();
   } catch(e) {
     toast(`Sync error: ${e.message}`, 'error');
   } finally {
@@ -1511,51 +1492,76 @@ async function syncAllWithFeedback() {
 }
 
 async function syncAll() {
-  const listed = (S.products||[]).filter(p => p.status==='listed');
+  const listed = (S.products||[]).filter(p => p.status === 'listed');
   if (!listed.length) { toast('No listed products to sync', 'info'); return; }
-  const syncable = listed.filter(p => p.sourceUrl && p.ebaySku);
-  const skipped  = listed.length - syncable.length;
-  if (!syncable.length) { toast('No products have a source URL — add Amazon URLs in My Products', 'warn'); return; }
-  toast(`Syncing ${syncable.length} products${skipped ? ` (${skipped} skipped — no source URL)` : ''}…`, 'info');
-  let ok = 0, totalPriceChanges = 0, totalStockChanges = 0;
+
+  // Only sync products that have both a sourceUrl and a real eBay SKU
+  const syncable = listed.filter(p =>
+    p.sourceUrl && p.ebaySku &&
+    !p.ebaySku.startsWith('DS-RECOVERED') &&
+    !p.ebaySku.startsWith('DS-EXISTING')
+  );
+  const skipped = listed.length - syncable.length;
+  if (!syncable.length) {
+    toast('No products ready to sync — add Amazon URLs and run Recover SKUs in Settings', 'warn', 5000); return;
+  }
+  toast(`Syncing ${syncable.length} products${skipped ? ` (${skipped} skipped)` : ''}…`, 'info');
+
+  let ok = 0, totalPriceChanges = 0, totalStockChanges = 0, failed = 0;
+
   for (const p of syncable) {
     try {
       const token = await ensureToken();
       const r = await fetch(`${S.backendUrl}/api/ebay?action=sync`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, sourceUrl: p.sourceUrl, hasVariations: p.hasVariations, quantity: p.quantity, variations: p.variations }),
+        body: JSON.stringify({
+          access_token: token,
+          ebaySku: p.ebaySku,
+          sourceUrl: p.sourceUrl,
+          quantity: p.quantity || 1,
+          markup: S.markup || 23,
+          handlingCost: S.handlingCost || 2,
+          sandbox: S.sandboxMode || false,
+          fallbackImages: p.images || [],
+          fallbackPrice: p.cost || p.price || 0,
+          fallbackInStock: p.inStock !== false,
+        }),
       });
       const d = await r.json();
       if (d.success) {
-        p.lastSynced = new Date().toISOString(); ok++;
-        if (d.freshData?.length) {
-          const pChanges = [], sChanges = [];
-          for (const u of d.freshData) {
-            const variant = (p.variations||[]).flatMap(g=>g.values).find(v=>v.value===u.color);
-            if (variant) {
-              if (variant.price && Math.abs((variant.price||0) - u.price) > 0.01)
-                pChanges.push(`${u.color}: $${(variant.price||0).toFixed(2)}→$${u.price.toFixed(2)}`);
-              if (variant.inStock !== undefined && variant.inStock !== u.inStock)
-                sChanges.push(`${u.color}: ${variant.inStock?'In Stock':'OOS'}→${u.inStock?'In Stock':'OOS'}`);
-              variant.price = u.price; variant.inStock = u.inStock;
-            }
-          }
-          if (pChanges.length) { addLog('price', `Price changes: ${p.title.slice(0,40)}`, pChanges.join(' · '), { productId: p.id, changes: pChanges }); totalPriceChanges++; sendWebhook('price', p, pChanges); }
-          if (sChanges.length) { addLog('stock', `Stock changes: ${p.title.slice(0,40)}`, sChanges.join(' · '), { productId: p.id, changes: sChanges }); totalStockChanges++; sendWebhook('stock', p, sChanges); }
+        p.lastSynced = new Date().toISOString();
+        p.inStock = d.inStock;
+        if (d.price) p.myPrice = d.price;
+        ok++;
+        if (d.priceChanges?.length) {
+          addLog('price', `Price updated: ${p.title.slice(0,40)}`, d.priceChanges.join(' · '), { productId: p.id });
+          totalPriceChanges++;
+          sendWebhook('price', p, d.priceChanges);
         }
-        // Single-variant changes from backend
-        if (d.priceChanges?.length) { addLog('price', `Price changes: ${p.title.slice(0,40)}`, d.priceChanges.join(' · '), { productId: p.id, changes: d.priceChanges }); totalPriceChanges++; sendWebhook('price', p, d.priceChanges); }
-        if (d.stockChanges?.length) { addLog('stock', `Stock changes: ${p.title.slice(0,40)}`, d.stockChanges.join(' · '), { productId: p.id, changes: d.stockChanges }); totalStockChanges++; sendWebhook('stock', p, d.stockChanges); }
+        if (d.stockChanges?.length) {
+          addLog('stock', `Stock updated: ${p.title.slice(0,40)}`, d.stockChanges.join(' · '), { productId: p.id });
+          totalStockChanges++;
+          sendWebhook('stock', p, d.stockChanges);
+        }
+      } else {
+        failed++;
+        addLog('error', `Sync failed: ${p.title.slice(0,40)}`, d.error || 'Unknown error', { productId: p.id });
       }
-    } catch {}
-    await new Promise(r => setTimeout(r, 500));
+    } catch(e) {
+      failed++;
+      console.warn('Sync error for', p.title?.slice(0,30), e.message);
+    }
+    await new Promise(r => setTimeout(r, 800)); // pace requests
   }
+
   save(); renderProducts();
-  const parts = [`Synced ${ok}/${syncable.length}`];
-  if (skipped) parts.push(`${skipped} skipped (no URL)`);
-  if (totalPriceChanges) parts.push(`${totalPriceChanges} price ∆`);
-  if (totalStockChanges) parts.push(`${totalStockChanges} stock ∆`);
-  toast(parts.join(' · '), 'success');
+  const parts = [`✅ Synced ${ok}/${syncable.length}`];
+  if (skipped) parts.push(`${skipped} skipped`);
+  if (failed) parts.push(`${failed} failed`);
+  if (totalPriceChanges) parts.push(`${totalPriceChanges} price changes`);
+  if (totalStockChanges) parts.push(`${totalStockChanges} stock changes`);
+  toast(parts.join(' · '), 'success', 7000);
+  addLog('sync', `Sync All complete`, parts.join(' · '), {});
 }
 
 function sendWebhook(type, product, changes) {
