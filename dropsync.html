@@ -2275,6 +2275,7 @@ async function reviseFromOrder(productId, orderIdSafe, btn) {
         markup: S.markup || 23,
         handlingCost: S.handlingCost || 2,
         sandbox: S.sandboxMode || false,
+        fallbackImages: p.images || [],
       })
     });
     const d = await r.json();
@@ -2353,6 +2354,7 @@ async function linkAndResync(productId, itemListingId, itemSku, orderIdSafe, url
         markup: S.markup || 23,
         handlingCost: S.handlingCost || 2,
         sandbox: S.sandboxMode || false,
+        fallbackImages: p.images || [],
       })
     });
     const d = await r.json();
