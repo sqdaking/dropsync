@@ -1770,11 +1770,29 @@ module.exports = async (req, res) => {
         body: JSON.stringify({ url: sourceUrl }),
       }).catch(e => { console.warn('[revise] scrape failed:', e.message); return null; });
       const scrapeD = scrapeR?.ok ? await scrapeR.json().catch(() => null) : null;
-      const product = scrapeD?.product || null;
+      let product = scrapeD?.product || null;
+
+      // Fallback: if scrape failed or returned no images, use cached data from frontend
+      const fallbackImages  = Array.isArray(body.fallbackImages) ? body.fallbackImages.filter(u => typeof u === 'string' && u.startsWith('http')) : [];
+      const fallbackTitle   = typeof body.fallbackTitle === 'string' ? body.fallbackTitle : '';
+      const fallbackPrice   = parseFloat(body.fallbackPrice) || 0;
+      const fallbackInStock = body.fallbackInStock !== false;
+
+      if (!product && fallbackImages.length) {
+        console.log(`[revise] scrape failed — using ${fallbackImages.length} cached fallback images`);
+        product = {
+          title: fallbackTitle || 'Product', price: fallbackPrice, images: fallbackImages,
+          inStock: fallbackInStock, hasVariations: false, variations: [], variationImages: {},
+          comboPrices: {}, sizePrices: {}, aspects: {}, breadcrumbs: [], bullets: [], descriptionPara: '',
+        };
+      } else if (product && !product.images?.length && fallbackImages.length) {
+        console.log(`[revise] no images in scrape — using ${fallbackImages.length} cached fallback images`);
+        product.images = fallbackImages;
+      }
 
       if (!product || !product.images?.length) {
         return res.status(400).json({
-          error: 'Could not fetch fresh data from Amazon. The listing may be blocked or the URL is invalid. Try again in 30 seconds.',
+          error: 'Amazon is blocking requests right now — could not fetch product data. Try again in 30–60 seconds.',
         });
       }
       console.log(`[revise] scraped: "${product.title?.slice(0,50)}" imgs=${product.images.length} price=$${product.price} hasVar=${product.hasVariations}`);
