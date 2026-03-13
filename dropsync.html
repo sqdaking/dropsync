@@ -227,10 +227,10 @@ const save = () => localStorage.setItem(KEY, JSON.stringify(S));
 function calcPrice(cost, markup) {
   const c = parseFloat(cost) || 0;
   const m = parseFloat(markup ?? S.markup) || 0;
-  const handling = parseFloat(S.handlingCost) || 0;
-  const ebayFee = 0.1335; // 13.35% eBay + PayPal
-  const base = (c + handling) * (1 + m / 100);
-  return Math.ceil(((base + 0.30) / (1 - ebayFee)) * 100) / 100;
+  const handling = parseFloat(S.handlingCost) || 2;
+  const ebayFee = 0.1335;
+  // Correct: (cost + handling) × (1 + markup%) ÷ (1 − 13.35%) + $0.30
+  return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
 // ── Utilities ─────────────────────────────────────────
@@ -621,6 +621,7 @@ async function doPush() {
         fulfillmentPolicyId: S.sandboxMode ? '' : S.fulfillmentPolicyId,
         paymentPolicyId:     S.sandboxMode ? '' : S.paymentPolicyId,
         returnPolicyId:      S.sandboxMode ? '' : S.returnPolicyId,
+        markup: S.markup || 23, handlingCost: S.handlingCost || 2,
       }),
     });
     const d = await r.json();
@@ -961,6 +962,7 @@ async function bulkPushAll() {
           fulfillmentPolicyId: S.sandboxMode?'':S.fulfillmentPolicyId,
           paymentPolicyId:     S.sandboxMode?'':S.paymentPolicyId,
           returnPolicyId:      S.sandboxMode?'':S.returnPolicyId,
+          markup: S.markup || 23, handlingCost: S.handlingCost || 2,
         })
       });
       const d = await r.json();
@@ -1360,9 +1362,58 @@ async function pushExisting(pid) {
   }
   try {
     const token = await ensureToken();
+
+    // Auto-scrape if images are missing — restores full product data before push
+    let productToPost = { ...p };
+    if (!productToPost.images?.length && productToPost.sourceUrl) {
+      toast('🔍 Refreshing product data from Amazon…', 'info', 3000);
+      try {
+        const sr = await fetch(`${S.backendUrl}/api/ebay?action=scrape`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: productToPost.sourceUrl })
+        });
+        const sd = await sr.json();
+        const scraped = sd.product || sd;
+        if (scraped.images?.length) {
+          productToPost = {
+            ...productToPost,
+            images: scraped.images,
+            price: scraped.price || productToPost.price,
+            cost: scraped.price || productToPost.cost,
+            bullets: scraped.bullets?.length ? scraped.bullets : productToPost.bullets,
+            description: scraped.description || productToPost.description,
+            variations: scraped.variations?.length ? scraped.variations : productToPost.variations,
+            variationImages: scraped.variationImages || productToPost.variationImages,
+            hasVariations: scraped.hasVariations ?? productToPost.hasVariations,
+            comboAsin: scraped.comboAsin || productToPost.comboAsin,
+            sizePrices: scraped.sizePrices || productToPost.sizePrices,
+            comboPrices: scraped.comboPrices || productToPost.comboPrices,
+            aspects: scraped.aspects || productToPost.aspects,
+            breadcrumbs: scraped.breadcrumbs || productToPost.breadcrumbs,
+          };
+          // Persist images back to localStorage
+          p.images = scraped.images;
+          p.price = scraped.price || p.price;
+          p.cost = scraped.price || p.cost;
+          if (scraped.variations?.length) p.variations = scraped.variations;
+          if (scraped.variationImages) p.variationImages = scraped.variationImages;
+          save();
+        }
+      } catch(e) { console.warn('[pushExisting] scrape failed, proceeding with cached data:', e.message); }
+    }
+
     const r = await fetch(`${S.backendUrl}/api/ebay?action=push`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ access_token: token, product: p, sandbox: S.sandboxMode || false, fulfillmentPolicyId: S.sandboxMode ? '' : S.fulfillmentPolicyId, paymentPolicyId: S.sandboxMode ? '' : S.paymentPolicyId, returnPolicyId: S.sandboxMode ? '' : S.returnPolicyId }),
+      body: JSON.stringify({
+        access_token: token,
+        product: productToPost,
+        sandbox: S.sandboxMode || false,
+        fulfillmentPolicyId: S.sandboxMode ? '' : S.fulfillmentPolicyId,
+        paymentPolicyId:     S.sandboxMode ? '' : S.paymentPolicyId,
+        returnPolicyId:      S.sandboxMode ? '' : S.returnPolicyId,
+        markup: S.markup || 23,
+        handlingCost: S.handlingCost || 2,
+      }),
     });
     const d = await r.json();
     if (!d.success) throw new Error(d.error);
