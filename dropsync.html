@@ -179,49 +179,110 @@ async function apiPut(path, body) {
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
+async function apiDelete(path) {
+  if (!S.serverUrl) return null;
+  const r = await fetch(S.serverUrl + path, { method:'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
 
-// ── Server-aware product/log ops ──────────────────────
-async function serverAddProduct(prod) {
-  if (!S.serverUrl) { S.products.unshift(prod); save(); return; }
-  try { await apiPost('/api/products', prod); } catch(e) { console.warn('serverAddProduct failed:', e); S.products.unshift(prod); save(); }
+// ── Track which product IDs changed since last save ──
+const _dirtyProducts = new Set();
+function markDirty(id) { if (id) _dirtyProducts.add(id); }
+
+// ── save(): write to localStorage + push dirty products to Railway ──
+function save() {
+  localStorage.setItem(KEY, JSON.stringify(S));
+  if (!S.serverUrl || !_dirtyProducts.size) return;
+  const ids = [..._dirtyProducts];
+  _dirtyProducts.clear();
+  // Fire-and-forget: push changed products to Railway
+  (async () => {
+    const toSave = S.products.filter(p => ids.includes(p.id));
+    if (!toSave.length) return;
+    try {
+      await fetch(S.serverUrl + '/api/products/bulk', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ products: toSave }),
+      });
+    } catch(e) { console.warn('[Railway] bulk save failed:', e.message); }
+  })();
 }
-async function serverUpdateProduct(id, updates) {
-  if (!S.serverUrl) { const p = S.products.find(x=>x.id===id); if(p) { Object.assign(p, updates); save(); } return; }
-  try { await apiPut('/api/products/' + id, updates); } catch(e) { console.warn('serverUpdateProduct failed:', e); }
+
+// ── saveProduct(p): upsert one product to Railway immediately ──
+async function saveProduct(p) {
+  markDirty(p.id);
+  // Also add/update in local S.products
+  const idx = S.products.findIndex(x => x.id === p.id);
+  if (idx >= 0) S.products[idx] = { ...S.products[idx], ...p };
+  else S.products.unshift(p);
+  save();
+  // Immediate Railway write (don't wait for dirty flush)
+  if (S.serverUrl) {
+    try {
+      await fetch(S.serverUrl + '/api/products', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(p),
+      });
+    } catch(e) { console.warn('[Railway] saveProduct failed:', e.message); }
+  }
 }
+
+// ── deleteProductFromRailway(id): remove from Railway DB ──
+async function deleteProductFromRailway(id) {
+  if (!S.serverUrl) return;
+  try {
+    await fetch(S.serverUrl + '/api/products/' + id, { method: 'DELETE' });
+  } catch(e) { console.warn('[Railway] delete failed:', e.message); }
+}
+
+// ── serverAddLog: legacy shim ──
 async function serverAddLog(entry) {
-  if (!S.serverUrl) { S.logs = [entry, ...(S.logs||[]).slice(0, 499)]; save(); return; }
+  if (!S.serverUrl) return;
   try { await apiPost('/api/logs', entry); } catch(e) { console.warn('serverAddLog failed:', e); }
 }
-async function loadProductsFromServer() {
-  if (!S.serverUrl) return;
+
+// ── loadProductsFromRailway: Railway is primary, localStorage is cache ──
+async function loadProductsFromRailway() {
+  if (!S.serverUrl) return false;
   try {
-    const d = await apiGet('/api/products?limit=9000');
-    if (d && Array.isArray(d.products) && d.products.length > 0) {
-      // Only use server data if it has richer info (data column populated)
-      // Check if first product has full data (images array, ebayListingId)
-      const sample = d.products[0];
-      const hasFullData = sample && (Array.isArray(sample.images) || sample.ebayListingId || sample.bullets);
-      if (hasFullData) {
-        S.products = d.products;
-        save();
+    const d = await fetch(S.serverUrl + '/api/products?limit=9000').then(r => r.json());
+    if (!d || !Array.isArray(d.products)) return false;
+    if (d.products.length === 0) {
+      // Railway is empty — seed it from localStorage if we have products
+      if (S.products.length > 0) {
+        console.log('[Railway] DB empty — seeding', S.products.length, 'products from local cache');
+        fetch(S.serverUrl + '/api/products/bulk', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ products: S.products }),
+        }).catch(e => console.warn('[Railway] seed failed:', e.message));
       }
-      // Otherwise keep local - server has stripped data from old schema
+      return false;
     }
-  } catch(e) { console.warn('loadProductsFromServer failed — using local cache:', e); }
+    // Railway has data — use it as primary source
+    // For products in Railway, use Railway data (has worker-updated prices/status)
+    // For products only in localStorage (not yet pushed to Railway), keep them
+    const rwMap = new Map(d.products.map(p => [p.id, p]));
+    const localOnly = S.products.filter(p => !rwMap.has(p.id));
+    S.products = [...d.products, ...localOnly];
+    localStorage.setItem(KEY, JSON.stringify(S));
+    console.log('[Railway] Loaded', d.products.length, 'products from Railway' + (localOnly.length ? ` + ${localOnly.length} local-only` : ''));
+    return true;
+  } catch(e) {
+    console.warn('[Railway] loadProductsFromRailway failed — using local cache:', e.message);
+    return false;
+  }
 }
-async function loadLogsFromServer() {
-  if (!S.serverUrl) return;
-  try {
-    const d = await apiGet('/api/logs?limit=500');
-    if (d && Array.isArray(d.logs)) { S.logs = d.logs; }
-  } catch(e) { console.warn('loadLogsFromServer failed:', e); }
+
+// Legacy compat shims
+async function serverAddProduct(prod) { await saveProduct(prod); }
+async function serverUpdateProduct(id, updates) {
+  const p = S.products.find(x => x.id === id);
+  if (p) { Object.assign(p, updates); markDirty(id); save(); }
 }
 
 let S = { ...DEFAULT_STATE };
 try { const saved = JSON.parse(localStorage.getItem(KEY)||'{}'); S = { ...S, ...saved }; } catch {}
-// bulkLoadState called lazily in renderBulk
-const save = () => localStorage.setItem(KEY, JSON.stringify(S));
 
 // ── Price Calc ────────────────────────────────────────
 function calcPrice(cost, markup) {
@@ -545,8 +606,7 @@ function toggleVar(groupName, idx) {
 async function saveAsDraft() {
   if (!IMP) return;
   const prod = buildProd();
-  S.products.unshift(prod); save();
-  await serverAddProduct(prod);
+  await saveProduct(prod);
   toast('Saved as draft!', 'success');
 }
 
@@ -648,8 +708,7 @@ async function doPush() {
     prod.ebaySku = d.sku || '';
     prod.ebayListingId = d.listingId || '';
     prod.pushedAt = new Date().toISOString();
-    S.products.unshift(prod); save();
-    serverAddProduct(prod).catch(()=>{});
+    await saveProduct(prod);
     setStatus(`✅ Listed on eBay! ${d.variantsCreated ? `${d.variantsCreated} variants` : ''} · <a href="https://www.ebay.com/itm/${prod.ebayListingId}" target="_blank" style="color:var(--accent2)">View listing</a>`, 'success');
     toast(`🎉 Live on eBay!`, 'success');
     IMP = null;
@@ -913,7 +972,7 @@ async function bulkFetchDeals() {
         BULK.queue.push(prod);
         if (!S.products) S.products=[];
         S.products.push(prod);
-        save();
+        markDirty(prod.id); save();
         ok++;
         bulkLog(`✓ ${asin}: "${(p.ebayTitle||p.title).slice(0,50)}"`, 'success');
       } catch(e) {
@@ -972,7 +1031,7 @@ async function bulkPushAll() {
         await new Promise(res=>setTimeout(res, 800));
         continue;
       }
-      if (stored) { stored.status='listed'; stored.ebaySku=d.sku; stored.ebayListingId=d.listingId; stored.lastSynced=new Date().toISOString(); }
+      if (stored) { stored.status='listed'; stored.ebaySku=d.sku; stored.ebayListingId=d.listingId; stored.lastSynced=new Date().toISOString(); markDirty(stored.id); }
       BULK.queue = BULK.queue.filter(x=>x.id!==p.id);
       save();
       addLog('push', `Bulk listed: ${(p.ebayTitle||p.title).slice(0,45)}`, `eBay ID ${d.listingId}`, {productId:p.id, ebayId:d.listingId});
@@ -1229,6 +1288,7 @@ async function eiImportSelected() {
     };
     if (!S.products) S.products = [];
     S.products.push(prod);
+    markDirty(prod.id);
     count++;
   }
   save();
@@ -1422,7 +1482,7 @@ async function pushExisting(pid) {
     const d = await r.json();
     if (!d.success) throw new Error(d.error);
     p.status = 'listed'; p.ebaySku = d.sku; p.ebayListingId = d.listingId; p.pushedAt = new Date().toISOString();
-    save(); renderProducts();
+    markDirty(p.id); save(); renderProducts();
     toast(`🎉 Live on eBay!`, 'success');
     addLog('push', `Listed: ${p.title.slice(0,50)}`, `eBay ID ${p.ebayListingId}`, { productId: p.id, ebayId: p.ebayListingId });
   } catch (e) { toast(e.message, 'error', 6000); }
@@ -1490,7 +1550,7 @@ async function pushAll() {
       if (!d.success) throw new Error(d.error);
 
       p.status = 'listed'; p.ebaySku = d.sku; p.ebayListingId = d.listingId; p.pushedAt = new Date().toISOString();
-      ok++;
+      markDirty(p.id); ok++;
       addLog('push', `Listed: ${p.title.slice(0,50)}`, `eBay ID ${p.ebayListingId}`, { productId: p.id, ebayId: p.ebayListingId });
       save(); renderDrafts();
     } catch(e) {
@@ -1547,7 +1607,7 @@ async function syncOne(pid) {
     p.lastSynced = new Date().toISOString();
     p.inStock = d.inStock;
     if (d.price) { p.myPrice = d.price; }
-    save(); renderProducts();
+    markDirty(p.id); save(); renderProducts();
 
     const parts = [`✅ Synced — ${d.images} photos`];
     if (d.price) parts.push(`price $${d.price.toFixed(2)}`);
@@ -1620,7 +1680,7 @@ async function syncAll() {
         p.lastSynced = new Date().toISOString();
         p.inStock = d.inStock;
         if (d.price) p.myPrice = d.price;
-        ok++;
+        markDirty(p.id); ok++;
         if (d.priceChanges?.length) {
           addLog('price', `Price updated: ${p.title.slice(0,40)}`, d.priceChanges.join(' · '), { productId: p.id });
           totalPriceChanges++;
@@ -1701,10 +1761,12 @@ async function endListing(pid, deleteAfter = false) {
     if (deleteAfter) {
       addLog('delete', `Ended & deleted: ${p.title.slice(0,50)}`, `${d.ended||0} offers removed · ${d.deleted||0} inventory items deleted`, { productId: p.id });
       S.products = S.products.filter(x => x.id !== pid);
+      deleteProductFromRailway(pid);
       toast(`Listing ended & deleted (${d.ended || 0} offers removed)`, 'info');
     } else {
       addLog('end', `Listing ended: ${p.title.slice(0,50)}`, `${d.ended||0} offers removed`, { productId: p.id });
       p.status = 'ended'; p.ebayListingId = '';
+      markDirty(pid);
       toast(`Listing ended (${d.ended || 0} offers removed)`, 'info');
     }
     save(); renderProducts();
@@ -1723,7 +1785,10 @@ function deleteProduct(pid) {
   } else {
     if (!confirm('Delete this product from DropSync?')) return;
     addLog('delete', `Deleted: ${p.title.slice(0,50)}`, 'Removed from DropSync (was draft/ended)', { productId: p.id });
-    S.products = S.products.filter(x => x.id !== pid); save(); renderProducts();
+    S.products = S.products.filter(x => x.id !== pid);
+    save();
+    deleteProductFromRailway(pid);
+    if (S.view === 'drafts') renderDrafts(); else renderProducts();
   }
 }
 
@@ -2239,6 +2304,10 @@ async function saveServerUrl() {
     if (d.status === 'ok') {
       toast('✅ Railway server connected!', 'success');
       if (statusEl) statusEl.innerHTML = '<span style="color:var(--green)">✅ Connected — ' + d.service + '</span>';
+      // Sync: load Railway products (or seed Railway with local products if empty)
+      await loadProductsFromRailway();
+      if (S.view === 'products') renderProducts();
+      if (S.view === 'drafts') renderDrafts();
     } else throw new Error('Bad response');
   } catch(e) {
     toast('❌ Could not reach Railway server', 'error');
@@ -2441,11 +2510,11 @@ async function linkAndResync(productId, itemListingId, itemSku, orderIdSafe, url
     };
     S.products = S.products || [];
     S.products.push(p);
-    save();
+    markDirty(p.id); save();
   } else if (p) {
     p.sourceUrl = cleanUrl;
     if (asin) p.asin = asin;
-    save();
+    markDirty(p.id); save();
   }
 
   if (!p) { toast('Could not find or create product entry', 'error'); return; }
@@ -2683,13 +2752,18 @@ function updateStatus() {
 }
 
 // ══════════════════════════════════════════════════════
-// INIT
-// ══════════════════════════════════════════════════════
+// INIT — load from Railway first (Railway is source of truth), then render
 updateStatus();
 setupAutoSync();
-nav(S.view || 'import');
-// Auto-register with server monitor on every page load (keeps product list fresh)
-setTimeout(registerMonitor, 3000);
+(async () => {
+  if (S.serverUrl) {
+    try {
+      await loadProductsFromRailway();
+    } catch(e) { console.warn('[Init] Railway load failed:', e.message); }
+  }
+  nav(S.view || 'import');
+  setTimeout(registerMonitor, 2000);
+})();
 </script>
 </body>
 </html>
