@@ -1704,6 +1704,14 @@ function renderOrderRows() {
     : _orderFilter === 'processing' ? _orders.filter(o => o.orderFulfillmentStatus === 'IN_PROGRESS')
     : _orders.filter(o => o.orderFulfillmentStatus === 'CANCELLED');
 
+  // Build lookup: ebay listingId → product, and sku → product
+  const productByListing = {};
+  const productBySku = {};
+  for (const p of (S.products||[])) {
+    if (p.ebayListingId) productByListing[p.ebayListingId] = p;
+    if (p.ebaySku) productBySku[p.ebaySku] = p;
+  }
+
   const card = o => {
     const item  = o.lineItems?.[0];
     const cfg   = STATUS[o.orderFulfillmentStatus] || { label: o.orderFulfillmentStatus||'—', color:'var(--text3)', bg:'rgba(255,255,255,.05)', dot:'var(--text3)' };
@@ -1716,31 +1724,74 @@ function renderOrderRows() {
     const qty   = (o.lineItems||[]).reduce((s,l)=>s+(l.quantity||1),0)||1;
     const title = (item?.title||'Order #'+o.orderId?.slice(-8)).slice(0,65);
     const img   = item?.image?.imageUrl || '';
-    return `<div style="background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px 16px;display:flex;gap:14px;align-items:center;transition:border-color .15s"
+
+    // Match to our product via line item SKU or eBay item ID
+    const itemSku = item?.sku || '';
+    const itemListingId = item?.ebayItemId || item?.legacyItemId || '';
+    const matchedProduct = productBySku[itemSku] || productByListing[itemListingId]
+      || (S.products||[]).find(p => p.ebaySku && itemSku.startsWith('DS-') && itemSku.startsWith(p.ebaySku?.slice(0,18)))
+      || null;
+
+    const sourceUrl = matchedProduct?.sourceUrl || '';
+    const productId = matchedProduct?.id || '';
+    const ebaySku   = matchedProduct?.ebaySku || itemSku || '';
+    const orderId_safe = o.orderId.replace(/[^a-z0-9]/gi,'_');
+
+    // Amazon URL section
+    const amazonSection = sourceUrl
+      ? `<div style="display:flex;align-items:center;gap:6px;margin-top:7px;flex-wrap:wrap">
+           <a href="${sourceUrl}" target="_blank"
+              style="display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;color:#f59e0b;text-decoration:none;background:rgba(245,158,11,.1);padding:3px 9px;border-radius:6px;border:1px solid rgba(245,158,11,.25)"
+              onmouseover="this.style.background='rgba(245,158,11,.2)'" onmouseout="this.style.background='rgba(245,158,11,.1)'">
+             <img src="https://www.amazon.com/favicon.ico" style="width:12px;height:12px"> Amazon Source
+           </a>
+           ${ebaySku ? `<button onclick="reviseFromOrder('${productId}','${orderId_safe}',this)"
+             style="display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:600;color:var(--accent2);background:rgba(99,179,237,.1);border:1px solid rgba(99,179,237,.25);padding:3px 9px;border-radius:6px;cursor:pointer"
+             onmouseover="this.style.background='rgba(99,179,237,.2)'" onmouseout="this.style.background='rgba(99,179,237,.1)'">
+             🔄 Resync Listing
+           </button>` : ''}
+         </div>`
+      : `<div style="display:flex;align-items:center;gap:6px;margin-top:7px;flex-wrap:wrap">
+           <div style="position:relative;flex:1;min-width:180px;max-width:320px">
+             <input id="url-input-${orderId_safe}" type="url" placeholder="Paste Amazon URL to link & resync…"
+               style="width:100%;box-sizing:border-box;font-size:11px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text);outline:none"
+               onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'"
+               onkeydown="if(event.key==='Enter')linkAndResync('${productId}','${itemListingId}','${itemSku}','${orderId_safe}',this.value)">
+           </div>
+           <button onclick="linkAndResync('${productId}','${itemListingId}','${itemSku}','${orderId_safe}',$('url-input-${orderId_safe}').value)"
+             style="flex-shrink:0;font-size:11px;font-weight:600;color:#fff;background:var(--accent);border:none;padding:4px 11px;border-radius:6px;cursor:pointer">
+             Link & Resync
+           </button>
+         </div>`;
+
+    return `<div id="order-card-${orderId_safe}" style="background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px 16px;transition:border-color .15s"
          onmouseover="this.style.borderColor='var(--accent2)'" onmouseout="this.style.borderColor='var(--border)'">
-      <div style="width:52px;height:52px;border-radius:10px;overflow:hidden;background:var(--bg2,var(--bg));flex-shrink:0;display:flex;align-items:center;justify-content:center">
-        ${img ? `<img src="${img}" style="width:100%;height:100%;object-fit:cover">` : `<span style="font-size:24px">🛍️</span>`}
-      </div>
-      <div style="flex:1;min-width:0">
-        <div style="font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:5px">${title}</div>
-        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-          <span style="font-size:11px;color:var(--text3)">👤 <span style="color:var(--text2);font-weight:600">${buyer}</span></span>
-          ${city ? `<span style="font-size:11px;color:var(--text3)">📍 ${city}, ${state}</span>` : ''}
-          <span style="font-size:11px;color:var(--text3)">📅 ${date}</span>
-          ${qty > 1 ? `<span style="font-size:11px;background:rgba(255,255,255,.07);padding:1px 7px;border-radius:10px;color:var(--text2)">×${qty}</span>` : ''}
+      <div style="display:flex;gap:14px;align-items:center">
+        <div style="width:52px;height:52px;border-radius:10px;overflow:hidden;background:var(--bg2,var(--bg));flex-shrink:0;display:flex;align-items:center;justify-content:center">
+          ${img ? `<img src="${img}" style="width:100%;height:100%;object-fit:cover">` : `<span style="font-size:24px">🛍️</span>`}
         </div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:4px">${title}</div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+            <span style="font-size:11px;color:var(--text3)">👤 <span style="color:var(--text2);font-weight:600">${buyer}</span></span>
+            ${city ? `<span style="font-size:11px;color:var(--text3)">📍 ${city}, ${state}</span>` : ''}
+            <span style="font-size:11px;color:var(--text3)">📅 ${date}</span>
+            ${qty > 1 ? `<span style="font-size:11px;background:rgba(255,255,255,.07);padding:1px 7px;border-radius:10px;color:var(--text2)">×${qty}</span>` : ''}
+          </div>
+          ${amazonSection}
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:5px;flex-shrink:0">
+          <div style="font-size:16px;font-weight:700;color:#10b981">$${amt}</div>
+          <div style="font-size:10px;color:var(--text3)">Net <span style="color:var(--text2)">$${netAmt}</span></div>
+          <span style="display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;padding:3px 10px;border-radius:20px;background:${cfg.bg};color:${cfg.color}">
+            <span style="width:6px;height:6px;border-radius:50%;background:${cfg.dot};flex-shrink:0;display:inline-block"></span>${cfg.label}
+          </span>
+        </div>
+        <a href="https://www.ebay.com/sh/ord/details?orderid=${o.orderId}" target="_blank"
+           style="width:30px;height:30px;border-radius:8px;border:1px solid var(--border);display:flex;align-items:center;justify-content:center;color:var(--text3);text-decoration:none;flex-shrink:0;font-size:13px"
+           onmouseover="this.style.borderColor='var(--accent2)';this.style.color='var(--accent2)'"
+           onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text3)'">↗</a>
       </div>
-      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:5px;flex-shrink:0">
-        <div style="font-size:16px;font-weight:700;color:#10b981">$${amt}</div>
-        <div style="font-size:10px;color:var(--text3)">Net <span style="color:var(--text2)">$${netAmt}</span></div>
-        <span style="display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;padding:3px 10px;border-radius:20px;background:${cfg.bg};color:${cfg.color}">
-          <span style="width:6px;height:6px;border-radius:50%;background:${cfg.dot};flex-shrink:0;display:inline-block"></span>${cfg.label}
-        </span>
-      </div>
-      <a href="https://www.ebay.com/sh/ord/details?orderid=${o.orderId}" target="_blank"
-         style="width:30px;height:30px;border-radius:8px;border:1px solid var(--border);display:flex;align-items:center;justify-content:center;color:var(--text3);text-decoration:none;flex-shrink:0;font-size:13px"
-         onmouseover="this.style.borderColor='var(--accent2)';this.style.color='var(--accent2)'"
-         onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text3)'">↗</a>
     </div>`;
   };
 
@@ -2194,6 +2245,128 @@ function forceReconnect() {
   save(); renderSettings();
   toast('Token cleared — re-authorizing...', 'info');
   setTimeout(() => connectEbay(), 500);
+}
+
+// ── ORDER RESYNC HELPERS ─────────────────────────────────────────────────────
+
+// Called from an order card's 🔄 Resync button — uses existing matched product
+async function reviseFromOrder(productId, orderIdSafe, btn) {
+  const p = S.products?.find(x => x.id === productId);
+  if (!p) { toast('Product not found in catalog', 'error'); return; }
+  if (!p.sourceUrl) { toast('No Amazon URL linked to this product', 'error'); return; }
+  if (!p.ebaySku || p.ebaySku.startsWith('DS-RECOVERED') || p.ebaySku.startsWith('DS-EXISTING')) {
+    toast('Real eBay SKU needed — go to Settings → Recover SKUs first', 'warn', 5000); return;
+  }
+  if (!S.token) { toast('Connect eBay first', 'error'); return; }
+
+  const orig = btn.textContent;
+  btn.textContent = '⏳ Syncing…';
+  btn.disabled = true;
+  try {
+    const token = await ensureToken();
+    const r = await fetch(`${S.backendUrl}/api/ebay?action=revise`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        access_token: token,
+        ebaySku: p.ebaySku,
+        sourceUrl: p.sourceUrl,
+        ebayListingId: p.ebayListingId,
+        quantity: p.quantity || 1,
+        markup: S.markup || 23,
+        handlingCost: S.handlingCost || 2,
+        sandbox: S.sandboxMode || false,
+      })
+    });
+    const d = await r.json();
+    if (!d.success) throw new Error(d.error);
+    p.lastSynced = new Date().toISOString();
+    if (d.price) { p.price = d.price; p.cost = d.price; }
+    save();
+    btn.textContent = '✅ Resynced!';
+    btn.style.color = '#10b981';
+    toast(`✅ Listing updated — ${d.images} photos, price $${d.price}, ${d.inStock ? 'In Stock' : 'Out of Stock'}`, 'success', 5000);
+    addLog('sync', `Revised: ${p.title?.slice(0,50)}`, `${d.updated} variants updated via order card`, { productId: p.id });
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; btn.style.color = ''; }, 4000);
+  } catch(e) {
+    btn.textContent = orig;
+    btn.disabled = false;
+    toast(`Resync failed: ${e.message}`, 'error', 6000);
+  }
+}
+
+// Called when user pastes an Amazon URL into the input field on an order card
+async function linkAndResync(productId, itemListingId, itemSku, orderIdSafe, url) {
+  url = (url||'').trim();
+  if (!url || !url.includes('amazon')) { toast('Paste a valid Amazon URL first', 'warn'); return; }
+  if (!S.token) { toast('Connect eBay first', 'error'); return; }
+
+  // Clean URL to dp/ASIN form
+  const asinMatch = url.match(/\/dp\/([A-Z0-9]{10})/i) || url.match(/([A-Z0-9]{10})$/i);
+  const cleanUrl = asinMatch ? `https://www.amazon.com/dp/${asinMatch[1]}` : url;
+  const asin = asinMatch?.[1] || '';
+
+  // Find or create product entry
+  let p = S.products?.find(x => x.id === productId)
+       || S.products?.find(x => x.ebayListingId === itemListingId)
+       || S.products?.find(x => x.ebaySku === itemSku);
+
+  if (!p && (itemListingId || itemSku)) {
+    // Create a stub product to track this listing
+    p = {
+      id: uid(), title: `eBay listing ${itemListingId || itemSku}`,
+      sourceUrl: cleanUrl, asin, status: 'listed',
+      ebayListingId: itemListingId || '', ebaySku: itemSku || '',
+      images: [], variations: [], hasVariations: false,
+    };
+    S.products = S.products || [];
+    S.products.push(p);
+    save();
+  } else if (p) {
+    p.sourceUrl = cleanUrl;
+    if (asin) p.asin = asin;
+    save();
+  }
+
+  if (!p) { toast('Could not find or create product entry', 'error'); return; }
+
+  // If no real eBay SKU, prompt recovery first
+  if (!p.ebaySku || p.ebaySku.startsWith('DS-RECOVERED') || p.ebaySku.startsWith('DS-EXISTING')) {
+    // Save URL and re-render, but can't revise without real SKU
+    toast('URL saved! Go to Settings → Recover SKUs to enable Resync.', 'info', 5000);
+    renderOrderRows();
+    return;
+  }
+
+  // Run revise inline
+  const btn = document.querySelector(`#order-card-${orderIdSafe} button[onclick*="linkAndResync"]`);
+  if (btn) { btn.textContent = '⏳ Linking & Syncing…'; btn.disabled = true; }
+  try {
+    const token = await ensureToken();
+    const r = await fetch(`${S.backendUrl}/api/ebay?action=revise`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        access_token: token,
+        ebaySku: p.ebaySku,
+        sourceUrl: cleanUrl,
+        ebayListingId: p.ebayListingId || itemListingId,
+        quantity: p.quantity || 1,
+        markup: S.markup || 23,
+        handlingCost: S.handlingCost || 2,
+        sandbox: S.sandboxMode || false,
+      })
+    });
+    const d = await r.json();
+    if (!d.success) throw new Error(d.error);
+    p.lastSynced = new Date().toISOString();
+    if (d.price) { p.price = d.price; p.cost = d.price; }
+    save();
+    toast(`✅ Linked & resynced — ${d.images} photos, price $${d.price}`, 'success', 5000);
+    addLog('sync', `Linked & revised: ${p.title?.slice(0,50)}`, `Amazon: ${cleanUrl.slice(0,60)}`, { productId: p.id });
+    renderOrderRows(); // re-render to show the Amazon link
+  } catch(e) {
+    if (btn) { btn.textContent = 'Link & Resync'; btn.disabled = false; }
+    toast(`Failed: ${e.message}`, 'error', 6000);
+  }
 }
 
 async function recoverSkusFromEbay() {
