@@ -305,7 +305,7 @@ async function loadLogsFromRailway() {
       // Merge: Railway logs + any local-only logs not yet pushed
       const rwIds = new Set(d.logs.map(l => String(l.id)));
       const localOnly = (S.logs||[]).filter(l => !rwIds.has(String(l.id)));
-      S.logs = [...d.logs, ...localOnly].sort((a,b) => new Date(b.ts||b.created_at) - new Date(a.ts||a.created_at));
+      S.logs = [...d.logs, ...localOnly].sort((a,b) => new Date(b.ts||b.created_at||0) - new Date(a.ts||a.created_at||0));
       localStorage.setItem(KEY, JSON.stringify(S));
     }
   } catch(e) { console.warn('[Logs] Railway fetch failed:', e.message); }
@@ -320,6 +320,7 @@ async function serverUpdateProduct(id, updates) {
 
 let S = { ...DEFAULT_STATE };
 try { const saved = JSON.parse(localStorage.getItem(KEY)||'{}'); S = { ...S, ...saved }; } catch {}
+S.sandboxMode = false; // always production — sandbox removed
 
 // ── Price Calc ────────────────────────────────────────
 function calcPrice(cost, markup) {
@@ -2064,7 +2065,7 @@ function renderLogs() {
     const detail = e.detail || '';
     const icon = LOG_ICONS[type] || 'ℹ️';
     const color = LOG_COLORS[type] || 'var(--text3)';
-    const dt = new Date(e.ts);
+    const dt = new Date(e.ts || e.created_at || Date.now());
     const dateStr = dt.toLocaleDateString('en-US', { month:'short', day:'numeric' });
     const timeStr = dt.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit' });
     const changes = e.changes?.length
@@ -2112,13 +2113,7 @@ function renderSettings() {
         <div class="card-header"><span class="card-title">⚡ eBay Connection</span></div>
         <div class="card-body">
           <div style="margin-bottom:14px;display:flex;align-items:center;gap:12px">
-            <label style="font-size:13px;font-weight:600;color:var(--text2)">Environment:</label>
-            <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
-              <input type="radio" name="ebay_env" value="production" ${!S.sandboxMode ? 'checked' : ''} onchange="setSandboxMode(false)"> Production
-            </label>
-            <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
-              <input type="radio" name="ebay_env" value="sandbox" ${S.sandboxMode ? 'checked' : ''} onchange="setSandboxMode(true)"> Sandbox
-            </label>
+            <span style="font-size:13px;font-weight:600;color:var(--green)">🟢 Production</span>
             ${S.sandboxMode ? `<span style="background:#f59e0b;color:#000;font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px">SANDBOX</span>` : ''}
           </div>
           <div id="ebay-conn-status" style="margin-bottom:16px">
@@ -2387,10 +2382,8 @@ async function savePricingDefaults() {
 }
 
 function setSandboxMode(val) {
-  S.sandboxMode = val;
-  if (S.token) { S.token = null; S.refreshToken = null; S.tokenExpiry = null; }
-  save(); renderSettings(); updateStatus();
-  toast(val ? "🟡 Switched to Sandbox mode" : "🟢 Switched to Production mode", 'info');
+  // Sandbox mode removed — always use production
+  S.sandboxMode = false; save();
 }
 
 async function connectEbay() {
@@ -2414,6 +2407,18 @@ async function connectEbay() {
       save(); updateStatus(); renderSettings(); setupAutoSync();
       toast('✅ Connected to eBay!', 'success');
       try { loadPolicies(); } catch(e) {}
+      // Push token to Railway so worker can refresh independently
+      if (S.serverUrl && data.refresh) {
+        fetch(S.serverUrl + '/api/settings/bulk', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            access_token:  data.token,
+            refresh_token: data.refresh,
+            token_expiry:  data.expiry,
+            sandbox:       '0',
+          }),
+        }).catch(()=>{});
+      }
     }
 
     // Method 1: postMessage from popup
@@ -2457,6 +2462,13 @@ async function refreshToken() {
     if (!d.access_token) throw new Error(d.error || 'Refresh failed');
     S.token = d.access_token; S.tokenExpiry = d.expiry || (Date.now() + 7000000);
     save(); renderSettings(); toast('Token refreshed', 'success');
+    // Push refreshed token to Railway worker
+    if (S.serverUrl && S.refreshToken) {
+      fetch(S.serverUrl + '/api/settings/bulk', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ access_token: S.token, refresh_token: S.refreshToken, token_expiry: S.tokenExpiry, sandbox: '0' }),
+      }).catch(()=>{});
+    }
   } catch (e) { toast(e.message, 'error'); }
 }
 
