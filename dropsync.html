@@ -1,4 +1,4 @@
- <!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2165,6 +2165,13 @@ function renderSettings() {
             </div>
           </div>
         </div>
+        \${S.serverUrl ? \`
+        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-outline btn-sm" onclick="syncCacheToRailway()">📤 Sync Cache → Railway</button>
+          <button class="btn btn-ghost btn-sm" onclick="loadWorkerLogs()">📋 Worker Logs</button>
+        </div>
+        <div id="worker-logs-panel" style="margin-top:8px;max-height:300px;overflow-y:auto;background:rgba(0,0,0,.2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:12px"></div>
+        \` : ''}
       </div>
 
       <!-- eBay Policies -->
@@ -2228,7 +2235,7 @@ function renderSettings() {
           <label style="font-size:13px">Webhook URL <span style="color:var(--text3);font-weight:400">(Discord, Slack, Make, Zapier, etc.)</span></label>
           <div style="display:flex;gap:8px">
             <input class="input" id="webhook-url" placeholder="https://discord.com/api/webhooks/..." value="${S.webhookUrl||''}" style="flex:1;font-size:12px;font-family:var(--font-mono)"
-              oninput="S.webhookUrl=this.value.trim();save()">
+              oninput="S.webhookUrl=this.value.trim();save();if(S.serverUrl)fetch(S.serverUrl+'/api/settings/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({webhookUrl:S.webhookUrl})}).catch(()=>{})">
             <button class="btn btn-outline btn-sm" onclick="testWebhook()">Test</button>
           </div>
           <div style="font-size:11px;color:var(--text3);line-height:1.6">
@@ -2321,6 +2328,56 @@ function renderSettings() {
       const el = $('server-status');
       if (el) el.innerHTML = `<span style="color:var(--red)">❌ Cannot reach server</span>`;
     });
+  }
+}
+
+// ── Worker Logs panel (shown in Settings) ──
+async function loadWorkerLogs() {
+  if (!S.serverUrl) { toast('Connect Railway server first', 'warn'); return; }
+  const el = document.getElementById('worker-logs-panel');
+  if (el) el.innerHTML = '<div style="color:var(--text3);font-size:12px">Loading…</div>';
+  try {
+    const r = await fetch(S.serverUrl + '/api/logs?limit=50');
+    const d = await r.json();
+    const logs = d.logs || [];
+    const icons = { sync:'✅', error:'❌', price:'💰', stock:'📦', info:'ℹ️' };
+    const rows = logs.map(l => {
+      const icon = icons[l.type] || '🔄';
+      const ts   = new Date(l.created_at).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'});
+      const date = new Date(l.created_at).toLocaleDateString('en-US',{month:'short',day:'numeric'});
+      const color = l.type==='error' ? 'var(--red)' : l.type==='sync' ? 'var(--green)' : 'var(--text2)';
+      return `<div style="display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px">
+        <span>${icon}</span>
+        <div style="flex:1;min-width:0">
+          <div style="color:${color};font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${l.title||''}</div>
+          ${l.detail ? `<div style="color:var(--text3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${l.detail}</div>` : ''}
+        </div>
+        <div style="flex-shrink:0;text-align:right;color:var(--text3);line-height:1.5">
+          <div>${date}</div><div>${ts}</div>
+        </div>
+      </div>`;
+    }).join('');
+    if (el) el.innerHTML = rows || '<div style="color:var(--text3);font-size:12px;padding:20px 0;text-align:center">No logs yet</div>';
+  } catch(e) {
+    if (el) el.innerHTML = `<div style="color:var(--red);font-size:12px">Failed: ${e.message}</div>`;
+  }
+}
+
+// ── Sync full product cache from localStorage → Railway ─────────────────────
+async function syncCacheToRailway() {
+  if (!S.serverUrl) { toast('Connect Railway server first', 'warn'); return; }
+  const products = S.products || [];
+  if (!products.length) { toast('No products to sync', 'warn'); return; }
+  toast(`Syncing ${products.length} products to Railway…`, 'info');
+  try {
+    const r = await fetch(S.serverUrl + '/api/products/bulk', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ products }),
+    });
+    const d = await r.json();
+    toast(`✅ Synced ${products.length} products to Railway`, 'success');
+  } catch(e) {
+    toast(`Sync failed: ${e.message}`, 'error');
   }
 }
 
