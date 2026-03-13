@@ -1045,6 +1045,19 @@ module.exports = async (req, res) => {
 
         const pr  = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${od.offerId}/publish`, { method: 'POST', headers: auth });
         const pd  = await pr.json();
+        if (!pd.listingId) {
+          const firstErr = (pd.errors||[])[0];
+          const errId = firstErr?.errorId;
+          if (errId === 25002) {
+            const existing = firstErr?.parameters?.find(p => p.name === 'listingId')?.value
+              || firstErr?.message?.match(/\((\d{12,})\)/)?.[1];
+            return res.status(400).json({
+              error: `Duplicate listing — already live as eBay item ${existing || '(see eBay)'}. Delete the old listing first or use Sync to update it.`,
+              errorId: 25002, existingListingId: existing || null,
+            });
+          }
+          return res.status(400).json({ error: 'Simple publish failed', details: pd, errorId: errId });
+        }
         return res.json({ success: true, sku: groupSku, offerId: od.offerId, listingId: pd.listingId });
       }
 
@@ -1331,8 +1344,18 @@ module.exports = async (req, res) => {
           console.log(`[push] published! listingId=${pd.listingId}`);
           return res.json({ success: true, sku: groupSku, listingId: pd.listingId, variantsCreated: final.length });
         }
-        const errId = (pd.errors||[])[0]?.errorId;
+        const firstErr = (pd.errors||[])[0];
+        const errId = firstErr?.errorId;
         console.warn(`[push] publish attempt ${attempt}: ${JSON.stringify(pd).slice(0,300)}`);
+        // Duplicate listing detected — return the existing listing ID
+        if (errId === 25002) {
+          const existing = firstErr?.parameters?.find(p => p.name === 'listingId')?.value
+            || firstErr?.message?.match(/\((\d{12,})\)/)?.[1];
+          return res.status(400).json({
+            error: `Duplicate listing — already live as eBay item ${existing || '(see eBay)'}. Delete the old listing first or use Sync to update it.`,
+            errorId: 25002, existingListingId: existing || null,
+          });
+        }
         if (attempt === 3) return res.status(400).json({ error: 'Publish failed', details: pd, errorId: errId });
         // Add missing aspects if required
         if (errId === 25004 || errId === 25003) {
@@ -1500,6 +1523,8 @@ module.exports = async (req, res) => {
     if (action === 'sync') {
       const { access_token, ebaySku, sourceUrl, hasVariations, quantity, variations, variationImages } = body;
       if (!access_token || !ebaySku) return res.status(400).json({ error: 'Missing fields' });
+      const sandbox = body.sandbox === true || body.sandbox === 'true';
+      const EBAY_API = getEbayUrls(sandbox).EBAY_API;
       const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
 
       // Re-scrape to get fresh data
@@ -1842,6 +1867,29 @@ Return ONLY the optimized title text, nothing else. No quotes, no explanation.` 
       const d = await r.json();
       if (!r.ok) return res.status(r.status).json({ error: d.errors?.[0]?.message || JSON.stringify(d) });
       return res.json({ orders: d.orders || [], total: d.total || 0 });
+    }
+
+    // ── RECOVER SKUS — maps all eBay listing IDs → real SKUs ────────────────
+    if (action === 'recoverSkus') {
+      const { access_token } = body;
+      if (!access_token) return res.status(400).json({ error: 'Missing access_token' });
+      const EBAY_API = getEbayUrls(false).EBAY_API;
+      const auth = { Authorization: `Bearer ${access_token}`, 'Accept-Language': 'en-US' };
+      const skuMap = {}; // listingId → sku
+      let offset = 0, hasMore = true;
+      while (hasMore && offset < 2000) {
+        const r = await fetch(`${EBAY_API}/sell/inventory/v1/offer?limit=100&offset=${offset}`, { headers: auth });
+        const d = await r.json();
+        const offers = d.offers || [];
+        for (const o of offers) {
+          const lid = o.listing?.listingId;
+          if (lid && o.sku) skuMap[lid] = o.sku;
+        }
+        hasMore = offers.length === 100;
+        offset += 100;
+        if (offers.length) await new Promise(r => setTimeout(r, 100));
+      }
+      return res.json({ skuMap, total: Object.keys(skuMap).length });
     }
 
     return res.status(400).json({ error: `Unknown action: ${action}` });
