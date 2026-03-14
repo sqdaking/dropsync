@@ -480,9 +480,16 @@ async function doScrape() {
     renderImport();
     const vc = countVariants();
     const dbg = d._debug || {};
-    const priceNote = dbg.pricesFound > 0 ? ` · 💰 ${dbg.pricesFound}/${dbg.totalColors} prices` : dbg.totalColors > 0 ? ' · ⚠️ prices unavailable (will use base price)' : '';
-    const imgNote   = dbg.imagesFound  > 0 ? ` · 🖼 ${dbg.imagesFound}/${dbg.totalColors} images` : '';
-    setStatus(`✅ Imported "${IMP.title.slice(0,50)}" — ${vc} variants${priceNote}${imgNote}${S.token ? ' · scroll down to push →' : ' · connect eBay in Settings'}`, 'success');
+    const pricesFailed = IMP._pricesFailed || dbg.pricesFailed || false;
+    // Mark on IMP so push button can check it
+    IMP._pricesFailed = pricesFailed;
+    const priceNote = pricesFailed
+      ? ' · ⛔ per-variant prices unavailable (Amazon blocked server fetches)'
+      : dbg.pricesFound > 0 ? ` · 💰 ${dbg.pricesFound}/${dbg.totalColors} prices` : '';
+    const imgNote = dbg.imagesFound > 0 ? ` · 🖼 ${dbg.imagesFound}/${dbg.totalColors} images` : '';
+    const statusType = pricesFailed ? 'warning' : 'success';
+    const statusIcon = pricesFailed ? '⚠️' : '✅';
+    setStatus(`${statusIcon} Imported "${IMP.title.slice(0,50)}" — ${vc} variants${priceNote}${imgNote}${pricesFailed ? ' · Cannot push until prices are resolved' : (S.token ? ' · scroll down to push →' : ' · connect eBay in Settings')}`, statusType);
     // Auto-optimize title in background (non-blocking)
     if (S.backendUrl && !IMP.ebayTitle) {
       aiOptimizeTitle().catch(() => {});
@@ -495,12 +502,8 @@ async function doScrape() {
 }
 
 function countVariants() {
-  if (!IMP?.hasVariations) return 1;
-  const cg = IMP.variations.find(v => /color/i.test(v.name));
-  const sg = IMP.variations.find(v => /size/i.test(v.name));
-  const ce = cg ? cg.values.length : 1;
-  const se = sg ? sg.values.length : 1;
-  return ce * se;
+  if (!IMP?.hasVariations || !IMP.variations?.length) return 1;
+  return IMP.variations.reduce((acc, g) => acc * (g.values?.length || 1), 1);
 }
 
 function applyMarkupToIMP() {
@@ -626,7 +629,11 @@ function renderPreview() {
           </div>
           <div style="flex:1"></div>
           <button class="btn btn-outline" onclick="saveAsDraft()">💾 Save Draft</button>
-          ${S.token ? `<button class="btn btn-success" onclick="doPush()" id="push-btn">🚀 Push to eBay (${countVariants()} variants)</button>` : `<button class="btn btn-outline" onclick="nav('settings')">⚡ Connect eBay</button>`}
+          ${S.token
+            ? IMP._pricesFailed
+              ? `<button class="btn" style="background:var(--border);color:var(--text3);cursor:not-allowed" disabled title="Cannot push — per-variant prices could not be fetched from Amazon. Try re-importing in a few minutes.">⛔ Prices Failed — Cannot Push</button>`
+              : `<button class="btn btn-success" onclick="doPush()" id="push-btn">🚀 Push to eBay (${countVariants()} variants)</button>`
+            : `<button class="btn btn-outline" onclick="nav('settings')">⚡ Connect eBay</button>`}
         </div>
       </div>
     </div>`;
@@ -707,6 +714,11 @@ async function aiOptimizeTitle() {
 async function doPush() {
   if (!IMP) return;
   if (!S.token) { toast('Connect eBay first in Settings', 'error'); return; }
+  // Block push if per-variant prices couldn't be fetched (Amazon blocked server requests)
+  if (IMP._pricesFailed) {
+    setStatus('⛔ Cannot push — per-variant prices are unavailable (Amazon blocked server-side price fetches). Try re-importing the product in a few minutes.', 'error');
+    return;
+  }
   const btn = $('push-btn');
   if (btn) { btn.disabled = true; btn.innerHTML = '<div class="spinner" style="width:14px;height:14px"></div> Pushing…'; }
   setStatus('<div class="spinner" style="width:14px;height:14px;flex-shrink:0"></div> <span>Pushing to eBay — AI selecting category, building listing…</span>');
@@ -1407,9 +1419,11 @@ function renderProdRows(prods) {
     }[p.status] || '';
     const syncAge = p.lastSynced ? `<span style="font-size:10px;color:var(--text3)">· synced ${timeAgo(p.lastSynced)}</span>` : '';
 
+    const reviseFailed = p.lastReviseError && p.lastReviseError.length > 0;
     const actionBtns = p.status==='listed' ? `
       <button class="btn btn-outline btn-sm" onclick="syncOne('${p.id}')">🔄 Revise</button>
       <a href="https://www.ebay.com/itm/${p.ebayListingId}" target="_blank" class="btn btn-outline btn-sm">eBay ↗</a>
+      ${reviseFailed && S.token ? `<button class="btn btn-sm" style="background:var(--amber,#f59e0b);color:#000;font-weight:600" onclick="repushListing('${p.id}')" title="${(p.lastReviseError||'').replace(/"/g,'\'').slice(0,120)}">⚠️ Revise Failed — Re-push?</button>` : ''}
       <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="confirmEnd('${p.id}')">End</button>
     ` : p.status==='draft' ? `
       <button class="btn btn-outline btn-sm" onclick="reImport('${p.id}')">↩ Edit</button>
@@ -1429,6 +1443,7 @@ function renderProdRows(prods) {
           <span style="color:var(--text3);font-family:var(--font-mono)">(cost $${(p.price||0).toFixed(2)})</span>
           <span>${variants} variants</span>
           ${statusBadge} ${syncAge}
+          ${p.lastReviseError ? `<span style="color:var(--red);font-size:10px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(p.lastReviseError||'').replace(/"/g,"'")}">⚠ ${p.lastReviseError.slice(0,60)}${p.lastReviseError.length>60?'…':''}</span>` : ''}
         </div>
       </div>
       <div style="display:flex;gap:6px;align-items:center;flex-shrink:0">
@@ -1466,9 +1481,10 @@ async function pushExisting(pid) {
   try {
     const token = await ensureToken();
 
-    // Auto-scrape if images are missing — restores full product data before push
+    // Always scrape fresh if sourceUrl available — ensures latest scraper logic is applied
+    // (important for re-pushes after code fixes, and for keeping data current)
     let productToPost = { ...p };
-    if (!productToPost.images?.length && productToPost.sourceUrl) {
+    if (productToPost.sourceUrl) {
       toast('🔍 Refreshing product data from Amazon…', 'info', 3000);
       try {
         const sr = await fetch(`${S.backendUrl}/api/ebay?action=scrape`, {
@@ -1477,29 +1493,41 @@ async function pushExisting(pid) {
         });
         const sd = await sr.json();
         const scraped = sd.product || sd;
-        if (scraped.images?.length) {
+        if (scraped.title || scraped.images?.length) {
+          // Merge all scraped fields — overwrite stale cached data
           productToPost = {
             ...productToPost,
-            images: scraped.images,
-            price: scraped.price || productToPost.price,
-            cost: scraped.price || productToPost.cost,
-            bullets: scraped.bullets?.length ? scraped.bullets : productToPost.bullets,
-            description: scraped.description || productToPost.description,
-            variations: scraped.variations?.length ? scraped.variations : productToPost.variations,
-            variationImages: scraped.variationImages || productToPost.variationImages,
-            hasVariations: scraped.hasVariations ?? productToPost.hasVariations,
-            comboAsin: scraped.comboAsin || productToPost.comboAsin,
-            sizePrices: scraped.sizePrices || productToPost.sizePrices,
-            comboPrices: scraped.comboPrices || productToPost.comboPrices,
-            aspects: scraped.aspects || productToPost.aspects,
-            breadcrumbs: scraped.breadcrumbs || productToPost.breadcrumbs,
+            images:          scraped.images?.length    ? scraped.images          : productToPost.images,
+            price:           scraped.price             || productToPost.price,
+            cost:            scraped.price             || productToPost.cost,
+            bullets:         scraped.bullets?.length   ? scraped.bullets         : productToPost.bullets,
+            description:     scraped.description       || productToPost.description,
+            variations:      scraped.variations?.length? scraped.variations      : productToPost.variations,
+            variationImages: scraped.variationImages   || productToPost.variationImages,
+            hasVariations:   scraped.hasVariations     ?? productToPost.hasVariations,
+            comboAsin:       scraped.comboAsin         || productToPost.comboAsin,
+            sizePrices:      scraped.sizePrices        || productToPost.sizePrices,
+            comboPrices:     scraped.comboPrices       || productToPost.comboPrices,
+            comboPrices:     scraped.comboPrices       || productToPost.comboPrices,
+            aspects:         scraped.aspects           || productToPost.aspects,
+            breadcrumbs:     scraped.breadcrumbs       || productToPost.breadcrumbs,
+            _primaryDimName:   scraped._primaryDimName   || productToPost._primaryDimName,
+            _secondaryDimName: scraped._secondaryDimName || productToPost._secondaryDimName,
+            _pricesFailed:     scraped._pricesFailed,
+            inStock:           scraped.inStock         ?? productToPost.inStock,
           };
-          // Persist images back to localStorage
-          p.images = scraped.images;
-          p.price = scraped.price || p.price;
-          p.cost = scraped.price || p.cost;
-          if (scraped.variations?.length) p.variations = scraped.variations;
-          if (scraped.variationImages) p.variationImages = scraped.variationImages;
+          // Block re-push if prices failed on fresh scrape
+          if (scraped._pricesFailed) {
+            throw new Error('Cannot push — Amazon blocked per-variant price lookups. All variants would be priced identically. Try again in a few minutes.');
+          }
+          // Persist key fields back to localStorage
+          p.images = productToPost.images;
+          p.price  = productToPost.price;
+          p.cost   = productToPost.cost;
+          if (scraped.variations?.length)  p.variations      = scraped.variations;
+          if (scraped.variationImages)      p.variationImages = scraped.variationImages;
+          if (scraped._primaryDimName)      p._primaryDimName = scraped._primaryDimName;
+          if (scraped._secondaryDimName)    p._secondaryDimName = scraped._secondaryDimName;
           save();
         }
       } catch(e) { console.warn('[pushExisting] scrape failed, proceeding with cached data:', e.message); }
@@ -1656,6 +1684,7 @@ async function syncOne(pid) {
     p.lastSynced = new Date().toISOString();
     p.inStock = d.inStock;
     if (d.price) { p.myPrice = d.price; }
+    delete p.lastReviseError; // clear error now that revise succeeded
     markDirty(p.id); save(); renderProducts();
 
     const parts = [`✅ Synced — ${d.images} photos`];
@@ -1669,10 +1698,97 @@ async function syncOne(pid) {
     if (d.stockChanges?.length) { addLog('stock', `Stock updated: ${p.title.slice(0,40)}`, d.stockChanges.join(' · '), { productId: p.id }); sendWebhook('stock', p, d.stockChanges); }
     addLog('sync', `Revised: ${p.title.slice(0,40)}`, `${d.updatedVariants||1} items · ${d.images} images · $${(d.price||0).toFixed(2)}`, { productId: p.id });
   } catch (e) {
-    toast(`Sync failed: ${e.message}`, 'error', 6000);
+    // Store error on product so card shows Re-push button
+    p.lastReviseError = e.message || 'Revise failed';
+    markDirty(p.id); save(); renderProducts();
+    toast(`Revise failed: ${e.message}`, 'error', 8000);
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = origText || '🔄 Revise'; }
   }
+}
+
+// Re-push: called when revise failed and user clicks "Re-push?"
+// Confirms with user, ends the broken listing, then pushes a fresh one
+async function repushListing(pid) {
+  const p = S.products.find(x => x.id === pid);
+  if (!p) return;
+
+  // Show confirm modal with error context
+  const errMsg = p.lastReviseError || 'Unknown revise error';
+  const confirmed = await showConfirmModal(
+    '🔄 Re-push Listing?',
+    `Revise failed: <em style="color:var(--red)">${errMsg.slice(0, 200)}</em>
+    <br><br>
+    This will:<br>
+    <b>1.</b> End the broken eBay listing (<code>${p.ebayListingId || 'unknown'}</code>)<br>
+    <b>2.</b> Re-import fresh data from Amazon<br>
+    <b>3.</b> Push a brand-new listing with a new ID<br>
+    <br>
+    <span style="color:var(--text3);font-size:11px">The old listing URL will stop working. Any watchers will be lost.</span>`,
+    'Re-push',
+    'Cancel'
+  );
+  if (!confirmed) return;
+
+  const statusEl = toast('Re-pushing — ending old listing…', 'info', 30000);
+
+  try {
+    // Step 1: End the old eBay listing (non-blocking if it fails)
+    if (p.ebayListingId && p.ebaySku) {
+      try {
+        const token = await ensureToken();
+        await fetch(`${S.backendUrl}/api/ebay?action=endListing`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId, sandbox: S.sandboxMode || false }),
+        });
+      } catch(e) { console.warn('[repush] end listing failed (continuing):', e.message); }
+    }
+
+    // Step 2: Mark as draft and clear old eBay IDs so it can be re-pushed
+    p.status = 'draft';
+    p.ebayListingId = null;
+    p.ebaySku = null;
+    p.lastReviseError = null;
+    p.lastSynced = null;
+    markDirty(p.id); save();
+
+    // Step 3: Push fresh
+    toast('Re-pushing — creating new listing…', 'info', 30000);
+    await pushExisting(pid);
+
+  } catch(e) {
+    p.lastReviseError = 'Re-push failed: ' + e.message;
+    markDirty(p.id); save(); renderProducts();
+    toast(`Re-push failed: ${e.message}`, 'error', 8000);
+  }
+}
+
+// Generic confirm modal — returns Promise<boolean>
+function showConfirmModal(title, bodyHtml, confirmLabel='Confirm', cancelLabel='Cancel') {
+  return new Promise(resolve => {
+    // Remove any existing modal
+    document.getElementById('confirm-modal-overlay')?.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'confirm-modal-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px';
+
+    overlay.innerHTML = `
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px;max-width:480px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,0.4)">
+        <h3 style="margin:0 0 12px;font-size:16px;color:var(--text)">${title}</h3>
+        <div style="font-size:13px;color:var(--text2);line-height:1.5;margin-bottom:20px">${bodyHtml}</div>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button id="modal-cancel" class="btn btn-ghost btn-sm" style="font-size:12px">${cancelLabel}</button>
+          <button id="modal-confirm" class="btn btn-sm" style="background:var(--amber,#f59e0b);color:#000;font-weight:600;font-size:12px">${confirmLabel}</button>
+        </div>
+      </div>`;
+
+    document.body.appendChild(overlay);
+
+    overlay.querySelector('#modal-confirm').onclick = () => { overlay.remove(); resolve(true); };
+    overlay.querySelector('#modal-cancel').onclick  = () => { overlay.remove(); resolve(false); };
+    overlay.onclick = e => { if (e.target === overlay) { overlay.remove(); resolve(false); } };
+  });
 }
 
 async function syncAllWithFeedback() {
