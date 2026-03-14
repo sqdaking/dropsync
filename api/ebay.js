@@ -2021,21 +2021,46 @@ module.exports = async (req, res) => {
           return p > 0 ? p : applyMk(basePrice) || 9.99;
         };
 
-        const getImageForColor = (color) =>
-          (color ? colorImgs[color] : null) || product.images[0] || '';
+        // Map Amazon color names to scraped color images
+        // Also build a fallback map from eBay's existing skuAspects color names
+        const buildColorImgMap = () => {
+          const map = { ...colorImgs }; // Amazon color → image URL
+          // Try case-insensitive match for eBay color names that differ slightly
+          const lowerMap = {};
+          for (const [k, v] of Object.entries(colorImgs)) lowerMap[k.toLowerCase()] = v;
+          // Add eBay-side color names as keys too
+          for (const { Color } of Object.values(skuAspects)) {
+            if (Color && !map[Color]) {
+              const match = lowerMap[Color.toLowerCase()];
+              if (match) map[Color] = match;
+            }
+          }
+          return map;
+        };
+        const colorImgMap = buildColorImgMap();
+
+        const getImageForColor = (color) => {
+          if (!color) return product.images[0] || '';
+          return colorImgMap[color]
+            || colorImgs[color]
+            || product.images[0]
+            || '';
+        };
+
+        const comboAsin    = product.comboAsin    || {};
+        const comboInStock = product.comboInStock || {};
+        console.log(`[revise] comboAsin=${Object.keys(comboAsin).length} comboInStock=${Object.keys(comboInStock).length} freshStock=${freshStock}`);
 
         const getQtyForVariant = (color, size) => {
           if (!freshStock) return 0;
-          // If we have comboAsin data, check if combo exists AND is in stock
-          const comboAsin   = product.comboAsin   || {};
-      const comboInStock = product.comboInStock || {};
+          // If we have comboAsin data, check if combo exists AND is in stock on Amazon
           if (Object.keys(comboAsin).length) {
             const key = `${color||''}|${size||''}`;
-            if (!comboAsin[key]) return 0;
-            if (comboInStock[key] === false) return 0;
+            if (!comboAsin[key]) return 0;           // combo doesn't exist on Amazon
+            if (comboInStock[key] === false) return 0; // combo exists but OOS on Amazon
             return defaultQty;
           }
-          return defaultQty;
+          return defaultQty; // no comboAsin data — assume in stock
         };
 
         // Full-replace each variant inventory item
@@ -2058,7 +2083,7 @@ module.exports = async (req, res) => {
               product: {
                 title:       listingTitle,
                 description: ebayDescription,
-                imageUrls:   [testImg, ...product.images.filter(x => x !== testImg)].filter(Boolean).slice(0, 12),
+                imageUrls:   testImg ? [testImg] : product.images.slice(0, 1),
                 aspects:     testAsp,
               },
             }),
@@ -2089,7 +2114,7 @@ module.exports = async (req, res) => {
                 product: {
                   title:       listingTitle,
                   description: ebayDescription,
-                  imageUrls:   [img, ...product.images.filter(x => x !== img)].filter(Boolean).slice(0, 12),
+                  imageUrls:   img ? [img] : product.images.slice(0, 1),
                   aspects:     asp,
                 },
               }),
@@ -2113,7 +2138,7 @@ module.exports = async (req, res) => {
                 availability: { shipToLocationAvailability: { quantity: getQtyForVariant(color, size) } },
                 condition: 'NEW',
                 product: { title: listingTitle, description: ebayDescription,
-                           imageUrls: [img, ...product.images.filter(x => x !== img)].filter(Boolean).slice(0, 12), aspects: asp },
+                           imageUrls: img ? [img] : product.images.slice(0, 1), aspects: asp },
               }),
             });
             if (r.ok || r.status === 204) createdSkus.add(sku);
@@ -2134,8 +2159,8 @@ module.exports = async (req, res) => {
           if (sizes.length)  varAspects['Size']  = sizes;
         }
         if (sizeGroup) varAspects['Size'] = sizeGroup.values.map(v => v.value);
-        const colorUrlList = Object.values(colorImgs).filter(Boolean).slice(0, 12);
-        const groupImageUrls = colorUrlList.length ? colorUrlList : product.images.slice(0, 12);
+        // Group gets ALL product images (up to 12); per-SKU images are on inventory items
+        const groupImageUrls = product.images.slice(0, 12);
         const groupAspects = { ...aspects };
         delete groupAspects['Color']; delete groupAspects['Size'];
         const variesBySpecs = Object.entries(varAspects).map(([name, values]) => ({ name, values }));
@@ -2151,7 +2176,7 @@ module.exports = async (req, res) => {
               variantSKUs: variantSkus.filter(s => createdSkus.has(s)),
               aspects:     groupAspects,
               variesBy: {
-                aspectsImageVariesBy: colorGroup ? ['Color'] : [],
+                aspectsImageVariesBy: varAspects['Color'] ? ['Color'] : [],
                 specifications: variesBySpecs,
               },
             }),
@@ -2164,7 +2189,7 @@ module.exports = async (req, res) => {
 
         // ── STEP 6C: Update all offer prices ────────────────────────────────────
         let pricesUpdated = 0;
-        for (let i = 0; i < variantSkus.length; i += 15) {
+        for (let i = 0; i < variantSkus.length; i += 8) {
           await Promise.all(variantSkus.slice(i, i + 8).map(async (sku) => {
             if (!createdSkus.has(sku)) return; // skip failed ones
             const { Color: color, Size: size } = skuAspects[sku] || {};
@@ -2180,7 +2205,7 @@ module.exports = async (req, res) => {
               pricesUpdated++;
             }
           }));
-          if (i + 15 < variantSkus.length) await sleep(80);
+          if (i + 8 < variantSkus.length) await sleep(100);
         }
 
         console.log(`[revise] done — ${createdSkus.size} variants updated, ${pricesUpdated} prices updated, ${failedSkus.length} failed`);
@@ -2514,7 +2539,7 @@ module.exports = async (req, res) => {
                 product: {
                   title:       listingTitle,
                   description: ebayDescription,
-                  imageUrls:   [img, ...product.images.filter(x => x !== img)].filter(Boolean).slice(0, 12),
+                  imageUrls:   img ? [img] : product.images.slice(0, 1),
                   aspects:     asp,
                 },
               }),
