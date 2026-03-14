@@ -1664,10 +1664,19 @@ async function syncOne(pid) {
         handlingCost: S.handlingCost,
         sandbox: S.sandboxMode || false,
         fallbackImages:   p.images || [],
-        fallbackTitle:    p.title  || '',
-        fallbackPrice:    p.cost   || p.price || p.amazonPrice || p.myPrice || 0,
+        fallbackTitle:    p.ebayTitle || p.title || '',
+        fallbackPrice:    p.cost || p.price || p.amazonPrice || 0,
         fallbackShipping: p.shippingCost || 0,
-        fallbackInStock:  p.inStock !== false && (p.quantity || 1) > 0,
+        // For variation products: pass full combo data so revise doesn't
+        // rely on stale product-level inStock which can cause all-OOS wipe
+        fallbackInStock:  p.hasVariations ? true : (p.inStock !== false && (p.quantity||1) > 0),
+        fallbackComboAsin:        p.comboAsin        || null,
+        fallbackComboInStock:     p.comboInStock     || null,
+        fallbackComboPrices:      p.comboPrices      || null,
+        fallbackVariations:       p.variations       || null,
+        fallbackVariationImages:  p.variationImages  || null,
+        fallbackPrimaryDimName:   p._primaryDimName  || null,
+        fallbackSecondaryDimName: p._secondaryDimName|| null,
       }),
     });
     const raw = await r.text();
