@@ -75,7 +75,7 @@ async function fetchPage(url, ua) {
     console.warn(`[fetch] allorigins blocked (${html.length}b)`);
   } catch (e) { console.warn(`[fetch] allorigins error: ${e.message}`); }
 
-  // Strategy 5: scraperapi free tier (no key needed for basic requests)
+  // Strategy 5: scraperapi free tier
   try {
     await sleep(800);
     const scraperUrl = `https://api.scraperapi.com/?url=${encodeURIComponent(url)}&render=false`;
@@ -84,6 +84,39 @@ async function fetchPage(url, ua) {
     if (!isBlocked(html)) { console.log(`[fetch] scraperapi ok len=${html.length}`); return html; }
     console.warn(`[fetch] scraperapi blocked (${html.length}b)`);
   } catch (e) { console.warn(`[fetch] scraperapi error: ${e.message}`); }
+
+  // Strategy 6: codetabs proxy
+  try {
+    await sleep(1200);
+    const r = await fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`, {
+      headers: { 'User-Agent': randUA() }
+    });
+    const html = await r.text();
+    if (!isBlocked(html)) { console.log(`[fetch] codetabs ok len=${html.length}`); return html; }
+    console.warn(`[fetch] codetabs blocked (${html.length}b)`);
+  } catch (e) { console.warn(`[fetch] codetabs error: ${e.message}`); }
+
+  // Strategy 7: thingproxy
+  try {
+    await sleep(1000);
+    const r = await fetch(`https://thingproxy.freeboard.io/fetch/${url}`, {
+      headers: { 'User-Agent': randUA(), 'Accept': 'text/html' }
+    });
+    const html = await r.text();
+    if (!isBlocked(html)) { console.log(`[fetch] thingproxy ok len=${html.length}`); return html; }
+    console.warn(`[fetch] thingproxy blocked (${html.length}b)`);
+  } catch (e) { console.warn(`[fetch] thingproxy error: ${e.message}`); }
+
+  // Strategy 8: htmlpreview / corsproxy.io
+  try {
+    await sleep(1000);
+    const r = await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`, {
+      headers: { 'User-Agent': randUA(), 'Accept': 'text/html,application/xhtml+xml' }
+    });
+    const html = await r.text();
+    if (!isBlocked(html)) { console.log(`[fetch] corsproxy ok len=${html.length}`); return html; }
+    console.warn(`[fetch] corsproxy blocked (${html.length}b)`);
+  } catch (e) { console.warn(`[fetch] corsproxy error: ${e.message}`); }
 
   return '';
 }
@@ -602,7 +635,8 @@ async function scrapeAmazonProduct(inputUrl) {
       const h = await fetchPage(`https://www.amazon.com/dp/${a}`, ua);
       if (!h) return;
       const p = extractPrice(h);
-      asinInStock[a] = !h.toLowerCase().includes('currently unavailable');
+      const _bbH = (h.match(/id="availability"[\s\S]{0,2000}/)?.[0]||'')+(h.match(/id="addToCart_feature_div"[\s\S]{0,500}/)?.[0]||'');
+      asinInStock[a] = _bbH.length>50 ? !_bbH.toLowerCase().includes('currently unavailable') : !h.toLowerCase().includes('currently unavailable');
       if (p) { sizePrices[size] = p; console.log(`[price] "${size}" = $${p} inStock=${asinInStock[a]}`); }
     }));
 
@@ -614,7 +648,8 @@ async function scrapeAmazonProduct(inputUrl) {
         const h = await fetchPage(`https://www.amazon.com/dp/${a}`, ua);
         if (!h) return;
         const p = extractPrice(h);
-        asinInStock[a] = !h.toLowerCase().includes('currently unavailable');
+        const _bbH = (h.match(/id="availability"[\s\S]{0,2000}/)?.[0]||'')+(h.match(/id="addToCart_feature_div"[\s\S]{0,500}/)?.[0]||'');
+      asinInStock[a] = _bbH.length>50 ? !_bbH.toLowerCase().includes('currently unavailable') : !h.toLowerCase().includes('currently unavailable');
         if (p) asinToPrice[a] = p;
       }));
       if (i + 5 < uniqueAsins.length) await sleep(300);
@@ -659,10 +694,15 @@ async function scrapeAmazonProduct(inputUrl) {
         return { value:s, price:sizePrices[s]||mainPrice, inStock:Object.keys(comboAsin).length>0?inStock:true, enabled:Object.keys(comboAsin).length>0?inStock:true, image:'' };
       })});
     }
-    product.comboAsin   = comboAsin;
+    product.comboAsin    = comboAsin;
     product.comboInStock = comboInStock;
-    product.sizePrices = sizePrices;
-    product.comboPrices = comboPrices;
+    product.sizePrices   = sizePrices;
+    product.comboPrices  = comboPrices;
+    if (Object.keys(comboInStock).length > 0) {
+      product.inStock = Object.values(comboInStock).some(v => v !== false);
+    } else {
+      product.inStock = true;
+    }
     const allP = Object.values(sizePrices).filter(p=>p>0);
     if (allP.length) product.price = Math.min(...allP);
   }
@@ -1676,8 +1716,15 @@ module.exports = async (req, res) => {
       product.price = extractPrice(html) || 0;
       product.shippingCost = extractShippingCost(html); // 0=FREE, >0=paid
 
-      // Stock
-      product.inStock = !html.toLowerCase().includes('currently unavailable');
+      // Stock — only check the add-to-cart/buy-box section, not entire HTML
+      // The full page may have "currently unavailable" for OTHER products (ads, recommendations)
+      const buyBoxHtml = (html.match(/id="availability"[\s\S]{0,2000}/)?.[0] || '')
+                       + (html.match(/id="addToCart_feature_div"[\s\S]{0,1000}/)?.[0] || '')
+                       + (html.match(/id="outOfStock"[\s\S]{0,500}/)?.[0] || '');
+      const checkInStock = buyBoxHtml.length > 50
+        ? !buyBoxHtml.toLowerCase().includes('currently unavailable')
+        : !html.toLowerCase().includes('currently unavailable');
+      product.inStock = checkInStock;
 
       // Images — all hiRes from page
       const imgs = [...html.matchAll(/"hiRes"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+\.jpg)"/g)]
@@ -1994,10 +2041,19 @@ module.exports = async (req, res) => {
         }
 
         // Store on product for push step
-        product.comboAsin   = comboAsin;
+        product.comboAsin    = comboAsin;
         product.comboInStock = comboInStock;
-        product.sizePrices = sizePrices;
-        product.comboPrices = comboPrices || {};
+        product.sizePrices   = sizePrices;
+        product.comboPrices  = comboPrices || {};
+
+        // For variation products, inStock = true if ANY combo is in stock
+        // Overrides the main-page check which may have been wrong color/size
+        if (Object.keys(comboInStock).length > 0) {
+          product.inStock = Object.values(comboInStock).some(v => v !== false);
+        } else {
+          // No combo data — trust the main page (at least one variant is in stock)
+          product.inStock = true;
+        }
 
         // Product base price = cheapest available size
         const allP = Object.values(sizePrices).filter(p => p > 0);
