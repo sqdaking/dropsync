@@ -765,6 +765,28 @@ async function scrapeAmazonProduct(inputUrl) {
       if (asinPrice[asin]) sizePrices[sVal] = asinPrice[asin];
     }
 
+    // Fetch remaining unique ASINs for per-combo pricing (up to 15 total)
+    // This handles products where prices vary by BOTH dimensions (e.g. Size × Style)
+    const fetchedAsins = new Set(Object.values(secToFetchAsin));
+    const remainingAsins = [...new Set(Object.values(comboAsin))]
+      .filter(a => a && !fetchedAsins.has(a) && !asinPrice[a])
+      .slice(0, 15); // cap to avoid Vercel timeout
+    if (remainingAsins.length) {
+      console.log(`[scraper] fetching ${remainingAsins.length} additional ASINs for per-combo pricing`);
+      for (let i = 0; i < remainingAsins.length; i += 5) {
+        await Promise.all(remainingAsins.slice(i, i + 5).map(async a => {
+          const h = await fetchPage(`https://www.amazon.com/dp/${a}`, ua);
+          if (!h) return;
+          const price = extractPriceFromBuyBox(h);
+          if (price) asinPrice[a] = price;
+          const bb = (h.match(/id="availability"[\s\S]{0,3000}/)?.[0] || '')
+                   + (h.match(/id="addToCart_feature_div"[\s\S]{0,1000}/)?.[0] || '');
+          if (bb.length > 30) asinInStock[a] = !bb.toLowerCase().includes('currently unavailable');
+        }));
+        if (i + 5 < remainingAsins.length) await sleep(300);
+      }
+    }
+
     // Fill missing prices with main page price
     const mainPrice = extractPriceFromBuyBox(html) || product.price || 0;
     if (secondaryDim) {
@@ -1396,19 +1418,48 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
   const fallbackPrice   = parseFloat(body.fallbackPrice) || 0;
   const fallbackInStock = body.fallbackInStock !== false;
 
+  // Also accept full product data passed directly from browser (avoids re-scrape)
+  const fallbackComboAsin        = body.fallbackComboAsin        || null;
+  const fallbackComboInStock     = body.fallbackComboInStock     || null;
+  const fallbackComboPrices      = body.fallbackComboPrices      || null;
+  const fallbackVariations       = Array.isArray(body.fallbackVariations) ? body.fallbackVariations : null;
+  const fallbackVariationImages  = body.fallbackVariationImages  || null;
+  const fallbackPrimaryDimName   = body.fallbackPrimaryDimName   || null;
+  const fallbackSecondaryDimName = body.fallbackSecondaryDimName || null;
+
   if (!product) {
     if (fallbackImages.length) {
-      console.log(`[revise] scrape failed — using ${fallbackImages.length} cached images`);
+      console.log(`[revise] scrape failed — using ${fallbackImages.length} cached images + combo data`);
       product = {
         title: fallbackTitle || 'Product', price: fallbackPrice,
         images: fallbackImages, inStock: fallbackInStock,
-        hasVariations: false, variations: [], variationImages: {},
-        comboPrices: {}, sizePrices: {}, comboAsin: {}, comboInStock: {},
+        hasVariations: !!(fallbackVariations?.length || fallbackComboAsin),
+        variations:       fallbackVariations       || [],
+        variationImages:  fallbackVariationImages  || {},
+        comboPrices:      fallbackComboPrices      || {},
+        sizePrices:       {},
+        comboAsin:        fallbackComboAsin        || {},
+        comboInStock:     fallbackComboInStock     || {},
         aspects: {}, breadcrumbs: [], bullets: [], descriptionPara: '',
+        _primaryDimName:   fallbackPrimaryDimName,
+        _secondaryDimName: fallbackSecondaryDimName,
       };
     }
   } else {
+    // Merge fallback data into scraped product where needed
     if (!product.images?.length && fallbackImages.length) product.images = fallbackImages;
+    // If scraped product has empty comboAsin (blocked sub-fetches) but caller has cached data, use it
+    if (!Object.keys(product.comboAsin||{}).length && fallbackComboAsin) {
+      product.comboAsin        = fallbackComboAsin;
+      product.comboInStock     = fallbackComboInStock || {};
+      product.comboPrices      = fallbackComboPrices  || {};
+      product.variations       = fallbackVariations   || product.variations;
+      product.variationImages  = fallbackVariationImages || product.variationImages;
+      if (fallbackPrimaryDimName)   product._primaryDimName   = fallbackPrimaryDimName;
+      if (fallbackSecondaryDimName) product._secondaryDimName = fallbackSecondaryDimName;
+      product.hasVariations = true;
+      console.log('[revise] merged fallback combo data into scraped product');
+    }
   }
 
   // Last resort: pull from eBay's existing inventory
