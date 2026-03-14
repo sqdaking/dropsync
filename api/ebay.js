@@ -127,6 +127,37 @@ function extractPrice(html) {
   return null;
 }
 
+// ── Extract Amazon shipping cost from product page HTML ──────────────────────
+// Returns: 0 if FREE shipping, positive number if paid shipping
+function extractShippingCost(html) {
+  // FREE shipping/delivery patterns
+  const freePatterns = [
+    /FREE\s+(?:delivery|shipping)/i,
+    /free\s+returns/i,
+    /"isFreeShipping"\s*:\s*true/i,
+  ];
+  for (const p of freePatterns) {
+    if (p.test(html)) return 0;
+  }
+  // Paid shipping patterns: "$4.99 shipping", "+ $6.99 shipping", "Ships for $3.99"
+  const paidPatterns = [
+    /\+\s*\$([\d.]+)\s+shipping/i,
+    /\$([\d.]+)\s+shipping/i,
+    /"shippingAmount"\s*:\s*\{"amount"\s*:\s*([\d.]+)/,
+    /"deliveryPrice"\s*:\s*\{"amount"\s*:\s*([\d.]+)/,
+    /shipping\s*&amp;\s*handling[^$]*\$([\d.]+)/i,
+  ];
+  for (const p of paidPatterns) {
+    const m = html.match(p);
+    if (m) {
+      const cost = parseFloat(m[1]);
+      if (cost > 0 && cost < 50) return cost; // sanity check
+    }
+  }
+  // If no shipping info found at all, assume free (Prime products)
+  return 0;
+}
+
 // ── Extract first hi-res image from an ASIN page ─────────────────────────────
 function extractMainImage(html) {
   // colorImages initial[0] is always the hero product shot
@@ -838,10 +869,19 @@ async function handlePush({ body, res, resolvePolicies, getCategories, aiEnrich,
   if (!product.hasVariations && !product.price && !product.cost && !product.myPrice)
     return res.status(400).json({ error: 'No price — re-import from the Import tab first.' });
 
-  const markupPct  = parseFloat(body.markup  ?? 0);
-  const handling   = parseFloat(body.handlingCost ?? 2);
-  const defaultQty = parseInt(body.quantity || product.quantity) || 1;
-  const applyMk    = makeApplyMk(markupPct, handling);
+  const markupPct      = parseFloat(body.markup  ?? 0);
+  const handling       = parseFloat(body.handlingCost ?? 2);
+  const defaultQty     = parseInt(body.quantity || product.quantity) || 1;
+  const amazonShipping = parseFloat(product.shippingCost || 0); // paid shipping on Amazon
+  // Price formula: (amazonCost + amazonShipping + handling) × markup ÷ (1−fee) + $0.30
+  const applyMk = (cost) => {
+    const c = parseFloat(cost) || 0;
+    if (c <= 0) return 0;
+    return Math.max(
+      Math.ceil(((c + amazonShipping + handling) * (1 + markupPct / 100) / (1 - 0.1335) + 0.30) * 100) / 100,
+      0.99
+    );
+  };
 
   console.log(`[push] "${product.title?.slice(0,60)}" hasVar=${product.hasVariations} imgs=${product.images?.length} markup=${markupPct}%`);
 
@@ -1073,10 +1113,19 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
   if (!access_token || !ebaySku || !sourceUrl)
     return res.status(400).json({ error: 'Missing access_token, ebaySku, or sourceUrl' });
 
-  const markupPct  = parseFloat(body.markup ?? 0);
-  const handling   = parseFloat(body.handlingCost ?? 2);
-  const defaultQty = parseInt(body.quantity) || 1;
-  const applyMk    = makeApplyMk(markupPct, handling);
+  const markupPct      = parseFloat(body.markup ?? 0);
+  const handling       = parseFloat(body.handlingCost ?? 2);
+  const defaultQty     = parseInt(body.quantity) || 1;
+  const amazonShipping = parseFloat(body.fallbackShipping || 0); // passed from cached product
+  // Price formula: (amazonCost + amazonShipping + handling) × markup ÷ (1−fee) + $0.30
+  const applyMk = (cost) => {
+    const c = parseFloat(cost) || 0;
+    if (c <= 0) return 0;
+    return Math.max(
+      Math.ceil(((c + amazonShipping + handling) * (1 + markupPct / 100) / (1 - 0.1335) + 0.30) * 100) / 100,
+      0.99
+    );
+  };
 
   console.log(`[revise] sku=${ebaySku?.slice(0,30)} markup=${markupPct}%`);
 
@@ -1624,6 +1673,7 @@ module.exports = async (req, res) => {
 
       // Price
       product.price = extractPrice(html) || 0;
+      product.shippingCost = extractShippingCost(html); // 0=FREE, >0=paid
 
       // Stock
       product.inStock = !html.toLowerCase().includes('currently unavailable');
