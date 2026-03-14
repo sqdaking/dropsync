@@ -822,6 +822,7 @@ function buildVariants({ product, groupSku, applyMk, defaultQty, body }) {
   } else if (otherGroup) {
     // Size/Style only (no color)
     for (const ov of otherGroup.values) {
+      const inStock = isInStock('', ov.value); // checks comboAsin[`|size`]
       const amazonPrice = getAmazonPrice('', ov.value);
       const ebayPrice = applyMk(amazonPrice);
       variants.push({
@@ -829,7 +830,7 @@ function buildVariants({ product, groupSku, applyMk, defaultQty, body }) {
         dims:   { [otherGroup.name]: ov.value },
         dimKey: `|${ov.value}`,
         price:  (ebayPrice > 0 ? ebayPrice : parseFloat(product.myPrice || 9.99)).toFixed(2),
-        qty:    defaultQty, // size-only: no per-combo stock data, keep all in stock
+        qty:    inStock ? defaultQty : 0,
         image:  product.images?.[0] || '',
       });
     }
