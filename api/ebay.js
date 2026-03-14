@@ -643,11 +643,21 @@ async function scrapeAmazonProduct(inputUrl) {
   product.hasVariations = hasVar;
 
   if (hasVar) {
-    // Primary dimension = Color/Colour if present, else first dim
-    const primaryDim   = allDims.find(d => /color|colour/i.test(d.name)) || allDims[0];
-    const secondaryDim = allDims.find(d => d !== primaryDim) || null;
+    // Skip any dimension with only 1 unique value (e.g. Color="Purple" only)
+    // — it adds no meaningful variation and wastes one of eBay's 2 dimension slots
+    const meaningfulDims = allDims.filter(d => d.values.length > 1);
+    // If all dims have 1 value (edge case), fall back to all dims
+    const effectiveDims = meaningfulDims.length > 0 ? meaningfulDims : allDims;
+
+    // Primary dimension = Color/Colour if present among meaningful dims, else first
+    const primaryDim   = effectiveDims.find(d => /color|colour/i.test(d.name)) || effectiveDims[0];
+    const secondaryDim = effectiveDims.find(d => d !== primaryDim) || null;
     const primaryVals   = primaryDim.values;
     const secondaryVals = secondaryDim?.values || [];
+
+    // Log skipped single-value dimensions for debugging
+    const skippedDims = allDims.filter(d => d.values.length === 1);
+    if (skippedDims.length) console.log(`[scraper] skipping single-value dims: ${skippedDims.map(d=>d.name+'='+d.values[0]).join(', ')}`);
 
     // Parse dimension order from page
     let dimOrder = null;
@@ -795,6 +805,19 @@ async function scrapeAmazonProduct(inputUrl) {
       .filter(p => p > 0);
     if (inStockPrices.length) product.price = Math.min(...inStockPrices);
     else { const allPrices = Object.values(comboPrices).filter(p=>p>0); if (allPrices.length) product.price = Math.min(...allPrices); }
+
+    // Detect if per-variant price fetches were blocked (all prices identical)
+    // This happens when Amazon redirects all per-ASIN server requests to the same page
+    const allComboPrices = Object.values(comboPrices).filter(p => p > 0);
+    const uniquePrices = [...new Set(allComboPrices)];
+    if (allComboPrices.length > 1 && uniquePrices.length === 1) {
+      // All variants returned same price — server-side fetches were blocked/redirected
+      product._pricesFailed = true;
+      product._pricesFailedReason = 'All variant prices identical — Amazon blocked per-ASIN server fetches. Cannot verify individual prices.';
+      console.warn(`[scraper] price fetch failed — all ${allComboPrices.length} combos returned $${uniquePrices[0]}`);
+    } else {
+      product._pricesFailed = false;
+    }
 
     // ── Per-color images ──────────────────────────────────────────────────────
     const colorImgMap = {};
@@ -1178,6 +1201,19 @@ async function handlePush({ body, res, resolvePolicies, getCategories, aiEnrich,
 
   const variants = buildVariants({ product, groupSku, applyMk, defaultQty, body });
   if (!variants.length) return res.status(400).json({ error: 'No variants could be built — check that the product has valid variation values.' });
+
+  // Block push if per-variant prices couldn't be verified
+  // (all prices identical = Amazon blocked per-ASIN fetches, can't price accurately)
+  if (product._pricesFailed) {
+    const allPrices = [...new Set(variants.map(v => v.price))];
+    if (allPrices.length === 1) {
+      return res.status(400).json({
+        error: `Cannot push — Amazon blocked per-variant price lookups. All ${variants.length} variants would be priced identically at $${allPrices[0]}, which is incorrect. Re-import this product later or push manually with correct prices.`,
+        code: 'PRICES_FAILED',
+        suggestion: 'Try importing this product again in a few minutes. If the issue persists, this listing type requires manual pricing.',
+      });
+    }
+  }
 
   console.log(`[push] ${variants.length} variants (${colorGroup ? colorGroup.values.length : 0} colors × ${otherGroup ? otherGroup.values.length : 1} sizes)`);
 
@@ -2308,7 +2344,7 @@ module.exports = async (req, res) => {
       if (!product.title) {
         return res.json({ success: false, error: 'Amazon blocked the request (bot detection). Wait 30 seconds and try again, or paste the URL directly.' });
       }
-      return res.json({ success: true, product, _debug: { pricesFound, imagesFound, totalColors: colorGrp?.values.length||0, colorAsinMapSize: Object.keys(colorAsinMap).length } });
+      return res.json({ success: true, product, _debug: { pricesFound, imagesFound, totalColors: colorGrp?.values.length||0, colorAsinMapSize: Object.keys(colorAsinMap).length, pricesFailed: !!product._pricesFailed, pricesFailedReason: product._pricesFailedReason } });
     }
 
     // ── PUSH: create eBay listing ─────────────────────────────────────────────
