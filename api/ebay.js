@@ -1341,9 +1341,11 @@ module.exports = async (req, res) => {
       console.log(`[push] comboAsin entries=${Object.keys(comboAsin).length} comboPrices entries=${Object.keys(comboPrices).length} markup=${markupPct}%`);
 
       if (colorGroup && sizeGroup) {
-        for (const cv of colorGroup.values.filter(v => v.enabled !== false)) {
-          for (const sv of sizeGroup.values.filter(v => v.enabled !== false)) {
+        for (const cv of colorGroup.values) {
+          for (const sv of sizeGroup.values) {
             const key = `${cv.value}|${sv.value}`;
+            // hasCombo: combo must exist on Amazon (comboAsin) AND be in stock (comboInStock)
+            // enabled flag is for UI display only — don't use it for qty determination
             const hasCombo = Object.keys(comboAsin).length === 0 || (!!comboAsin[key] && comboInStock[key] !== false);
             // Use comboPrices (per-combo) → sizePrices (per-size) → variant price → basePrice → myPrice fallback
             const amazonPrice = comboPrices[key]
@@ -1363,7 +1365,7 @@ module.exports = async (req, res) => {
           }
         }
       } else if (colorGroup) {
-        for (const cv of colorGroup.values.filter(v => v.enabled !== false)) {
+        for (const cv of colorGroup.values) {
           const key = `${cv.value}|`;
           const hasCombo = Object.keys(comboAsin).length === 0 || (!!comboAsin[key] && comboInStock[key] !== false);
           const amazonPrice = comboPrices[key] || parseFloat(cv.price || basePrice || product.myPrice || 0);
