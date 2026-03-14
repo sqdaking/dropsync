@@ -1486,7 +1486,7 @@ module.exports = async (req, res) => {
       // PUT inventory_item_group
       // Color must be FIRST in variesBy so eBay treats it as primary (image-bearing) variation
       const varAspects = {};
-      if (colorGroup) varAspects['Color'] = colorGroup.values.filter(v=>v.enabled!==false).map(v => v.value);
+      if (colorGroup) varAspects['Color'] = colorGroup.values.map(v => v.value); // all values — OOS handled via qty=0
       if (sizeGroup)  varAspects['Size']  = sizeGroup.values.map(v => v.value);
 
       // Build color→imageUrl map for eBay to display correct image per color swatch
