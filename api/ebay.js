@@ -707,16 +707,26 @@ async function scrapeAmazonProduct(inputUrl) {
     const fullPrimary = Object.entries(primaryToAsins)
       .sort((a,b) => b[1].length - a[1].length)[0]?.[0] || primaryVals[0];
 
-    // Build secondary→ASIN map for the fullPrimary
-    const secToFetchAsin = {};
-    for (const [key, asin] of Object.entries(comboAsin)) {
-      const [pv, sv] = key.split('|');
-      if (pv === fullPrimary) secToFetchAsin[sv] = asin;
-    }
-    if (!Object.keys(secToFetchAsin).length && Object.keys(comboAsin).length) {
-      // Color-only or can't find fullPrimary combos — use any asin
-      const firstAsin = Object.values(comboAsin)[0];
-      secToFetchAsin[''] = firstAsin;
+    // Build what to fetch for price+stock:
+    // - If 2 dimensions: fetch each secondary value's ASIN via fullPrimary (e.g. one color × all sizes)
+    // - If 1 dimension only (Style, Size, Flavor etc.): fetch EACH primary value's ASIN
+    const secToFetchAsin = {};  // key → asin  (key = secondaryVal or primaryVal for 1-dim)
+    if (secondaryDim) {
+      // 2 dimensions: fetch via fullPrimary's secondary ASINs
+      for (const [key, asin] of Object.entries(comboAsin)) {
+        const [pv, sv] = key.split('|');
+        if (pv === fullPrimary) secToFetchAsin[sv] = asin;
+      }
+      // Fallback: if fullPrimary has no combos mapped, use any
+      if (!Object.keys(secToFetchAsin).length && Object.keys(comboAsin).length) {
+        secToFetchAsin[''] = Object.values(comboAsin)[0];
+      }
+    } else {
+      // 1 dimension only: fetch EACH primary value's ASIN for individual price+stock
+      for (const [key, asin] of Object.entries(comboAsin)) {
+        const pv = key.split('|')[0];
+        secToFetchAsin[pv] = asin;  // key = primaryVal (not secondary)
+      }
     }
 
     const asinInStock = {};  // ASIN → true/false/undefined
@@ -747,8 +757,13 @@ async function scrapeAmazonProduct(inputUrl) {
 
     // Fill missing prices with main page price
     const mainPrice = extractPriceFromBuyBox(html) || product.price || 0;
-    for (const sv of secondaryVals) { if (!sizePrices[sv]) sizePrices[sv] = mainPrice; }
-    if (!secondaryVals.length && !sizePrices['']) sizePrices[''] = mainPrice;
+    if (secondaryDim) {
+      // 2-dim: fill missing secondary prices
+      for (const sv of secondaryVals) { if (!sizePrices[sv]) sizePrices[sv] = mainPrice; }
+    } else {
+      // 1-dim: sizePrices keys by primary val — fill any missing
+      for (const pv of primaryVals) { if (!sizePrices[pv]) sizePrices[pv] = mainPrice; }
+    }
 
     // Build comboInStock + comboPrices
     const comboInStock = {};
