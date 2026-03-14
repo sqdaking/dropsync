@@ -1028,11 +1028,11 @@ function buildVariants({ product, groupSku, applyMk, defaultQty, body }) {
   }
 
   function isInStock(pVal, sVal) {
-    if (!hasComboData) return product.inStock !== false; // no combo data → use product-level
+    if (!hasComboData) return true; // no combo data → assume in stock (safer than OOS)
     const key = `${pVal || ''}|${sVal || ''}`;
     if (!comboAsin[key]) return false;           // combo doesn't exist on Amazon
     if (comboInStock[key] === false) return false; // explicitly OOS
-    return true;
+    return true; // comboInStock = true or undefined → in stock
   }
 
   function getImage(pVal) {
@@ -1383,6 +1383,7 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
   const EBAY_API = getEbayUrls(sandbox).EBAY_API;
   const auth     = { Authorization: `Bearer ${body.access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
   const { access_token, ebaySku, sourceUrl } = body;
+  const ebayListingId = body.ebayListingId || '';
   if (!access_token || !ebaySku || !sourceUrl)
     return res.status(400).json({ error: 'Missing access_token, ebaySku, or sourceUrl' });
 
@@ -1448,8 +1449,13 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
   } else {
     // Merge fallback data into scraped product where needed
     if (!product.images?.length && fallbackImages.length) product.images = fallbackImages;
-    // If scraped product has empty comboAsin (blocked sub-fetches) but caller has cached data, use it
-    if (!Object.keys(product.comboAsin||{}).length && fallbackComboAsin) {
+    // Use fallback combo data if:
+    // (a) scrape returned no comboAsin, OR
+    // (b) scrape returned comboAsin but comboInStock is completely empty (sub-fetches blocked)
+    const scrapedComboEmpty = !Object.keys(product.comboAsin||{}).length;
+    const scrapedStockEmpty = Object.keys(product.comboAsin||{}).length > 0 &&
+                              Object.keys(product.comboInStock||{}).length === 0;
+    if ((scrapedComboEmpty || scrapedStockEmpty) && fallbackComboAsin) {
       product.comboAsin        = fallbackComboAsin;
       product.comboInStock     = fallbackComboInStock || {};
       product.comboPrices      = fallbackComboPrices  || {};
@@ -1772,11 +1778,15 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
     const basePrice    = parseFloat(product.price || 0);
 
     function getQty(pVal, sVal) {
-      if (!freshStock) return 0;
+      // No combo data at all → assume in stock (better to show in-stock than wrongly OOS)
       if (!hasComboData) return defaultQty;
       const key = `${pVal || ''}|${sVal || ''}`;
+      // Combo doesn't exist on Amazon at all → OOS
       if (!comboAsin[key]) return 0;
+      // Explicitly marked OOS in per-combo data → OOS
       if (comboInStock[key] === false) return 0;
+      // comboInStock[key] = true OR undefined (unknown) → in stock
+      // NOTE: do NOT use product-level freshStock here — it can be stale Railway data
       return defaultQty;
     }
 
