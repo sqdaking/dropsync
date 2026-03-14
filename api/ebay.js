@@ -1570,12 +1570,138 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
     `${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`,
     { headers: auth }
   ).then(r => r.json()).catch(() => null);
-  const variantSkus = grpRes?.variantSKUs || [];
-  const isVariation = variantSkus.length > 0;
-  console.log(`[revise] mode=${isVariation ? 'variation' : 'simple'} existingVarSkus=${variantSkus.length}`);
+  let variantSkus = grpRes?.variantSKUs || [];
+
+  // If group exists but variantSKUs is empty (eBay desync bug), try to recover
+  // via the offer API — offers know their SKU, and we can search by listing ID or prefix
+  if (!variantSkus.length && product.hasVariations) {
+    console.log('[revise] group has no variantSKUs — attempting recovery via offer API');
+    try {
+      // Page through all offers to find ones belonging to this listing
+      let offset = 0, found = [];
+      while (offset < 300) {
+        const oRes = await fetch(
+          `${EBAY_API}/sell/inventory/v1/offer?limit=100&offset=${offset}`,
+          { headers: auth }
+        ).then(r => r.json()).catch(() => ({}));
+        const offers = oRes.offers || [];
+        if (!offers.length) break;
+        // Match by listingId or by SKU prefix
+        const matched = offers.filter(o =>
+          o.listing?.listingId === ebayListingId ||
+          o.sku?.startsWith(ebaySku + '-') ||
+          (o.sku !== ebaySku && o.sku?.startsWith(ebaySku.slice(0, 20)))
+        );
+        found.push(...matched.map(o => o.sku));
+        if (offers.length < 100) break;
+        offset += 100;
+      }
+      if (found.length) {
+        variantSkus = [...new Set(found)].filter(s => s !== ebaySku);
+        console.log(`[revise] recovered ${variantSkus.length} variant SKUs from offers`);
+      }
+    } catch(e) { console.warn('[revise] SKU recovery failed:', e.message); }
+  }
+
+  const isVariation = variantSkus.length > 0 || product.hasVariations;
+  console.log(`[revise] mode=${variantSkus.length > 0 ? 'variation' : (product.hasVariations ? 'variation-rebuild' : 'simple')} existingVarSkus=${variantSkus.length}`);
 
   // ── STEP 4: Update listing ────────────────────────────────────────────────
   if (isVariation) {
+    // If we have no existing SKUs, build them fresh from product variations (like push)
+    // This handles the eBay group desync case + first revise after push failure
+    if (!variantSkus.length && product.hasVariations && Object.keys(product.comboAsin || {}).length > 0) {
+      console.log('[revise] no existing SKUs — rebuilding from product variations (re-push mode)');
+      const newVariants = buildVariants({ product, groupSku: ebaySku, applyMk, defaultQty, body });
+      console.log(`[revise] built ${newVariants.length} new variant SKUs`);
+      // PUT each new variant
+      const rebuildCreated = new Set();
+      // Test first
+      if (newVariants.length) {
+        const v0 = newVariants[0];
+        const itemAsp0 = { ...aspects };
+        for (const [k, val] of Object.entries(v0.dims)) itemAsp0[k] = [val];
+        const r0 = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(v0.sku)}`, {
+          method: 'PUT', headers: auth,
+          body: JSON.stringify({
+            availability: { shipToLocationAvailability: { quantity: v0.qty } },
+            condition: 'NEW',
+            product: { title: listingTitle, description: ebayDescription,
+              imageUrls: v0.image ? [v0.image] : product.images.slice(0,1), aspects: itemAsp0 },
+          }),
+        });
+        if (r0.status === 401) return res.status(401).json({ error: 'eBay token expired', code: 'INVENTORY_401' });
+        if (r0.ok || r0.status === 204) rebuildCreated.add(v0.sku);
+        else { const t = await r0.text(); console.warn(`[revise-rebuild] first item: ${r0.status} ${t.slice(0,100)}`); }
+      }
+      // Rest in batches
+      for (let i = 1; i < newVariants.length; i += 15) {
+        await Promise.all(newVariants.slice(i, i+15).map(async v => {
+          const itemAsp = { ...aspects };
+          for (const [k, val] of Object.entries(v.dims)) itemAsp[k] = [val];
+          const r = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(v.sku)}`, {
+            method: 'PUT', headers: auth,
+            body: JSON.stringify({
+              availability: { shipToLocationAvailability: { quantity: v.qty } },
+              condition: 'NEW',
+              product: { title: listingTitle, description: ebayDescription,
+                imageUrls: v.image ? [v.image] : product.images.slice(0,1), aspects: itemAsp },
+            }),
+          });
+          if (r.ok || r.status === 204) rebuildCreated.add(v.sku);
+          else { const t = await r.text(); console.warn(`[revise-rebuild] ${v.sku.slice(-20)}: ${r.status} ${t.slice(0,80)}`); }
+        }));
+        if (i + 15 < newVariants.length) await sleep(100);
+      }
+      // Group PUT with new SKUs
+      const newVariesBy = buildVariesBy(product,
+        product.variations?.find(v => v.name === product._primaryDimName) || product.variations?.[0],
+        product.variations?.find(v => v.name === product._secondaryDimName));
+      const grpAsp = { ...aspects };
+      for (const vg of (product.variations||[])) { delete grpAsp[vg.name]; delete grpAsp[vg.name.toLowerCase()]; }
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const gr = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, {
+          method: 'PUT', headers: auth,
+          body: JSON.stringify({
+            inventoryItemGroupKey: ebaySku,
+            title: listingTitle, description: ebayDescription,
+            imageUrls: product.images.slice(0,12),
+            variantSKUs: newVariants.map(v => v.sku).filter(s => rebuildCreated.has(s)),
+            aspects: grpAsp, variesBy: newVariesBy,
+          }),
+        });
+        if (gr.ok || gr.status === 204) { console.log('[revise-rebuild] group PUT ok'); break; }
+        const gt = await gr.text();
+        console.warn(`[revise-rebuild] group attempt ${attempt}: ${gr.status} ${gt.slice(0,200)}`);
+        if (attempt < 3) await sleep(600);
+      }
+      // Update offer prices
+      let rebuildPrices = 0;
+      for (let i = 0; i < newVariants.length; i += 8) {
+        await Promise.all(newVariants.slice(i, i+8).filter(v => rebuildCreated.has(v.sku)).map(async v => {
+          const ol = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(v.sku)}`, {headers:auth}).then(r=>r.json()).catch(()=>({}));
+          const offerId = (ol.offers||[])[0]?.offerId;
+          if (offerId) {
+            await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offerId}`, {
+              method:'PUT', headers:auth,
+              body: JSON.stringify({pricingSummary:{price:{value:parseFloat(v.price).toFixed(2),currency:'USD'}}}),
+            }).catch(()=>{});
+            rebuildPrices++;
+          }
+        }));
+        if (i + 8 < newVariants.length) await sleep(100);
+      }
+      console.log(`[revise-rebuild] done — ${rebuildCreated.size}/${newVariants.length} items, ${rebuildPrices} prices`);
+      return res.json({
+        success: true, type: 'variant-rebuild',
+        updatedVariants: rebuildCreated.size, pricesUpdated: rebuildPrices,
+        failed: newVariants.length - rebuildCreated.size, total: newVariants.length,
+        images: product.images.length, price: applyMk(product.price || 0),
+        inStock: product.inStock !== false, title: listingTitle,
+        priceChanges: [], stockChanges: [], imageChanges: [],
+      });
+    }
+
     // Read existing Color/Size aspects for each SKU from eBay
     const skuAspects = {}; // sku → { Color, Size, [otherDim]: value }
     for (let i = 0; i < variantSkus.length; i += 20) {
@@ -1824,6 +1950,16 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
 
   } else {
     // ── SIMPLE REVISE ─────────────────────────────────────────────────────
+    // Safety: if product has variations, do NOT treat as simple — that would set group item qty=0
+    if (product.hasVariations) {
+      console.warn('[revise] product hasVariations but no variant SKUs found — skipping to avoid OOS wipe');
+      return res.json({
+        success: false,
+        error: 'Cannot revise — listing has variations but eBay variant SKUs not found. Use Re-push to rebuild the listing.',
+        code: 'VARIATION_SKUS_MISSING',
+        suggestion: 'Click Re-push in the Listed tab to end this listing and push a fresh one.',
+      });
+    }
     const freshStock = product.inStock !== false;
     const newPrice   = applyMk(parseFloat(product.price || 0));
     const finalPrice = newPrice > 0 ? newPrice : (applyMk(fallbackPrice) || 9.99);
