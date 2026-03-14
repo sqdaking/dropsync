@@ -1505,12 +1505,48 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
     }
     console.log(`[revise] read aspects for ${Object.keys(skuAspects).length}/${variantSkus.length} SKUs`);
 
-    // Build color img map with case-insensitive fallback
-    const colorImgs = product.variationImages?.['Color'] || {};
-    const colorImgLower = Object.fromEntries(Object.entries(colorImgs).map(([k,v]) => [k.toLowerCase(), v]));
-    function getImageForColor(colorVal) {
-      if (!colorVal) return product.images[0] || '';
-      return colorImgs[colorVal] || colorImgLower[colorVal.toLowerCase()] || product.images[0] || '';
+    // Use product's actual primary/secondary dimension names (set by scraper)
+    // Fallback: primary=Color (or first aspect), secondary=everything-else
+    const revPrimaryName   = product._primaryDimName   || null;
+    const revSecondaryName = product._secondaryDimName || null;
+
+    // Build image map keyed by primary dimension value
+    const imgByPrimary = Object.assign(
+      {},
+      product.variationImages?.['Color']  || {},
+      revPrimaryName ? (product.variationImages?.[revPrimaryName] || {}) : {}
+    );
+    const imgByPrimaryLower = Object.fromEntries(Object.entries(imgByPrimary).map(([k,v]) => [k.toLowerCase(), v]));
+
+    function getImageForPrimary(pVal) {
+      if (!pVal) return product.images[0] || '';
+      return imgByPrimary[pVal] || imgByPrimaryLower[pVal.toLowerCase()] || product.images[0] || '';
+    }
+
+    // Extract primary/secondary values from a SKU's aspects dict
+    // Works for Color+Size, Style-only, Size-only, Color-only, etc.
+    function getPrimarySecondary(dimVals) {
+      if (!dimVals || !Object.keys(dimVals).length) return { pVal: null, sVal: null };
+      if (revPrimaryName && revSecondaryName) {
+        // We know exact names from scraper
+        return { pVal: dimVals[revPrimaryName] || null, sVal: dimVals[revSecondaryName] || null };
+      }
+      if (revPrimaryName) {
+        // Only primary known — secondary is whatever else is there
+        const pVal = dimVals[revPrimaryName] || null;
+        const sVal = Object.entries(dimVals).find(([k,v]) => k !== revPrimaryName && v)?.[1] || null;
+        return { pVal, sVal };
+      }
+      // Fallback: primary = Color/Colour if present, else first aspect; secondary = rest
+      const colorEntry = Object.entries(dimVals).find(([k]) => /color|colour/i.test(k));
+      if (colorEntry) {
+        const pVal = colorEntry[1];
+        const sVal = Object.entries(dimVals).find(([k,v]) => !/color|colour/i.test(k) && v)?.[1] || null;
+        return { pVal, sVal };
+      }
+      // No color — first aspect is primary
+      const entries = Object.entries(dimVals).filter(([,v]) => v);
+      return { pVal: entries[0]?.[1] || null, sVal: entries[1]?.[1] || null };
     }
 
     // Stock & price per SKU using comboAsin/comboInStock from scraped data
@@ -1522,18 +1558,18 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
     const freshStock   = product.inStock !== false;
     const basePrice    = parseFloat(product.price || 0);
 
-    function getQty(colorVal, otherVal) {
+    function getQty(pVal, sVal) {
       if (!freshStock) return 0;
       if (!hasComboData) return defaultQty;
-      const key = `${colorVal || ''}|${otherVal || ''}`;
+      const key = `${pVal || ''}|${sVal || ''}`;
       if (!comboAsin[key]) return 0;
       if (comboInStock[key] === false) return 0;
       return defaultQty;
     }
 
-    function getPrice(colorVal, otherVal) {
-      const key = `${colorVal || ''}|${otherVal || ''}`;
-      const amazonPrice = comboPrices[key] || sizePrices[otherVal || ''] || sizePrices[colorVal || ''] || basePrice || 0;
+    function getPrice(pVal, sVal) {
+      const key = `${pVal || ''}|${sVal || ''}`;
+      const amazonPrice = comboPrices[key] || sizePrices[sVal || ''] || sizePrices[pVal || ''] || basePrice || 0;
       const p = applyMk(amazonPrice);
       return p > 0 ? p : applyMk(basePrice) || 9.99;
     }
@@ -1546,17 +1582,16 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
     if (variantSkus.length > 0) {
       const sku0 = variantSkus[0];
       const dimVals = skuAspects[sku0] || {};
-      const colorVal = dimVals['Color'] || dimVals['color'] || null;
-      const otherVal = Object.entries(dimVals).find(([k]) => !/color|colour/i.test(k) && dimVals[k])?.[1] || null;
+      const { pVal: pVal0, sVal: sVal0 } = getPrimarySecondary(dimVals);
       const itemAsp  = { ...aspects, ...Object.fromEntries(Object.entries(dimVals).filter(([,v]) => v).map(([k,v]) => [k, [v]])) };
       const r0 = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku0)}`, {
         method: 'PUT', headers: auth,
         body: JSON.stringify({
-          availability: { shipToLocationAvailability: { quantity: getQty(colorVal, otherVal) } },
+          availability: { shipToLocationAvailability: { quantity: getQty(pVal0, sVal0) } },
           condition: 'NEW',
           product: {
             title: listingTitle, description: ebayDescription,
-            imageUrls: getImageForColor(colorVal) ? [getImageForColor(colorVal)] : product.images.slice(0, 1),
+            imageUrls: getImageForPrimary(pVal0) ? [getImageForPrimary(pVal0)] : product.images.slice(0, 1),
             aspects: itemAsp,
           },
         }),
@@ -1570,17 +1605,16 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
     for (let i = 1; i < variantSkus.length; i += 15) {
       await Promise.all(variantSkus.slice(i, i + 15).map(async sku => {
         const dimVals  = skuAspects[sku] || {};
-        const colorVal = dimVals['Color'] || dimVals['color'] || null;
-        const otherVal = Object.entries(dimVals).find(([k]) => !/color|colour/i.test(k) && dimVals[k])?.[1] || null;
+        const { pVal, sVal } = getPrimarySecondary(dimVals);
         const itemAsp  = { ...aspects, ...Object.fromEntries(Object.entries(dimVals).filter(([,v]) => v).map(([k,v]) => [k, [v]])) };
         const r = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
           method: 'PUT', headers: auth,
           body: JSON.stringify({
-            availability: { shipToLocationAvailability: { quantity: getQty(colorVal, otherVal) } },
+            availability: { shipToLocationAvailability: { quantity: getQty(pVal, sVal) } },
             condition: 'NEW',
             product: {
               title: listingTitle, description: ebayDescription,
-              imageUrls: getImageForColor(colorVal) ? [getImageForColor(colorVal)] : product.images.slice(0, 1),
+              imageUrls: getImageForPrimary(pVal) ? [getImageForPrimary(pVal)] : product.images.slice(0, 1),
               aspects: itemAsp,
             },
           }),
@@ -1596,17 +1630,16 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
       await sleep(800);
       await Promise.all(failedSkus.map(async sku => {
         const dimVals  = skuAspects[sku] || {};
-        const colorVal = dimVals['Color'] || dimVals['color'] || null;
-        const otherVal = Object.entries(dimVals).find(([k]) => !/color|colour/i.test(k) && dimVals[k])?.[1] || null;
+        const { pVal, sVal } = getPrimarySecondary(dimVals);
         const itemAsp  = { ...aspects, ...Object.fromEntries(Object.entries(dimVals).filter(([,v]) => v).map(([k,v]) => [k, [v]])) };
         const r = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
           method: 'PUT', headers: auth,
           body: JSON.stringify({
-            availability: { shipToLocationAvailability: { quantity: getQty(colorVal, otherVal) } },
+            availability: { shipToLocationAvailability: { quantity: getQty(pVal, sVal) } },
             condition: 'NEW',
             product: {
               title: listingTitle, description: ebayDescription,
-              imageUrls: getImageForColor(colorVal) ? [getImageForColor(colorVal)] : product.images.slice(0, 1),
+              imageUrls: getImageForPrimary(pVal) ? [getImageForPrimary(pVal)] : product.images.slice(0, 1),
               aspects: itemAsp,
             },
           }),
@@ -1617,22 +1650,37 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
 
     console.log(`[revise] inventory: ${createdSkus.size}/${variantSkus.length} updated, ${failedSkus.length} failed`);
 
-    // Group PUT — rebuild variesBy from eBay's existing SKU aspects
-    const allColors = [...new Set(Object.values(skuAspects).map(d => d['Color'] || d['color']).filter(Boolean))];
-    const allOther  = [...new Set(Object.values(skuAspects).flatMap(d => Object.entries(d).filter(([k]) => !/color|colour/i.test(k)).map(([,v]) => v)).filter(Boolean))];
-    const otherDimName = Object.keys(Object.values(skuAspects)[0] || {}).find(k => !/color|colour/i.test(k)) || 'Size';
+    // Group PUT — rebuild variesBy using actual dimension names
+    // Use scraped product data first (most accurate), fall back to reading eBay SKU aspects
+    const revPrimGrp = revPrimaryName
+      ? product.variations?.find(v => v.name === revPrimaryName)
+      : product.variations?.find(v => /color|colour/i.test(v.name)) || product.variations?.[0];
+    const revSecGrp  = revSecondaryName
+      ? product.variations?.find(v => v.name === revSecondaryName)
+      : product.variations?.find(v => v !== revPrimGrp);
 
-    // Also use scraped variation values if available (more accurate)
-    const colorGroup = product.variations?.find(v => /color|colour/i.test(v.name));
-    const otherGroup = product.variations?.find(v => !/color|colour/i.test(v.name));
-    const colorValues = colorGroup ? colorGroup.values.map(v => v.value) : allColors;
-    const otherValues = otherGroup ? otherGroup.values.map(v => v.value) : allOther;
+    // Fall back to reading existing eBay aspects if no scraped data
+    const allPrimVals = revPrimGrp
+      ? revPrimGrp.values.map(v => v.value)
+      : [...new Set(Object.values(skuAspects).map(d => d[revPrimaryName] || Object.values(d)[0]).filter(Boolean))];
+    const allSecVals  = revSecGrp
+      ? revSecGrp.values.map(v => v.value)
+      : [...new Set(Object.values(skuAspects).flatMap(d => Object.entries(d).filter(([k]) => k !== revPrimaryName).map(([,v]) => v)).filter(Boolean))];
+
+    // Dimension names for specs
+    const primDimName = revPrimGrp?.name || revPrimaryName || Object.keys(Object.values(skuAspects)[0] || {})[0] || 'Style';
+    const secDimName  = revSecGrp?.name  || revSecondaryName || Object.keys(Object.values(skuAspects)[0] || {}).find(k => k !== primDimName) || 'Size';
 
     const groupAspects = { ...aspects };
-    delete groupAspects['Color']; delete groupAspects['Size'];
+    for (const vg of (product.variations || [])) { delete groupAspects[vg.name]; delete groupAspects[vg.name.toLowerCase()]; }
+    delete groupAspects['Color']; delete groupAspects['Size']; // always remove these too
+
     const specs = [];
-    if (colorValues.length) specs.push({ name: 'Color', values: colorValues });
-    if (otherValues.length) specs.push({ name: otherDimName, values: otherValues });
+    if (allPrimVals.length) specs.push({ name: primDimName, values: allPrimVals });
+    if (allSecVals.length)  specs.push({ name: secDimName,  values: allSecVals  });
+
+    // Image varies by primary only if it's color-like
+    const isColorPrim = /color|colour/i.test(primDimName);
 
     for (let attempt = 1; attempt <= 3; attempt++) {
       const gr = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, {
@@ -1645,7 +1693,7 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
           variantSKUs: variantSkus.filter(s => createdSkus.has(s)),
           aspects:     groupAspects,
           variesBy: {
-            aspectsImageVariesBy: colorValues.length ? ['Color'] : [],
+            aspectsImageVariesBy: isColorPrim ? [primDimName] : [],
             specifications: specs,
           },
         }),
@@ -1662,9 +1710,8 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
       await Promise.all(variantSkus.slice(i, i + 8).map(async sku => {
         if (!createdSkus.has(sku)) return;
         const dimVals  = skuAspects[sku] || {};
-        const colorVal = dimVals['Color'] || dimVals['color'] || null;
-        const otherVal = Object.entries(dimVals).find(([k]) => !/color|colour/i.test(k) && dimVals[k])?.[1] || null;
-        const price    = getPrice(colorVal, otherVal);
+        const { pVal: ppVal, sVal: psVal } = getPrimarySecondary(dimVals);
+        const price    = getPrice(ppVal, psVal);
         const ol = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers: auth }).then(r => r.json()).catch(() => ({}));
         const offerId = (ol.offers || [])[0]?.offerId;
         if (offerId) {
