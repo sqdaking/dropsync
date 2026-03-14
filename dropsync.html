@@ -670,6 +670,7 @@ function buildProd() {
     inStock: IMP.inStock !== false,
     status: 'draft',
     ebaySku: '', ebayListingId: '',
+    shippingCost: IMP?.shippingCost || 0,
     createdAt: new Date().toISOString(), lastSynced: null,
     // Required for variant filtering and pricing on push
     comboAsin:   IMP.comboAsin   || {},
@@ -1634,10 +1635,11 @@ async function syncOne(pid) {
         markup: S.markup,
         handlingCost: S.handlingCost,
         sandbox: S.sandboxMode || false,
-        fallbackImages:  p.images || [],
-        fallbackTitle:   p.title  || '',
-        fallbackPrice:   p.cost   || p.price || p.amazonPrice || p.myPrice || 0,
-        fallbackInStock: p.inStock !== false && (p.quantity || 1) > 0,
+        fallbackImages:   p.images || [],
+        fallbackTitle:    p.title  || '',
+        fallbackPrice:    p.cost   || p.price || p.amazonPrice || p.myPrice || 0,
+        fallbackShipping: p.shippingCost || 0,
+        fallbackInStock:  p.inStock !== false && (p.quantity || 1) > 0,
       }),
     });
     const raw = await r.text();
@@ -1717,10 +1719,11 @@ async function syncAll() {
           markup: S.markup,
           handlingCost: S.handlingCost,
           sandbox: S.sandboxMode || false,
-          fallbackImages:  p.images || [],
-          fallbackTitle:   p.title  || '',
-          fallbackPrice:   p.cost   || p.price || p.amazonPrice || p.myPrice || 0,
-          fallbackInStock: p.inStock !== false && (p.quantity || 1) > 0,
+          fallbackImages:   p.images || [],
+          fallbackTitle:    p.title  || '',
+          fallbackPrice:    p.cost   || p.price || p.amazonPrice || p.myPrice || 0,
+          fallbackShipping: p.shippingCost || 0,
+          fallbackInStock:  p.inStock !== false && (p.quantity || 1) > 0,
         }),
       });
       const d = await r.json();
