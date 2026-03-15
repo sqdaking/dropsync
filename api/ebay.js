@@ -3541,6 +3541,25 @@ Return ONLY the optimized title text, nothing else. No quotes, no explanation.` 
         freshProduct = await scrapeAmazonProduct(sourceUrl, clientHtmlReplenish);
       } catch(e) { console.warn('[replenish] scrape error:', e.message); }
 
+      // ── STEP 3b: Multi-ASIN mismatch guard ────────────────────────────────
+      // Detect the case where: eBay listing IS a variation group (multiple colors/sizes)
+      // BUT the Amazon sourceUrl is a child ASIN from a multi-ASIN page (separate ASINs
+      // per color, not a true parent-child variation). Scraping one child ASIN returns
+      // hasVariations=false, which would incorrectly overwrite all eBay variants.
+      //
+      // Detection: eBay group has variant SKUs  AND  Amazon scrape → no variations
+      if (freshProduct && variantSkusR.length > 0 && freshProduct.hasVariations === false) {
+        console.warn(`[replenish] multi-ASIN mismatch: eBay has ${variantSkusR.length} variants but Amazon URL is a simple/child ASIN`);
+        // Rollback the wipe (listing stayed alive so nothing to restore — just return error)
+        return res.status(422).json({
+          success: false,
+          rolledBack: false,
+          multiAsinMismatch: true,
+          errors: ['Multi-ASIN listing — replenish not supported'],
+          message: `This eBay listing has ${variantSkusR.length} variants but the Amazon source URL (${sourceUrl.slice(0, 60)}) is a single product page (each color is a separate ASIN). Replenish cannot safely update all variants from one color's page. Use Re-push instead, or link to the variation parent ASIN.`,
+        });
+      }
+
       // ── STEP 4: Validate scraped data — adapted to listing type ─────────────
       // Handles: simple listing, single-dim variation, two-dim variation,
       //          child ASIN (psc=1 redirect), bundle, blocked scrape
