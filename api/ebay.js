@@ -3,14 +3,14 @@
 
 const SCOPES = 'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.inventory https://api.ebay.com/oauth/api_scope/sell.account https://api.ebay.com/oauth/api_scope/sell.fulfillment';
 
-function getEbayUrls(sandbox) {
+function getEbayUrls() {
   return {
-    EBAY_API:     sandbox ? 'https://api.sandbox.ebay.com'                           : 'https://api.ebay.com',
-    EBAY_AUTH:    sandbox ? 'https://auth.sandbox.ebay.com/oauth2/authorize'         : 'https://auth.ebay.com/oauth2/authorize',
-    EBAY_TOK:     sandbox ? 'https://api.sandbox.ebay.com/identity/v1/oauth2/token'  : 'https://api.ebay.com/identity/v1/oauth2/token',
-    CLIENT_ID:    sandbox ? process.env.EBAY_SANDBOX_CLIENT_ID     : process.env.EBAY_CLIENT_ID,
-    CLIENT_SECRET:sandbox ? process.env.EBAY_SANDBOX_CLIENT_SECRET : process.env.EBAY_CLIENT_SECRET,
-    REDIRECT:     sandbox ? (process.env.EBAY_SANDBOX_REDIRECT_URI || process.env.EBAY_REDIRECT_URI) : process.env.EBAY_REDIRECT_URI,
+    EBAY_API:     'https://api.ebay.com',
+    EBAY_AUTH:    'https://auth.ebay.com/oauth2/authorize',
+    EBAY_TOK:     'https://api.ebay.com/identity/v1/oauth2/token',
+    CLIENT_ID:    process.env.EBAY_CLIENT_ID,
+    CLIENT_SECRET:process.env.EBAY_CLIENT_SECRET,
+    REDIRECT:     process.env.EBAY_REDIRECT_URI,
   };
 }
 
@@ -311,8 +311,8 @@ function extractColorAsinMaps(html) {
 }
 
 // ── eBay Taxonomy API: get leaf category suggestions ─────────────────────────
-async function getCategories(title, token, sandbox=false) {
-  const EBAY_API = getEbayUrls(sandbox).EBAY_API;
+async function getCategories(title, token) {
+  const EBAY_API = getEbayUrls().EBAY_API;
   try {
     const r = await fetch(
       `${EBAY_API}/commerce/taxonomy/v1/category_tree/0/get_category_suggestions?q=${encodeURIComponent(title.slice(0,80))}`,
@@ -385,8 +385,8 @@ CRITICAL: categoryId MUST be a LEAF category from the suggestions list. Never pi
 }
 
 // ── Resolve all 3 eBay policies, auto-create if missing ───────────────────────
-async function resolvePolicies(token, supplied, sandbox=false) {
-  const EBAY_API = getEbayUrls(sandbox).EBAY_API;
+async function resolvePolicies(token, supplied) {
+  const EBAY_API = getEbayUrls().EBAY_API;
   const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
   const p = {
     fulfillmentPolicyId: (supplied.fulfillmentPolicyId || '').trim(),
@@ -480,8 +480,8 @@ async function resolvePolicies(token, supplied, sandbox=false) {
 }
 
 // ── Ensure merchant location exists ──────────────────────────────────────────
-async function ensureLocation(auth, sandbox=false) {
-  const EBAY_API = getEbayUrls(sandbox).EBAY_API;
+async function ensureLocation(auth) {
+  const EBAY_API = getEbayUrls().EBAY_API;
   const r = await fetch(`${EBAY_API}/sell/inventory/v1/location`, { headers: auth }).then(r => r.json()).catch(() => ({}));
   if ((r.locations || []).length) {
     const key = r.locations[0].merchantLocationKey;
@@ -1107,8 +1107,7 @@ function buildVariesBy(product, primaryGroup, secondaryGroup) {
 // ─── PUSH action ──────────────────────────────────────────────────────────────
 
 async function handlePush({ body, res, resolvePolicies, getCategories, aiEnrich, sanitizeTitle, ensureLocation, buildOffer, sleep, getEbayUrls }) {
-  const sandbox  = body.sandbox === true || body.sandbox === 'true';
-  const EBAY_API = getEbayUrls(sandbox).EBAY_API;
+  const EBAY_API = getEbayUrls().EBAY_API;
   const auth     = { Authorization: `Bearer ${body.access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
   const { access_token, product, fulfillmentPolicyId, paymentPolicyId, returnPolicyId } = body;
   if (!access_token || !product) return res.status(400).json({ error: 'Missing access_token or product' });
@@ -1437,8 +1436,7 @@ async function handlePush({ body, res, resolvePolicies, getCategories, aiEnrich,
 // ─── REVISE action ─────────────────────────────────────────────────────────────
 
 async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle, sleep, getEbayUrls }) {
-  const sandbox  = body.sandbox === true || body.sandbox === 'true';
-  const EBAY_API = getEbayUrls(sandbox).EBAY_API;
+  const EBAY_API = getEbayUrls().EBAY_API;
   const auth     = { Authorization: `Bearer ${body.access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
   const { access_token, ebaySku, sourceUrl } = body;
   const ebayListingId = body.ebayListingId || '';
@@ -1833,15 +1831,15 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
     const basePrice    = parseFloat(product.price || 0);
 
     function getQty(pVal, sVal) {
-      // No combo data at all → assume in stock (better to show in-stock than wrongly OOS)
+      // No combo data at all → assume in stock (better safe than ending the listing)
       if (!hasComboData) return defaultQty;
       const key = `${pVal || ''}|${sVal || ''}`;
-      // Combo doesn't exist on Amazon at all → OOS
-      if (!comboAsin[key]) return 0;
       // Explicitly marked OOS in per-combo data → OOS
       if (comboInStock[key] === false) return 0;
-      // comboInStock[key] = true OR undefined (unknown) → in stock
-      // NOTE: do NOT use product-level freshStock here — it can be stale Railway data
+      // Key not found OR comboInStock[key]=true/undefined → in stock
+      // NOTE: We do NOT return 0 when comboAsin[key] is missing because
+      // eBay stored aspect names (e.g. "3 Pack (Black-white-blue)") may differ
+      // slightly from Amazon's current names, causing false OOS on all variants.
       return defaultQty;
     }
 
@@ -2080,21 +2078,17 @@ module.exports = async (req, res) => {
 
     // ── AUTH ──────────────────────────────────────────────────────────────────
     if (action === 'auth') {
-      const sandbox = req.query.sandbox === 'true';
-      const E = getEbayUrls(sandbox);
+      const E = getEbayUrls();
       const REDIRECT = E.REDIRECT || `${req.headers['x-forwarded-proto']||'https'}://${req.headers.host}/api/ebay?action=callback`;
-      console.log(`[auth] sandbox=${sandbox} client_id=${E.CLIENT_ID?.slice(0,20)} redirect=${REDIRECT}`);
-      const url = `${E.EBAY_AUTH}?client_id=${E.CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code&scope=${encodeURIComponent(SCOPES)}&state=${sandbox?'sandbox':'production'}`;
-      return res.json({ url, sandbox });
+      const url = `${E.EBAY_AUTH}?client_id=${E.CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code&scope=${encodeURIComponent(SCOPES)}&state=production`;
+      return res.json({ url });
     }
 
     if (action === 'callback') {
-      // Detect sandbox from state param passed through OAuth flow
-      const sandbox = req.query.state === 'sandbox' || req.query.sandbox === 'true' || process.env.EBAY_SANDBOX === 'true';
-      const E = getEbayUrls(sandbox);
+      const E = getEbayUrls();
       const REDIRECT = E.REDIRECT || `${req.headers['x-forwarded-proto']||'https'}://${req.headers.host}/api/ebay?action=callback`;
       const creds = Buffer.from(`${E.CLIENT_ID}:${E.CLIENT_SECRET}`).toString('base64');
-      console.error(`[callback] sandbox=${sandbox} tok_url=${E.EBAY_TOK} client=${E.CLIENT_ID?.slice(0,25)} redirect=${REDIRECT}`);
+      console.error(`[callback] tok_url=${E.EBAY_TOK} client=${E.CLIENT_ID?.slice(0,25)} redirect=${REDIRECT}`);
       const r = await fetch(E.EBAY_TOK, {
         method: 'POST',
         headers: { Authorization: `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -2135,8 +2129,7 @@ module.exports = async (req, res) => {
     }
 
     if (action === 'refresh') {
-      const sandbox = (body.sandbox || req.query.sandbox) === 'true';
-      const E = getEbayUrls(sandbox);
+      const E = getEbayUrls();
       const creds = Buffer.from(`${E.CLIENT_ID}:${E.CLIENT_SECRET}`).toString('base64');
       const r = await fetch(E.EBAY_TOK, {
         method: 'POST',
@@ -2150,8 +2143,7 @@ module.exports = async (req, res) => {
 
     // ── TEST CREDS ───────────────────────────────────────────────────────────
     if (action === 'test_creds') {
-      const sandbox = req.query.sandbox === 'true';
-      const E = getEbayUrls(sandbox);
+      const E = getEbayUrls();
       // Try client credentials grant to verify client_id/secret work
       const creds = Buffer.from(`${E.CLIENT_ID}:${E.CLIENT_SECRET}`).toString('base64');
       const r = await fetch(E.EBAY_TOK, {
@@ -2160,15 +2152,14 @@ module.exports = async (req, res) => {
         body: `grant_type=client_credentials&scope=${encodeURIComponent('https://api.ebay.com/oauth/api_scope')}`,
       });
       const d = await r.json();
-      return res.json({ sandbox, client_id: E.CLIENT_ID, has_secret: !!E.CLIENT_SECRET, result: d });
+      return res.json({ client_id: E.CLIENT_ID, has_secret: !!E.CLIENT_SECRET, result: d });
     }
 
     // ── POLICIES ─────────────────────────────────────────────────────────────
     if (action === 'policies') {
       const token = body.access_token || req.query.access_token;
       if (!token) return res.status(400).json({ error: 'No token' });
-      const sandbox = body.sandbox === true || body.sandbox === 'true' || req.query.sandbox === 'true';
-      const EBAY_API = getEbayUrls(sandbox).EBAY_API;
+      const EBAY_API = getEbayUrls().EBAY_API;
       const auth = { Authorization: `Bearer ${token}`, 'Accept-Language': 'en-US' };
       const [fp, pp, rp] = await Promise.all([
         fetch(`${EBAY_API}/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US`, { headers: auth }).then(r => r.json()),
@@ -2616,7 +2607,7 @@ module.exports = async (req, res) => {
     if (action === 'fetchMyListings') {
       const { access_token } = body;
       if (!access_token) return res.status(400).json({ error: 'Missing access_token' });
-      const EBAY_API = getEbayUrls(false).EBAY_API;
+      const EBAY_API = getEbayUrls().EBAY_API;
       const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
 
       const allListings = [];
@@ -2778,8 +2769,7 @@ module.exports = async (req, res) => {
       if (!access_token || !ebaySku || !sourceUrl) {
         return res.status(400).json({ error: 'Missing access_token, ebaySku, or sourceUrl' });
       }
-      const sandbox    = body.sandbox === true || body.sandbox === 'true';
-      const EBAY_API   = getEbayUrls(sandbox).EBAY_API;
+      const EBAY_API   = getEbayUrls().EBAY_API;
       const markupPct  = parseFloat(body.markup ?? 0);
       const handling   = parseFloat(body.handlingCost ?? 2);
       const ebayFee    = 0.1335;
@@ -3368,8 +3358,7 @@ Return ONLY the optimized title text, nothing else. No quotes, no explanation.` 
 
     if (action === 'endListing') {
       const { access_token, ebaySku, ebayListingId } = body;
-      const sandbox = body.sandbox === true || body.sandbox === 'true';
-      const EBAY_API = getEbayUrls(sandbox).EBAY_API;
+      const EBAY_API = getEbayUrls().EBAY_API;
       const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
       let ended = 0;
       const variantSkus = [];
@@ -3454,12 +3443,11 @@ Return ONLY the optimized title text, nothing else. No quotes, no explanation.` 
     // Unlike revise (which merges), replenish CLEARS everything first then rewrites
     // from scratch using fresh Amazon data. Same listing ID preserved. Rolls back on fail.
     if (action === 'replenish') {
-      const { access_token, ebaySku, sourceUrl, markup, handlingCost, quantity, sandbox: sb } = body;
+      const { access_token, ebaySku, sourceUrl, markup, handlingCost, quantity } = body;
       const markupReplenish   = parseFloat(markup ?? 0);
       const handlingReplenish = parseFloat(handlingCost ?? 2);
       const defaultQtyR       = parseInt(quantity) || 1;
-      const sandboxR          = sb === true || sb === 'true';
-      const EBAY_API_R        = getEbayUrls(sandboxR).EBAY_API;
+      const EBAY_API_R        = getEbayUrls().EBAY_API;
       const authR             = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
 
       if (!access_token || !ebaySku || !sourceUrl)
@@ -3677,7 +3665,7 @@ Return ONLY the optimized title text, nothing else. No quotes, no explanation.` 
     if (action === 'recoverSkus') {
       const { access_token } = body;
       if (!access_token) return res.status(400).json({ error: 'Missing access_token' });
-      const EBAY_API = getEbayUrls(false).EBAY_API;
+      const EBAY_API = getEbayUrls().EBAY_API;
       const auth = { Authorization: `Bearer ${access_token}`, 'Accept-Language': 'en-US' };
       const skuMap = {}; // listingId → sku
       let offset = 0, hasMore = true;
