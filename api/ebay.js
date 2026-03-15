@@ -2862,20 +2862,25 @@ module.exports = async (req, res) => {
       return handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle, sleep, getEbayUrls });
     }
 
-    // ── SYNC: same strategy as push/revise, keeps existing listing ID ────────────
+    // ── SYNC: price + stock ONLY — no images, no AI, no scraping ────────────────
+    // Worker job: update offer price and inventory qty per variant using cached
+    // combo data. Never touches title, description, images, or aspects.
     if (action === 'sync') {
-      // Strategy: identical to revise — full inventory item PUT (title+desc+images+aspects+qty)
-      // + group PUT + offer price update. Returns a diff summary of what changed.
       const { access_token, ebaySku, sourceUrl } = body;
       if (!access_token || !ebaySku || !sourceUrl) {
         return res.status(400).json({ error: 'Missing access_token, ebaySku, or sourceUrl' });
       }
-      const EBAY_API   = getEbayUrls().EBAY_API;
-      const markupPct  = parseFloat(body.markup ?? 0);
-      const handling   = parseFloat(body.handlingCost ?? 2);
-      const ebayFee    = 0.1335;
-      const defaultQty = parseInt(body.quantity) || 1;
-      const applyMk    = (cost) => {
+
+      // Normalise variant SKU → group SKU
+      const rawSkuSync = ebaySku;
+      const groupSkuSync = rawSkuSync.replace(/^(DS-\d{10,14}-[A-Z0-9]{4,8})-[A-Z0-9_]+$/, '$1');
+
+      const EBAY_API_S  = getEbayUrls().EBAY_API;
+      const markupPct   = parseFloat(body.markup ?? 0);
+      const handling    = parseFloat(body.handlingCost ?? 2);
+      const ebayFee     = 0.1335;
+      const defaultQty  = parseInt(body.quantity) || 1;
+      const applyMk     = (cost) => {
         const c = parseFloat(cost) || 0;
         if (c <= 0) return 0;
         return Math.max(Math.ceil(((c + handling) * (1 + markupPct / 100) / (1 - ebayFee) + 0.30) * 100) / 100, 0.99);
@@ -2886,429 +2891,219 @@ module.exports = async (req, res) => {
         'Content-Language': 'en-US',
         'Accept-Language':  'en-US',
       };
-      console.log(`[sync] sku=${ebaySku?.slice(0,35)} markup=${markupPct}%`);
 
-      // ── STEP 1: Full Amazon scrape ────────────────────────────────────────────
-      // Use client-provided HTML if available (bypasses Vercel IP blocking)
-      const clientHtmlSync = body.clientHtml || null;
-      let product = null;
+      // ── Get price / stock data from cached fallback (no Amazon scrape) ──────
+      const fallbackPrice        = parseFloat(body.fallbackPrice) || 0;
+      const fallbackInStock      = body.fallbackInStock !== false;
+      const comboAsin            = body.fallbackComboAsin    || {};
+      const comboInStock         = body.fallbackComboInStock || {};
+      const comboPrices          = body.fallbackComboPrices  || {};
+      const sizePrices           = (body.fallbackVariations  || []).reduce((acc, v) => {
+        for (const val of (v.values || [])) if (val.price) acc[val.value] = parseFloat(val.price);
+        return acc;
+      }, {});
+      const basePrice            = parseFloat(fallbackPrice) || 0;
+      const hasComboData         = Object.keys(comboInStock).length > 0 || Object.keys(comboPrices).length > 0;
 
-      if (clientHtmlSync) console.log('[sync] using client-provided HTML — skipping server-side fetch');
-      product = await scrapeAmazonProduct(sourceUrl, clientHtmlSync).catch(e => { console.warn('[sync] scrape failed:', e.message); return null; });
+      // Fuzzy normalised lookup (handles capitalisation/spacing differences)
+      const _nv = v => (v || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const _ciN = {}, _cpN = {};
+      for (const [k, v] of Object.entries(comboInStock)) { const [p,s]=k.split('|'); _ciN[`${_nv(p)}|${_nv(s)}`]=v; }
+      for (const [k, v] of Object.entries(comboPrices))  { const [p,s]=k.split('|'); _cpN[`${_nv(p)}|${_nv(s)}`]=v; }
 
-      // Fallback to cached frontend data if Amazon blocked
-      const fallbackImages  = Array.isArray(body.fallbackImages) ? body.fallbackImages.filter(u => typeof u === 'string' && u.startsWith('http')) : [];
-      const fallbackPrice   = parseFloat(body.fallbackPrice) || 0;
-      const fallbackInStock = body.fallbackInStock !== false;
-      const fallbackTitle   = typeof body.fallbackTitle === 'string' ? body.fallbackTitle : '';
-
-      if (!product) {
-        // Amazon blocked — use any cached data from frontend (images, price, title)
-        if (fallbackTitle || fallbackPrice > 0 || fallbackImages.length) {
-          console.log(`[sync] scrape blocked — using cached fallback: title="${fallbackTitle?.slice(0,40)}" imgs=${fallbackImages.length} price=$${fallbackPrice}`);
-          product = {
-            title: fallbackTitle || 'Product', price: fallbackPrice, images: fallbackImages,
-            inStock: fallbackInStock, hasVariations: false, variations: [], variationImages: {},
-            comboPrices: {}, sizePrices: {}, aspects: {}, breadcrumbs: [], bullets: [], descriptionPara: '',
-          };
-        }
-      } else if (!product.images?.length && fallbackImages.length) {
-        product.images = fallbackImages;
-      }
-
-      if (!product) {
-        return res.status(400).json({ error: 'Amazon is blocking requests and no cached data is available. Open the product on the Import tab to refresh it first.' });
-      }
-      console.log(`[sync] scraped: "${product.title?.slice(0,50)}" imgs=${product.images.length} price=$${product.price} hasVar=${product.hasVariations}`);
-
-      // ── STEP 2: AI category + title + aspects (same as push/revise) ─────────
-      const suggestions = await getCategories(product.title || '', access_token).catch(() => []);
-      const ai          = await aiEnrich(product.title, product.breadcrumbs || [], product.aspects || {}, suggestions).catch(() => null);
-      const categoryId  = ai?.categoryId || suggestions[0]?.id || '11450';
-      const rawTitle    = product.ebayTitle || ai?.title || product.title || 'Product';
-      const listingTitle = sanitizeTitle(rawTitle) || sanitizeTitle(product.title) || 'Product';
-
-      // ── STEP 3: Build description (same as push/revise) ──────────────────────
-      const buildEbayDesc = (title, bullets, para, asp) => {
-        const bulletHtml = (bullets || []).length
-          ? '<ul>' + bullets.map(b => `<li>${String(b).replace(/</g,'&lt;').replace(/>/g,'&gt;')}</li>`).join('') + '</ul>' : '';
-        const specRows = Object.entries(asp || {})
-          .filter(([k,v]) => !['ASIN','UPC','Color','Size','Brand Name','Brand'].includes(k) && v[0] && String(v[0]).length < 80)
-          .slice(0, 10).map(([k,v]) => `<tr><td><b>${k}</b></td><td>${v[0]}</td></tr>`).join('');
-        const specsTable = specRows
-          ? `<br/><table border="0" cellpadding="4" cellspacing="0" width="100%"><tbody>${specRows}</tbody></table>` : '';
-        return [`<h2>${title}</h2>`, bulletHtml, para ? `<p>${para}</p>` : '', specsTable,
-          '<br/><p style="font-size:11px;color:#888">Ships from US. Item is new. Please message us with any questions before purchasing.</p>',
-        ].filter(Boolean).join('\n');
-      };
-      const ebayDescription = buildEbayDesc(listingTitle, product.bullets || [], product.descriptionPara || '', product.aspects || '')
-                           || product.description || listingTitle;
-
-      const aspects = { ...(product.aspects || {}), ...(ai?.aspects || {}) };
-      delete aspects['Color']; delete aspects['color'];
-      delete aspects['Size'];  delete aspects['size'];
-
-      // Auto-fill required item specifics
-      try {
-        const catMeta = await fetch(
-          `${EBAY_API}/commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category?category_id=${categoryId}`,
-          { headers: { Authorization: `Bearer ${access_token}`, 'Accept-Language': 'en-US' } }
-        ).then(r => r.json()).catch(() => ({}));
-        for (const aspect of (catMeta.aspects || [])) {
-          const name = aspect.aspectConstraint?.aspectRequired ? aspect.localizedAspectName : null;
-          if (!name || aspects[name]) continue;
-          const vals = (aspect.aspectValues || []).map(v => v.localizedValue);
-          if (!vals.length) continue;
-          const match = vals.find(v => (product.title || '').toLowerCase().includes(v.toLowerCase())) || vals[0];
-          aspects[name] = [match];
-        }
-      } catch(e) { console.warn('[sync] aspects fetch failed:', e.message); }
-
-      const freshStock  = product.inStock !== false;
-      const colorGroup  = product.variations?.find(v => /color|colour/i.test(v.name));
-      const sizeGroup   = product.variations?.find(v => /size/i.test(v.name));
-      const colorImgs   = product.variationImages?.['Color'] || {};
-      const comboPrices = product.comboPrices || {};
-      const sizePrices  = product.sizePrices  || {};
-      const comboAsin   = product.comboAsin   || {};
-      const comboInStock = product.comboInStock || {};
-      const basePrice   = parseFloat(product.price || 0);
-
-      // Fuzzy-normalised lookup tables (handles eBay vs Amazon name differences)
-      const _normV = v => (v || '').toLowerCase().replace(/\s+/g,' ').trim();
-      const _ciNorm = {}, _cpNorm = {};
-      for (const [k, v] of Object.entries(comboInStock)) { const [p,s]=k.split('|'); _ciNorm[`${_normV(p)}|${_normV(s)}`]=v; }
-      for (const [k, v] of Object.entries(comboPrices))  { const [p,s]=k.split('|'); _cpNorm[`${_normV(p)}|${_normV(s)}`]=v; }
-
-      const _lookupInStock = (c, s) => {
+      const lookupStock = (c, s) => {
         const e=`${c||''}|${s||''}`; if (comboInStock[e]!==undefined) return comboInStock[e];
-        const n=`${_normV(c)}|${_normV(s)}`; return _ciNorm[n];
+        return _ciN[`${_nv(c)}|${_nv(s)}`];
       };
-      const _lookupPrice = (c, s) => {
+      const lookupPrice = (c, s) => {
         const e=`${c||''}|${s||''}`; if (comboPrices[e]) return comboPrices[e];
-        const n=`${_normV(c)}|${_normV(s)}`; if (_cpNorm[n]) return _cpNorm[n];
+        if (_cpN[`${_nv(c)}|${_nv(s)}`]) return _cpN[`${_nv(c)}|${_nv(s)}`];
         return sizePrices[s||''] || sizePrices[c||''] || basePrice || 0;
       };
 
-      // Per-variant price — fuzzy combo lookup
-      const getPriceForVariant = (color, size) => {
-        const cv  = colorGroup?.values?.find(v => v.value === color);
-        const sv  = sizeGroup?.values?.find(v => v.value === size);
-        const amazonPrice = _lookupPrice(color, size)
-                         || parseFloat(cv?.price || sv?.price || basePrice || 0);
-        const p = applyMk(amazonPrice);
+      const getQtySync = (c, s) => {
+        if (!fallbackInStock) return 0;
+        if (!hasComboData) return defaultQty;
+        const inStock = lookupStock(c, s);
+        return inStock === false ? 0 : defaultQty;
+      };
+      const getPriceSync = (c, s) => {
+        const p = applyMk(lookupPrice(c, s));
         return p > 0 ? p : applyMk(basePrice) || 9.99;
       };
 
-      // Per-variant qty — fuzzy OOS matching (only 0 if explicitly OOS on Amazon)
-      const getQtyForVariant = (color, size) => {
-        if (!freshStock) return 0;
-        if (Object.keys(comboInStock).length) {
-          const inStock = _lookupInStock(color, size);
-          if (inStock === false) return 0; // explicitly OOS
-          return defaultQty; // in stock or unknown → keep available
-        }
-        return defaultQty;
-      };
+      const priceChanges = [], stockChanges = [];
 
-      // Per-color image — same as push/revise
-      const getImageForColor = (color) =>
-        (color ? colorImgs[color] : null) || product.images[0] || '';
-
-      console.log(`[sync] comboPrices=${Object.keys(comboPrices).length} sizePrices=${Object.keys(sizePrices).length} comboAsin=${Object.keys(comboAsin).length}`);
-
-      // ── STEP 4: Get existing variant SKUs from eBay ──────────────────────────
-      const groupRes    = await fetch(
-        `${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`,
+      // ── Check if variation or simple ────────────────────────────────────────
+      const grpRes     = await fetch(
+        `${EBAY_API_S}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(groupSkuSync)}`,
         { headers: auth }
-      ).then(r => r.json()).catch(() => null);
-      const variantSkus = groupRes?.variantSKUs || [];
-      const isVariation = variantSkus.length > 0;
-      console.log(`[sync] type=${isVariation?'variation':'simple'} variantSkus=${variantSkus.length}`);
+      ).then(r => r.ok ? r.json() : null).catch(() => null);
+      const variantSkusSync = grpRes?.variantSKUs || [];
+      const isVarSync = variantSkusSync.length > 0;
 
-      // Change tracking
-      const priceChanges = [], stockChanges = [], imageChanges = [];
+      console.log(`[sync] sku=${groupSkuSync.slice(0,30)} type=${isVarSync?'variation':'simple'} markup=${markupPct}% hasCombo=${hasComboData}`);
 
-      if (isVariation) {
-        // ── VARIATION: full inventory PUT per variant (same as push/revise) ────
-
-        // Read Color+Size aspects for all existing variant SKUs from eBay
-        const skuAspects = {};  // sku → { Color, Size }
-        for (let i = 0; i < variantSkus.length; i += 20) {
-          const batch = variantSkus.slice(i, i + 20);
-          const qs    = batch.map(s => `sku=${encodeURIComponent(s)}`).join('&');
-          const bd    = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item?${qs}`, { headers: auth })
+      if (isVarSync) {
+        // ── VARIATION: update only qty + price per variant ───────────────────
+        // Read current Color/Size aspects for each SKU
+        const skuAsp = {};
+        for (let i = 0; i < variantSkusSync.length; i += 20) {
+          const qs = variantSkusSync.slice(i, i+20).map(s => `sku=${encodeURIComponent(s)}`).join('&');
+          const bd = await fetch(`${EBAY_API_S}/sell/inventory/v1/inventory_item?${qs}`, { headers: auth })
             .then(r => r.json()).catch(() => ({}));
           for (const item of (bd.inventoryItems || [])) {
             const asp = item.inventoryItem?.product?.aspects || {};
-            skuAspects[item.sku] = {
-              Color: (asp['Color'] || asp['color'] || [])[0] || null,
-              Size:  (asp['Size']  || asp['size']  || [])[0] || null,
-            };
+            // Find primary (Color) and secondary (Size) dimension values
+            // Try common names first, then fall back to any aspect values
+            const colorKeys = Object.keys(asp).filter(k => /color|colour/i.test(k));
+            const sizeKeys  = Object.keys(asp).filter(k => /size/i.test(k));
+            const otherKeys = Object.keys(asp).filter(k => !/color|colour|size/i.test(k));
+            const color = colorKeys.length ? asp[colorKeys[0]]?.[0] : null;
+            const size  = sizeKeys.length  ? asp[sizeKeys[0]]?.[0]  : (otherKeys.length ? asp[otherKeys[0]]?.[0] : null);
+            skuAsp[item.sku] = { color, size, rawAspects: asp };
+            skuAsp[item.sku].existingQty = item.inventoryItem?.availability?.shipToLocationAvailability?.quantity ?? -1;
           }
-          if (i + 20 < variantSkus.length) await sleep(100);
-        }
-        console.log(`[sync] aspects read: ${Object.keys(skuAspects).length}/${variantSkus.length}`);
-
-        // Full inventory PUT per variant — same as push/revise
-        // title + description + imageUrls (per-color) + aspects + qty
-        const createdSkus = new Set();
-        const failedSkus  = [];
-
-        // Test first variant for 401
-        if (variantSkus.length > 0) {
-          const testSku = variantSkus[0];
-          const { Color: testColor, Size: testSize } = skuAspects[testSku] || {};
-          const testAsp = { ...aspects };
-          if (testColor) testAsp['Color'] = [testColor];
-          if (testSize)  testAsp['Size']  = [testSize];
-          const testImg = getImageForColor(testColor);
-
-          // Track old qty for stock change detection
-          const oldItem = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(testSku)}`, { headers: auth })
-            .then(r => r.ok ? r.json() : {}).catch(() => ({}));
-          const oldQty  = oldItem?.availability?.shipToLocationAvailability?.quantity ?? -1;
-          const newQty  = getQtyForVariant(testColor, testSize);
-
-          const testR = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(testSku)}`, {
-            method: 'PUT', headers: auth,
-            body: JSON.stringify({
-              availability: { shipToLocationAvailability: { quantity: newQty } },
-              condition: 'NEW',
-              product: {
-                title:       listingTitle,
-                description: ebayDescription,
-                imageUrls:   [testImg, ...product.images.filter(x => x !== testImg)].filter(Boolean).slice(0, 12),
-                aspects:     testAsp,
-              },
-            }),
-          });
-          if (testR.status === 401) {
-            return res.status(401).json({ error: 'eBay token missing inventory permission. Go to Settings → Force Reconnect (fix 401) and re-authorize.', code: 'INVENTORY_401' });
-          }
-          if (testR.ok || testR.status === 204) {
-            createdSkus.add(testSku);
-            if (oldQty >= 0 && oldQty !== newQty) {
-              const label = [testColor, testSize].filter(Boolean).join('/') || testSku.slice(-12);
-              stockChanges.push(`${label}: qty ${oldQty}→${newQty}`);
-              console.log(`[sync] stock ${label}: ${oldQty}→${newQty}`);
-            }
-          } else {
-            const t = await testR.text();
-            console.warn(`[sync] test PUT fail: ${testR.status} ${t.slice(0,100)}`);
-            failedSkus.push(testSku);
-          }
+          if (i + 20 < variantSkusSync.length) await sleep(80);
         }
 
-        // Remaining variants in batches of 8 (same as push/revise)
-        for (let i = 1; i < variantSkus.length; i += 8) {
-          await Promise.all(variantSkus.slice(i, i + 8).map(async (sku) => {
-            const { Color: color, Size: size } = skuAspects[sku] || {};
-            const asp = { ...aspects };
-            if (color) asp['Color'] = [color];
-            if (size)  asp['Size']  = [size];
-            const img    = getImageForColor(color);
-            const newQty = getQtyForVariant(color, size);
+        // Update qty for each variant (price set per offer separately)
+        const updates = variantSkusSync.map(sku => {
+          const { color, size, existingQty, rawAspects } = skuAsp[sku] || {};
+          const newQty = getQtySync(color, size);
+          return { sku, color, size, newQty, existingQty, rawAspects };
+        });
 
-            // Track old qty
-            const oldItem = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, { headers: auth })
-              .then(r => r.ok ? r.json() : {}).catch(() => ({}));
-            const oldQty = oldItem?.availability?.shipToLocationAvailability?.quantity ?? -1;
+        // Batch update inventory item quantity only (preserve all other fields)
+        let firstStatus = 0;
+        for (let i = 0; i < updates.length; i += 15) {
+          await Promise.all(updates.slice(i, i+15).map(async ({ sku, newQty, existingQty }) => {
+            // Read existing item to preserve product data
+            const existing = await fetch(`${EBAY_API_S}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, { headers: auth })
+              .then(r => r.ok ? r.json() : null).catch(() => null);
+            if (!existing) return;
 
-            const r = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
+            const r = await fetch(`${EBAY_API_S}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
               method: 'PUT', headers: auth,
               body: JSON.stringify({
+                ...existing,
+                // Only change availability — preserve product (title, images, aspects, description)
                 availability: { shipToLocationAvailability: { quantity: newQty } },
-                condition: 'NEW',
-                product: {
-                  title:       listingTitle,
-                  description: ebayDescription,
-                  imageUrls:   img ? [img] : product.images.slice(0, 1),
-                  aspects:     asp,
-                },
               }),
             });
-            if (r.ok || r.status === 204) {
-              createdSkus.add(sku);
-              if (oldQty >= 0 && oldQty !== newQty) {
-                const label = [color, size].filter(Boolean).join('/') || sku.slice(-12);
-                stockChanges.push(`${label}: qty ${oldQty}→${newQty}`);
-              }
-            } else {
-              const t = await r.text();
-              console.warn(`[sync] PUT fail ${sku.slice(-20)}: ${r.status} ${t.slice(0,80)}`);
-              failedSkus.push(sku);
+            if (r.status === 401 && firstStatus === 0) firstStatus = 401;
+
+            if (existingQty >= 0 && existingQty !== newQty) {
+              stockChanges.push(`${sku.slice(-12)}: qty ${existingQty}→${newQty}`);
+              console.log(`[sync/var] qty ${existingQty}→${newQty} for ${sku.slice(-20)}`);
             }
           }));
-          if (i + 8 < variantSkus.length) await sleep(150);
+          if (i + 15 < updates.length) await sleep(100);
         }
 
-        // Retry failed items once
-        if (failedSkus.length) {
-          await sleep(800);
-          for (const sku of failedSkus) {
-            const { Color: color, Size: size } = skuAspects[sku] || {};
-            const asp = { ...aspects }; if (color) asp['Color'] = [color]; if (size) asp['Size'] = [size];
-            const img    = getImageForColor(color);
-            const newQty = getQtyForVariant(color, size);
-            const r = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
-              method: 'PUT', headers: auth,
-              body: JSON.stringify({
-                availability: { shipToLocationAvailability: { quantity: newQty } },
-                condition: 'NEW',
-                product: { title: listingTitle, description: ebayDescription,
-                           imageUrls: [img, ...product.images.filter(x => x !== img)].filter(Boolean).slice(0, 12), aspects: asp },
-              }),
-            });
-            if (r.ok || r.status === 204) createdSkus.add(sku);
-          }
-        }
-        console.log(`[sync] inventory items: ${createdSkus.size}/${variantSkus.length} updated, ${failedSkus.length} failed`);
-
-        // ── GROUP PUT: fresh images + variesBy (same as push/revise) ───────────
-        const varAspects = {};
-        if (colorGroup) varAspects['Color'] = colorGroup.values.map(v => v.value);
-        if (sizeGroup)  varAspects['Size']  = sizeGroup.values.map(v => v.value);
-        const colorUrlList   = Object.values(colorImgs).filter(Boolean).slice(0, 12);
-        const groupImageUrls = colorUrlList.length ? colorUrlList : product.images.slice(0, 12);
-        const groupAspects   = { ...aspects };
-        for (const vg of (product.variations || [])) { delete groupAspects[vg.name]; delete groupAspects[vg.name.toLowerCase()]; }
-        const variesBySpecs  = Object.entries(varAspects).map(([name, values]) => ({ name, values }));
-
-        // Track group image changes
-        const prevGroupImages = groupRes?.imageUrls || [];
-        if (prevGroupImages.length !== groupImageUrls.length) {
-          imageChanges.push(`Gallery: ${prevGroupImages.length}→${groupImageUrls.length} images`);
+        if (firstStatus === 401) {
+          return res.status(401).json({ error: 'eBay token missing inventory permission. Re-authorize in Settings.', code: 'INVENTORY_401' });
         }
 
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          const gr = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, {
-            method: 'PUT', headers: auth,
-            body: JSON.stringify({
-              inventoryItemGroupKey: ebaySku,
-              title:       listingTitle,
-              description: ebayDescription,
-              imageUrls:   groupImageUrls,
-              variantSKUs: variantSkus.filter(s => createdSkus.has(s)),
-              aspects:     groupAspects,
-              variesBy: {
-                aspectsImageVariesBy: colorGroup ? ['Color'] : [],
-                specifications: variesBySpecs,
-              },
-            }),
-          });
-          if (gr.ok || gr.status === 204) { console.log('[sync] group PUT ok'); break; }
-          const gt = await gr.text();
-          console.warn(`[sync] group attempt ${attempt}: ${gr.status} ${gt.slice(0,200)}`);
-          if (attempt < 3) await sleep(600);
-        }
-
-        // ── UPDATE OFFER PRICES: per-variant with correct color+size price ───
-        let pricesUpdated = 0;
-        for (let i = 0; i < variantSkus.length; i += 15) {
-          await Promise.all(variantSkus.slice(i, i + 8).map(async (sku) => {
-            if (!createdSkus.has(sku)) return;
-            const { Color: color, Size: size } = skuAspects[sku] || {};
-            const newPrice = getPriceForVariant(color, size);
-            const ol = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers: auth })
+        // Update offer price per variant SKU
+        let priceUpdates = 0;
+        for (let i = 0; i < updates.length; i += 8) {
+          await Promise.all(updates.slice(i, i+8).map(async ({ sku, color, size }) => {
+            const newPrice = getPriceSync(color, size);
+            const ol = await fetch(`${EBAY_API_S}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers: auth })
               .then(r => r.json()).catch(() => ({}));
             const offer = (ol.offers || [])[0];
-            if (offer?.offerId) {
-              const oldPrice = parseFloat(offer.pricingSummary?.price?.value || 0);
-              if (Math.abs(newPrice - oldPrice) > 0.01) {
-                await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}`, {
-                  method: 'PUT', headers: auth,
-                  body: JSON.stringify({ pricingSummary: { price: { value: newPrice.toFixed(2), currency: 'USD' } } }),
-                }).catch(() => {});
-                const label = [color, size].filter(Boolean).join('/') || sku.slice(-12);
-                priceChanges.push(`${label}: $${oldPrice.toFixed(2)}→$${newPrice.toFixed(2)}`);
-                console.log(`[sync] price ${label}: $${oldPrice.toFixed(2)}→$${newPrice.toFixed(2)}`);
-              }
-              pricesUpdated++;
+            if (!offer?.offerId) return;
+            const oldPrice = parseFloat(offer.pricingSummary?.price?.value || 0);
+            if (Math.abs(newPrice - oldPrice) > 0.01) {
+              await fetch(`${EBAY_API_S}/sell/inventory/v1/offer/${offer.offerId}`, {
+                method: 'PUT', headers: auth,
+                body: JSON.stringify({ pricingSummary: { price: { value: newPrice.toFixed(2), currency: 'USD' } } }),
+              }).catch(() => {});
+              priceChanges.push(`${sku.slice(-12)}: $${oldPrice.toFixed(2)}→$${newPrice.toFixed(2)}`);
+              priceUpdates++;
+              console.log(`[sync/var] price $${oldPrice.toFixed(2)}→$${newPrice.toFixed(2)} for ${sku.slice(-20)}`);
             }
           }));
-          if (i + 15 < variantSkus.length) await sleep(80);
+          if (i + 8 < updates.length) await sleep(80);
         }
 
-        console.log(`[sync] done — ${createdSkus.size} updated, ${pricesUpdated} prices checked, ${priceChanges.length} price changes, ${stockChanges.length} stock changes`);
+        console.log(`[sync/var] done — ${stockChanges.length} stock changes, ${priceUpdates} price changes`);
         return res.json({
-          success:      true,
-          type:         'variation',
-          updatedVariants: createdSkus.size,
-          failed:       failedSkus.length,
-          images:       product.images.length,
-          price:        applyMk(basePrice),
-          inStock:      freshStock,
-          priceChanges,
-          stockChanges,
-          imageChanges,
+          success: true, type: 'variant',
+          updatedVariants: variantSkusSync.length,
+          images: 0,  // worker never touches images
+          price: applyMk(basePrice),
+          inStock: fallbackInStock,
+          priceChanges, stockChanges, imageChanges: [],
         });
 
       } else {
-        // ── SIMPLE LISTING: full inventory PUT (same as push/revise) ──────────
-        const newPrice = applyMk(product.price) || 9.99;
-        const newQty   = freshStock ? defaultQty : 0;
+        // ── SIMPLE listing: update qty + price only ──────────────────────────
+        const freshStock = fallbackInStock;
+        const newPrice   = getPriceSync(null, null);
+        const newQty     = freshStock ? defaultQty : 0;
 
-        // Track old values
-        const oldItem  = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(ebaySku)}`, { headers: auth })
-          .then(r => r.ok ? r.json() : {}).catch(() => ({}));
-        const oldQty   = oldItem?.availability?.shipToLocationAvailability?.quantity ?? -1;
-        const oldImgCount = (oldItem?.product?.imageUrls || []).length;
+        // Read existing item to preserve all product data
+        const existingItem = await fetch(`${EBAY_API_S}/sell/inventory/v1/inventory_item/${encodeURIComponent(groupSkuSync)}`, { headers: auth })
+          .then(r => r.ok ? r.json() : null).catch(() => null);
 
-        const ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(ebaySku)}`, {
+        if (!existingItem) {
+          return res.status(400).json({ error: 'Inventory item not found — may have been deleted. Use Re-push to recreate.' });
+        }
+
+        const oldQty = existingItem?.availability?.shipToLocationAvailability?.quantity ?? -1;
+
+        const ir = await fetch(`${EBAY_API_S}/sell/inventory/v1/inventory_item/${encodeURIComponent(groupSkuSync)}`, {
           method: 'PUT', headers: auth,
           body: JSON.stringify({
+            ...existingItem,
+            // Only change qty — preserve product (title, images, aspects, description)
             availability: { shipToLocationAvailability: { quantity: newQty } },
-            condition: 'NEW',
-            product: { title: listingTitle, description: ebayDescription, imageUrls: product.images.slice(0, 12), aspects },
           }),
         });
+
         if (ir.status === 401) {
-          return res.status(401).json({ error: 'eBay token missing inventory permission. Go to Settings → Force Reconnect (fix 401) and re-authorize.', code: 'INVENTORY_401' });
+          return res.status(401).json({ error: 'eBay token missing inventory permission. Re-authorize in Settings.', code: 'INVENTORY_401' });
         }
         if (!ir.ok) {
           const t = await ir.text();
-          return res.status(400).json({ error: `Inventory update failed: ${t.slice(0,200)}` });
+          return res.status(400).json({ error: `Inventory update failed: ${t.slice(0, 200)}` });
         }
 
         if (oldQty >= 0 && oldQty !== newQty) {
           stockChanges.push(`qty ${oldQty}→${newQty}`);
           console.log(`[sync/simple] stock: ${oldQty}→${newQty}`);
         }
-        if (oldImgCount !== product.images.length) {
-          imageChanges.push(`Images: ${oldImgCount}→${product.images.length}`);
-        }
 
         // Update offer price
-        const ol = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(ebaySku)}`, { headers: auth })
+        const ol = await fetch(`${EBAY_API_S}/sell/inventory/v1/offer?sku=${encodeURIComponent(groupSkuSync)}`, { headers: auth })
           .then(r => r.json()).catch(() => ({}));
         const offer = (ol.offers || [])[0];
         if (offer?.offerId) {
           const oldPrice = parseFloat(offer.pricingSummary?.price?.value || 0);
           if (Math.abs(newPrice - oldPrice) > 0.01) {
-            await fetch(`${EBAY_API}/sell/inventory/v1/offer/${offer.offerId}`, {
+            await fetch(`${EBAY_API_S}/sell/inventory/v1/offer/${offer.offerId}`, {
               method: 'PUT', headers: auth,
               body: JSON.stringify({ pricingSummary: { price: { value: newPrice.toFixed(2), currency: 'USD' } } }),
             }).catch(() => {});
-            priceChanges.push(`$${oldPrice.toFixed(2)} → $${newPrice.toFixed(2)}`);
-            console.log(`[sync/simple] price: $${oldPrice.toFixed(2)} → $${newPrice.toFixed(2)}`);
+            priceChanges.push(`$${oldPrice.toFixed(2)}→$${newPrice.toFixed(2)}`);
+            console.log(`[sync/simple] price: $${oldPrice.toFixed(2)}→$${newPrice.toFixed(2)}`);
           }
         }
 
-        console.log(`[sync/simple] title="${listingTitle.slice(0,40)}" price=$${newPrice} qty=${newQty} imgs=${product.images.length}`);
+        console.log(`[sync/simple] price=$${newPrice} qty=${newQty}`);
         return res.json({
-          success:      true,
-          type:         'simple',
+          success: true, type: 'simple',
           updatedVariants: 1,
-          images:       product.images.length,
-          price:        newPrice,
-          inStock:      freshStock,
-          priceChanges,
-          stockChanges,
-          imageChanges,
+          images: 0,  // worker never touches images
+          price: newPrice,
+          inStock: freshStock,
+          priceChanges, stockChanges, imageChanges: [],
         });
       }
     }
+
 
     // ── END LISTING ───────────────────────────────────────────────────────────
     // ── DEALS SCRAPE v2: get ASINs from Amazon Today's Deals page ────────────────
