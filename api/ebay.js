@@ -1438,8 +1438,14 @@ async function handlePush({ body, res, resolvePolicies, getCategories, aiEnrich,
 async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle, sleep, getEbayUrls }) {
   const EBAY_API = getEbayUrls().EBAY_API;
   const auth     = { Authorization: `Bearer ${body.access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
-  const { access_token, ebaySku, sourceUrl } = body;
+  const { access_token, sourceUrl } = body;
   const ebayListingId = body.ebayListingId || '';
+  // Normalise ebaySku: if a variant SKU (DS-{ts}-{hash}-{DIMS}) was passed,
+  // strip the variant-dimension suffix so we always use the group SKU.
+  // Pattern: DS-1773366148579-TFEKT-WHITE_2_BIG_KID → DS-1773366148579-TFEKT
+  const rawSku = body.ebaySku || '';
+  const ebaySku = rawSku.replace(/^(DS-\d{10,14}-[A-Z0-9]{4,8})-[A-Z0-9_]+$/, '$1');
+  if (ebaySku !== rawSku) console.log(`[revise] normalised variant SKU: ${rawSku} → ${ebaySku}`);
   if (!access_token || !ebaySku || !sourceUrl)
     return res.status(400).json({ error: 'Missing access_token, ebaySku, or sourceUrl' });
 
@@ -3443,7 +3449,12 @@ Return ONLY the optimized title text, nothing else. No quotes, no explanation.` 
     // Unlike revise (which merges), replenish CLEARS everything first then rewrites
     // from scratch using fresh Amazon data. Same listing ID preserved. Rolls back on fail.
     if (action === 'replenish') {
-      const { access_token, ebaySku, sourceUrl, markup, handlingCost, quantity } = body;
+      const { access_token, sourceUrl, markup, handlingCost, quantity } = body;
+      // Normalise ebaySku: strip variant-dimension suffix if present
+      // DS-1773366148579-TFEKT-WHITE_2_BIG_KID → DS-1773366148579-TFEKT
+      const rawSkuR  = body.ebaySku || '';
+      const ebaySku  = rawSkuR.replace(/^(DS-\d{10,14}-[A-Z0-9]{4,8})-[A-Z0-9_]+$/, '$1');
+      if (ebaySku !== rawSkuR) console.log(`[replenish] normalised variant SKU: ${rawSkuR} → ${ebaySku}`);
       const markupReplenish   = parseFloat(markup ?? 0);
       const handlingReplenish = parseFloat(handlingCost ?? 2);
       const defaultQtyR       = parseInt(quantity) || 1;
