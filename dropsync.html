@@ -1427,6 +1427,7 @@ function renderProdRows(prods) {
     const reviseFailed = p.lastReviseError && p.lastReviseError.length > 0;
     const actionBtns = p.status==='listed' ? `
       <button class="btn btn-outline btn-sm" onclick="syncOne('${p.id}')">🔄 Revise</button>
+      <button class="btn btn-sm" style="background:#6366f1;color:#fff;font-weight:600;border:none" onclick="doRepush('${p.id}')" title="End current listing + republish as a fresh new listing with latest Amazon data">♻️ Re-push</button>
       <a href="https://www.ebay.com/itm/${p.ebayListingId}" target="_blank" class="btn btn-outline btn-sm">eBay ↗</a>
       ${reviseFailed && S.token ? `<button class="btn btn-sm" style="background:var(--amber,#f59e0b);color:#000;font-weight:600" onclick="repushListing('${p.id}')" title="${(p.lastReviseError||'').replace(/"/g,'\'').slice(0,120)}">⚠️ Revise Failed — Re-push?</button>` : ''}
       <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="confirmEnd('${p.id}')">End</button>
@@ -1725,6 +1726,57 @@ async function syncOne(pid) {
 
 // Re-push: called when revise failed and user clicks "Re-push?"
 // Confirms with user, ends the broken listing, then pushes a fresh one
+// ── doRepush: end current listing and publish a fresh new one ─────────────────
+async function doRepush(pid) {
+  const p = S.products.find(x => x.id === pid);
+  if (!p || !S.token) return;
+
+  const confirmed = await showConfirmModal(
+    '♻️ Re-push Listing?',
+    `This will:<br>
+    <b>1.</b> End the current eBay listing (<code>${p.ebayListingId || p.ebaySku || 'unknown'}</code>)<br>
+    <b>2.</b> Re-import fresh data from Amazon<br>
+    <b>3.</b> Publish a brand-new listing with a new ID<br>
+    <br>
+    <span style="color:var(--text3);font-size:11px">The old listing URL will stop working. Any watchers will be lost.</span>`,
+    '♻️ Re-push',
+    'Cancel'
+  );
+  if (!confirmed) return;
+
+  const toastId = toast('Re-pushing — ending old listing…', 'info', 60000);
+
+  try {
+    // Step 1: End the old eBay listing
+    if (p.ebayListingId && p.ebaySku) {
+      try {
+        const token = await ensureToken();
+        await fetch(`${S.backendUrl}/api/ebay?action=endListing`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId, sandbox: S.sandboxMode || false }),
+        });
+      } catch(e) { console.warn('[doRepush] end listing failed (continuing):', e.message); }
+    }
+
+    // Step 2: Reset to draft so pushExisting can push it fresh
+    p.status = 'draft';
+    p.ebayListingId = null;
+    p.ebaySku = null;
+    p.lastReviseError = null;
+    p.lastSynced = null;
+    markDirty(p.id); save();
+
+    // Step 3: Push fresh (will re-scrape Amazon + push to eBay)
+    toast('Re-pushing — creating new listing…', 'info', 60000);
+    await pushExisting(pid);
+
+  } catch(e) {
+    p.lastReviseError = 'Re-push failed: ' + e.message;
+    markDirty(p.id); save(); renderProducts();
+    toast(`Re-push failed: ${e.message}`, 'error', 8000);
+  }
+}
+
 async function repushListing(pid) {
   const p = S.products.find(x => x.id === pid);
   if (!p) return;
