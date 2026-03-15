@@ -676,6 +676,33 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null) {
     let dtaMap = {};
     try { dtaMap = JSON.parse(dtaBlock); } catch {}
 
+    // Extract OOS colors from sortedDimValuesForAllDims → dimensionValueState === "UNAVAILABLE"
+    // This is Amazon's authoritative per-color availability — shown as "See all available options"
+    const unavailableAsins = new Set();
+    const unavailableColorIdxs = new Set();
+    try {
+      const sddIdx = html.indexOf('"sortedDimValuesForAllDims"');
+      if (sddIdx > -1) {
+        const colorKey = '"color_name"';
+        const colorIdx = html.indexOf(colorKey, sddIdx);
+        if (colorIdx > -1) {
+          let i = html.indexOf('[', colorIdx), depth = 0, start = i;
+          for (; i < html.length && i < start + 200000; i++) {
+            if (html[i]==='[') depth++;
+            else if (html[i]===']') { depth--; if (depth===0) break; }
+          }
+          const dimArr = JSON.parse(html.slice(start, i+1));
+          for (const e of dimArr) {
+            if (e.dimensionValueState === 'UNAVAILABLE') {
+              if (e.defaultAsin) unavailableAsins.add(e.defaultAsin);
+              if (e.indexInDimList !== undefined) unavailableColorIdxs.add(e.indexInDimList);
+            }
+          }
+          console.log(`[scraper] sortedDimValues: ${dimArr.length} colors, ${unavailableAsins.size} UNAVAILABLE`);
+        }
+      }
+    } catch(e) { console.warn('[scraper] sortedDimValues parse err:', e.message); }
+
     const pIdx = dimOrder.indexOf(primaryDim.key)   >= 0 ? dimOrder.indexOf(primaryDim.key)   : 0;
     const sIdx = secondaryDim && dimOrder.indexOf(secondaryDim.key) >= 0
                ? dimOrder.indexOf(secondaryDim.key)
@@ -838,7 +865,7 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null) {
 
     // Build comboInStock + comboPrices
     // Price priority: per-exact-ASIN → per-color (primary) → per-size (secondary) → mainPrice
-    // Stock priority: per-exact-ASIN → per-color → per-size → mainInStock
+    // Stock priority: sortedDimValues UNAVAILABLE → per-exact-ASIN → per-color → per-size → mainInStock
     const comboInStock = {};
     const comboPrices  = {};
     for (const [key, asin] of Object.entries(comboAsin)) {
@@ -847,7 +874,12 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null) {
                       || primaryPrices[pv]
                       || sizePrices[sv]
                       || mainPrice;
-      if (asinInStock[asin] !== undefined) {
+      // sortedDimValuesForAllDims is the most reliable OOS signal — use it first
+      if (unavailableAsins.has(asin)) {
+        comboInStock[key] = false;
+      } else if (unavailableColorIdxs.size > 0 && primaryVals.indexOf(pv) > -1 && unavailableColorIdxs.has(primaryVals.indexOf(pv))) {
+        comboInStock[key] = false;
+      } else if (asinInStock[asin] !== undefined) {
         comboInStock[key] = asinInStock[asin];
       } else if (primaryInStock[pv] !== undefined) {
         comboInStock[key] = primaryInStock[pv];
@@ -2710,13 +2742,17 @@ module.exports = async (req, res) => {
         if (!secondaryVals.length && !sizePrices['']) sizePrices[''] = mainPrice;
 
         // Build comboInStock + comboPrices
-        // Price priority: per-ASIN → per-color → per-size → mainPrice
+        // Stock priority: sortedDimValues UNAVAILABLE → per-ASIN → per-color → per-size → mainInStock
         const comboInStock = {};
         const comboPrices  = {};
         for (const [key, asin] of Object.entries(comboAsin)) {
           const [pv, sv] = key.split('|');
           comboPrices[key] = asinPrice[asin] || primaryPrices2[pv] || sizePrices[sv] || mainPrice;
-          if (asinInStock[asin] !== undefined) {
+          if (unavailableAsins2.has(asin)) {
+            comboInStock[key] = false;
+          } else if (unavailableColorIdxs2.size > 0 && primaryVals.indexOf(pv) > -1 && unavailableColorIdxs2.has(primaryVals.indexOf(pv))) {
+            comboInStock[key] = false;
+          } else if (asinInStock[asin] !== undefined) {
             comboInStock[key] = asinInStock[asin];
           } else if (primaryInStock2[pv] !== undefined) {
             comboInStock[key] = primaryInStock2[pv];
