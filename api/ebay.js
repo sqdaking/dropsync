@@ -3442,6 +3442,228 @@ Return ONLY the optimized title text, nothing else. No quotes, no explanation.` 
       return res.json({ orders: d.orders || [], total: d.total || 0 });
     }
 
+    // ── REPLENISH — wipe listing content, re-scrape Amazon, update in-place ─────
+    // Unlike revise (which merges), replenish CLEARS everything first then rewrites
+    // from scratch using fresh Amazon data. Same listing ID preserved. Rolls back on fail.
+    if (action === 'replenish') {
+      const { access_token, ebaySku, sourceUrl, markup, handlingCost, quantity, sandbox: sb } = body;
+      const markupReplenish   = parseFloat(markup ?? 0);
+      const handlingReplenish = parseFloat(handlingCost ?? 2);
+      const defaultQtyR       = parseInt(quantity) || 1;
+      const sandboxR          = sb === true || sb === 'true';
+      const EBAY_API_R        = getEbayUrls(sandboxR).EBAY_API;
+      const authR             = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
+
+      if (!access_token || !ebaySku || !sourceUrl)
+        return res.status(400).json({ error: 'Missing access_token, ebaySku, or sourceUrl' });
+
+      const applyMkR = (cost) => {
+        const c = parseFloat(cost) || 0;
+        if (c <= 0) return 0;
+        return Math.max(Math.ceil(((c + handlingReplenish) * (1 + markupReplenish / 100) / (1 - 0.1335) + 0.30) * 100) / 100, 0.99);
+      };
+
+      console.log(`[replenish] sku=${ebaySku?.slice(0,30)}`);
+
+      // ── STEP 1: Snapshot existing eBay inventory (for rollback) ──────────
+      let snapshot = null;
+      let snapshotGroup = null;
+      let variantSkusR = [];
+      try {
+        const grpSnap = await fetch(`${EBAY_API_R}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`, { headers: authR }).then(r => r.ok ? r.json() : null).catch(() => null);
+        if (grpSnap) {
+          snapshotGroup = grpSnap;
+          variantSkusR = grpSnap.variantSKUs || [];
+          // Snapshot each variant
+          const snapItems = {};
+          for (let i = 0; i < variantSkusR.length; i += 20) {
+            const qs = variantSkusR.slice(i, i+20).map(s => `sku=${encodeURIComponent(s)}`).join('&');
+            const bd = await fetch(`${EBAY_API_R}/sell/inventory/v1/inventory_item?${qs}`, { headers: authR }).then(r => r.json()).catch(() => ({}));
+            for (const inv of (bd.inventoryItems || [])) snapItems[inv.sku] = inv.inventoryItem;
+          }
+          snapshot = { type: 'variation', group: grpSnap, items: snapItems };
+        } else {
+          const simpleSnap = await fetch(`${EBAY_API_R}/sell/inventory/v1/inventory_item/${encodeURIComponent(ebaySku)}`, { headers: authR }).then(r => r.ok ? r.json() : null).catch(() => null);
+          if (simpleSnap) snapshot = { type: 'simple', item: simpleSnap };
+        }
+      } catch(e) { console.warn('[replenish] snapshot failed:', e.message); }
+
+      // ── STEP 2: Wipe eBay listing content (qty=0, blank images/title/desc) ─
+      // This clears stale data before writing fresh — same listing ID kept
+      try {
+        if (snapshot?.type === 'variation' && variantSkusR.length) {
+          // Zero out all variant quantities
+          for (let i = 0; i < variantSkusR.length; i += 15) {
+            await Promise.all(variantSkusR.slice(i, i+15).map(async sku => {
+              const existing = snapshot.items?.[sku] || {};
+              await fetch(`${EBAY_API_R}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
+                method: 'PUT', headers: authR,
+                body: JSON.stringify({ ...existing, availability: { shipToLocationAvailability: { quantity: 0 } } }),
+              }).catch(() => {});
+            }));
+          }
+        } else if (snapshot?.type === 'simple') {
+          const existing = snapshot.item || {};
+          await fetch(`${EBAY_API_R}/sell/inventory/v1/inventory_item/${encodeURIComponent(ebaySku)}`, {
+            method: 'PUT', headers: authR,
+            body: JSON.stringify({ ...existing, product: { ...existing.product, title: existing.product?.title || 'Replenishing…', imageUrls: [], description: '' }, availability: { shipToLocationAvailability: { quantity: 0 } } }),
+          }).catch(() => {});
+        }
+        console.log('[replenish] wiped existing content');
+      } catch(e) { console.warn('[replenish] wipe error:', e.message); }
+
+      // ── STEP 3: Fresh Amazon scrape ───────────────────────────────────────
+      let freshProduct = null;
+      try {
+        const baseUrl = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://dropsync-one.vercel.app';
+        const scrapeR = await fetch(`${baseUrl}/api/ebay?action=scrape`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: sourceUrl }),
+        }).catch(() => null);
+        const scrapeD = scrapeR?.ok ? await scrapeR.json().catch(() => null) : null;
+        freshProduct = scrapeD?.product || null;
+      } catch(e) { console.warn('[replenish] scrape error:', e.message); }
+
+      // ── STEP 4: Validate scraped data — adapted to listing type ─────────────
+      // Handles: simple listing, single-dim variation, two-dim variation,
+      //          child ASIN (psc=1 redirect), bundle, blocked scrape
+      const replenishErrors = [];
+
+      if (!freshProduct) {
+        replenishErrors.push('Amazon scrape failed — page blocked or invalid URL');
+      } else {
+        // ── 4a. Title ────────────────────────────────────────────────────────
+        if (!freshProduct.title || freshProduct.title.trim().length < 3)
+          replenishErrors.push('No title returned from Amazon — page may be blocked');
+
+        // ── 4b. Images ───────────────────────────────────────────────────────
+        if (!freshProduct.images?.length)
+          replenishErrors.push('No images returned from Amazon');
+
+        // ── 4c. Detect listing type and validate accordingly ─────────────────
+        const isVariation   = freshProduct.hasVariations && freshProduct.variations?.length > 0;
+        const hasComboAsin  = Object.keys(freshProduct.comboAsin  || {}).length > 0;
+        const hasComboPrice = Object.keys(freshProduct.comboPrices || {}).length > 0;
+        const hasSizePrice  = Object.keys(freshProduct.sizePrices  || {}).length > 0;
+
+        if (isVariation) {
+          // ── Variation listing (parent ASIN with child ASINs) ──────────────
+          const primaryGroup   = freshProduct.variations[0];
+          const secondaryGroup = freshProduct.variations[1] || null;
+          const primaryCount   = primaryGroup?.values?.length  || 0;
+          const secondaryCount = secondaryGroup?.values?.length || 0;
+
+          console.log(`[replenish/validate] variation: dims=${freshProduct.variations.length} primary=${primaryCount} secondary=${secondaryCount} combos=${Object.keys(freshProduct.comboAsin||{}).length} pricesFailed=${freshProduct._pricesFailed}`);
+
+          // Must have at least 1 dimension with at least 1 value
+          if (primaryCount === 0)
+            replenishErrors.push('Variation listing has no dimension values — scrape incomplete');
+
+          // Must have combo ASIN mapping (confirms Amazon returned child ASINs)
+          if (!hasComboAsin)
+            replenishErrors.push('Variation listing missing child ASIN map — Amazon may have blocked variant fetch');
+
+          // Must have at least some pricing (comboPrices or sizePrices)
+          if (!hasComboPrice && !hasSizePrice && !freshProduct.price)
+            replenishErrors.push('Variation listing: no prices found for any variant');
+
+          // If prices failed (all identical = blocked), block replenish
+          if (freshProduct._pricesFailed) {
+            // Only block if no manual price can be used as fallback
+            if (!freshProduct.price || freshProduct.price <= 0)
+              replenishErrors.push(`Variation pricing unreliable — Amazon blocked per-variant price fetches and no base price available`);
+            else
+              console.warn(`[replenish/validate] _pricesFailed but base price $${freshProduct.price} available — allowing with warning`);
+          }
+
+          // Quantity validation for variations:
+          // At least ONE combo must be in-stock. All-OOS = Amazon pulled the listing.
+          const comboInStockR = freshProduct.comboInStock || {};
+          const hasComboStock = Object.keys(comboInStockR).length > 0;
+          if (hasComboStock) {
+            const anyInStock = Object.values(comboInStockR).some(v => v !== false);
+            if (!anyInStock)
+              replenishErrors.push('All variants are out of stock on Amazon — replenish blocked to avoid dead listing');
+          } else if (!freshProduct.inStock) {
+            // No per-combo data but product-level says OOS
+            replenishErrors.push('Product is out of stock on Amazon (no stock data for any variant)');
+          }
+
+        } else {
+          // ── Simple listing or child ASIN (single item) ────────────────────
+          // Child ASIN: url had ?psc=1 or /dp/CHILDASIN — scraper normalizes it
+          // These have no variations, just a direct price + stock
+
+          if (!freshProduct.price || freshProduct.price <= 0)
+            replenishErrors.push('No price found — product may be unavailable or a bundle without a buy box');
+
+          // Quantity check: product must be in stock
+          // inStock=false means buy-box explicitly says "Currently unavailable"
+          if (freshProduct.inStock === false)
+            replenishErrors.push('Product is out of stock on Amazon — replenish blocked to avoid dead listing');
+
+          // Extra: if it looks like a parent ASIN that returned no variations
+          // (title exists, price=0, no variations) — this is a blocked/redirect scrape
+          if (freshProduct.price <= 0 && freshProduct.title?.length > 3)
+            replenishErrors.push('Price is $0 — this may be a parent ASIN redirect. Use the child ASIN URL (?th=1&psc=1)');
+        }
+
+        // ── 4d. ASIN sanity check ─────────────────────────────────────────────
+        // If the scraped ASIN doesn't match the sourceUrl ASIN, we got redirected
+        const urlAsin    = (sourceUrl.match(/\/dp\/([A-Z0-9]{10})/i) || [])[1] || '';
+        const scrapedAsin = freshProduct.asin || '';
+        if (urlAsin && scrapedAsin && urlAsin !== scrapedAsin) {
+          // Amazon redirected to a different ASIN (common with parent→child redirect)
+          // This is fine for child ASINs — log but don't block
+          console.warn(`[replenish/validate] ASIN mismatch: url=${urlAsin} scraped=${scrapedAsin} — likely parent→child redirect, proceeding`);
+        }
+      }
+
+      console.log(`[replenish/validate] errors=${replenishErrors.length}: ${replenishErrors.join(' | ') || 'none'}`);
+        // ── ROLLBACK: restore the snapshot we took ───────────────────────
+        console.warn('[replenish] validation failed — rolling back:', replenishErrors.join(', '));
+        try {
+          if (snapshot?.type === 'variation' && variantSkusR.length) {
+            for (let i = 0; i < variantSkusR.length; i += 15) {
+              await Promise.all(variantSkusR.slice(i, i+15).map(sku =>
+                fetch(`${EBAY_API_R}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
+                  method: 'PUT', headers: authR, body: JSON.stringify(snapshot.items?.[sku] || {}),
+                }).catch(() => {})
+              ));
+            }
+          } else if (snapshot?.type === 'simple') {
+            await fetch(`${EBAY_API_R}/sell/inventory/v1/inventory_item/${encodeURIComponent(ebaySku)}`, {
+              method: 'PUT', headers: authR, body: JSON.stringify(snapshot.item),
+            }).catch(() => {});
+          }
+          console.log('[replenish] rollback complete');
+        } catch(re) { console.warn('[replenish] rollback error:', re.message); }
+        return res.status(422).json({ success: false, rolledBack: true, errors: replenishErrors, message: `Replenish failed — old listing restored. Reason: ${replenishErrors[0]}` });
+      }
+
+      // ── STEP 5: Re-apply full fresh data to same eBay listing ────────────
+      // Use the same logic as handleRevise but with fresh scraped product
+      // Mutate body to inject the fresh product and call handleRevise internally
+      const revisedBody = {
+        ...body,
+        action: 'revise',
+        // Force fresh scraped data — no fallback to old cached data
+        fallbackImages:          freshProduct.images        || [],
+        fallbackTitle:           freshProduct.title         || '',
+        fallbackPrice:           freshProduct.price         || 0,
+        fallbackInStock:         freshProduct.inStock !== false,
+        fallbackComboAsin:       freshProduct.comboAsin     || null,
+        fallbackComboInStock:    freshProduct.comboInStock  || null,
+        fallbackComboPrices:     freshProduct.comboPrices   || null,
+        fallbackVariations:      freshProduct.variations    || null,
+        fallbackVariationImages: freshProduct.variationImages || null,
+        fallbackPrimaryDimName:  freshProduct._primaryDimName || null,
+        fallbackSecondaryDimName: freshProduct._secondaryDimName || null,
+      };
+      // Delegate to handleRevise with the fresh product injected
+      return handleRevise({ body: revisedBody, res, getCategories, aiEnrich, sanitizeTitle, sleep, getEbayUrls });
+    }
+
     // ── RECOVER SKUS — maps all eBay listing IDs → real SKUs ────────────────
     if (action === 'recoverSkus') {
       const { access_token } = body;
