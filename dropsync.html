@@ -457,6 +457,13 @@ function setStatus(msg, type='info') {
 // True browser-fetch (reads Amazon HTML from user's real browser session) requires
 // a Chrome extension content script to bridge cross-origin content.
 // For now, all callers gracefully fall back to server-side Vercel scrape.
+// ── normaliseGroupSku: strip variant suffix from eBay SKU to get group SKU ─
+// DS-1773366148579-TFEKT-WHITE_2_BIG_KID → DS-1773366148579-TFEKT
+function normaliseGroupSku(sku) {
+  if (!sku) return sku;
+  return sku.replace(/^(DS-\d{10,14}-[A-Z0-9]{4,8})-[A-Z0-9_]+$/, '$1');
+}
+
 async function fetchAmazonInBrowser(url) {
   // Returns null → callers fall back to server-side scrape (same as Import tab)
   return null;
@@ -1673,7 +1680,7 @@ async function syncOne(pid) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token: token,
-        ebaySku: p.ebaySku,
+        ebaySku: normaliseGroupSku(p.ebaySku),
         sourceUrl: p.sourceUrl,
         clientHtml,
         ebayListingId: p.ebayListingId || '',
@@ -1908,7 +1915,7 @@ async function syncAll() {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           access_token: token,
-          ebaySku: p.ebaySku,
+          ebaySku: normaliseGroupSku(p.ebaySku),
           sourceUrl: p.sourceUrl,
           clientHtml,
           ebayListingId: p.ebayListingId || '',
@@ -2786,7 +2793,7 @@ async function replenishFromOrder(productId, orderIdSafe, btn) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token:  token,
-        ebaySku:       p.ebaySku,
+        ebaySku:       normaliseGroupSku(p.ebaySku),
         sourceUrl:     p.sourceUrl,
         ebayListingId: p.ebayListingId || '',
         quantity:      p.quantity || 1,
