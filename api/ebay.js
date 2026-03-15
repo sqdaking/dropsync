@@ -2753,6 +2753,30 @@ module.exports = async (req, res) => {
         for (const sv of secondaryVals) { if (!sizePrices[sv]) sizePrices[sv] = mainPrice; }
         if (!secondaryVals.length && !sizePrices['']) sizePrices[''] = mainPrice;
 
+        // Extract UNAVAILABLE colors from sortedDimValuesForAllDims
+        const unavailableAsins2 = new Set();
+        const unavailableColorIdxs2 = new Set();
+        try {
+          const sddIdx2 = html.indexOf('"sortedDimValuesForAllDims"');
+          if (sddIdx2 > -1) {
+            const c2 = html.indexOf('"color_name"', sddIdx2);
+            if (c2 > -1) {
+              let i2 = html.indexOf('[', c2), d2 = 0, s2 = i2;
+              for (; i2 < html.length && i2 < s2+200000; i2++) {
+                if (html[i2]==='[') d2++; else if (html[i2]===']') { d2--; if (d2===0) break; }
+              }
+              const dimArr2 = JSON.parse(html.slice(s2, i2+1));
+              for (const e of dimArr2) {
+                if (e.dimensionValueState === 'UNAVAILABLE') {
+                  if (e.defaultAsin) unavailableAsins2.add(e.defaultAsin);
+                  if (e.indexInDimList !== undefined) unavailableColorIdxs2.add(e.indexInDimList);
+                }
+              }
+              console.log('[scrape] sortedDimValues:', dimArr2.length, 'colors,', unavailableAsins2.size, 'UNAVAILABLE');
+            }
+          }
+        } catch(e) {}
+
         // Build comboInStock + comboPrices
         // Stock priority: sortedDimValues UNAVAILABLE → per-ASIN → per-color → per-size → mainInStock
         const comboInStock = {};
@@ -3066,7 +3090,7 @@ module.exports = async (req, res) => {
       const groupSkuSync = rawSkuSync.replace(/^(DS-\d{10,14}-[A-Z0-9]{4,8})-[A-Z0-9_]+$/, '$1');
 
       const EBAY_API_S  = getEbayUrls().EBAY_API;
-      const markupPct   = parseFloat(body.markup ?? 0);
+      const markupPct   = parseFloat(body.markup ?? body.markupPct ?? 23);
       const handling    = parseFloat(body.handlingCost ?? 2);
       const ebayFee     = 0.1335;
       const defaultQty  = parseInt(body.quantity) || 1;
