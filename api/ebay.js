@@ -2249,6 +2249,10 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
       images: product.images.length, price: applyMk(basePrice),
       inStock: freshStock, title: listingTitle,
       priceChanges: [], stockChanges: [], imageChanges: [],
+      // Return fresh combo data so frontend can update cached DB values
+      comboInStock: product.comboInStock || null,
+      comboAsin:    product.comboAsin    || null,
+      comboPrices:  product.comboPrices  || null,
     });
 
   } else {
