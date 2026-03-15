@@ -679,12 +679,17 @@ function buildProd() {
     ebaySku: '', ebayListingId: '',
     shippingCost: IMP?.shippingCost || 0,
     createdAt: new Date().toISOString(), lastSynced: null,
-    // Required for variant filtering and pricing on push
-    comboAsin:   IMP.comboAsin   || {},
-    sizePrices:  IMP.sizePrices  || {},
-    comboPrices: IMP.comboPrices || {},
+    // Required for variant filtering and pricing on push + revise
+    comboAsin:    IMP.comboAsin    || {},
+    comboInStock: IMP.comboInStock || {},   // FIX: was missing — causes all variants to show in-stock on revise
+    sizePrices:   IMP.sizePrices   || {},
+    comboPrices:  IMP.comboPrices  || {},
+    // FIX: dim names were missing — handlePush and revise use these to match variant dimensions
+    // Without them, Color/Size detection falls back to regex guessing which can misidentify dimensions
+    _primaryDimName:   IMP._primaryDimName   || null,
+    _secondaryDimName: IMP._secondaryDimName || null,
     // Description data
-    bullets:        IMP.bullets        || [],
+    bullets:         IMP.bullets         || [],
     descriptionPara: IMP.descriptionPara || '',
   };
 }
@@ -1665,7 +1670,9 @@ async function syncOne(pid) {
         sandbox: S.sandboxMode || false,
         fallbackImages:   p.images || [],
         fallbackTitle:    p.ebayTitle || p.title || '',
-        fallbackPrice:    p.cost || p.price || p.amazonPrice || 0,
+        // FIX: pass Amazon cost only — handleRevise applies markup via applyMk()
+        // p.cost and p.amazonPrice are Amazon costs; p.myPrice is already marked-up eBay price
+        fallbackPrice:    p.cost || p.amazonPrice || 0,
         fallbackShipping: p.shippingCost || 0,
         // For variation products: pass full combo data so revise doesn't
         // rely on stale product-level inStock which can cause all-OOS wipe
@@ -1845,10 +1852,19 @@ async function syncAll() {
           handlingCost: S.handlingCost,
           sandbox: S.sandboxMode || false,
           fallbackImages:   p.images || [],
-          fallbackTitle:    p.title  || '',
-          fallbackPrice:    p.cost   || p.price || p.amazonPrice || p.myPrice || 0,
+          fallbackTitle:    p.ebayTitle || p.title || '',
+          // FIX: pass Amazon cost only, not eBay myPrice (double markup bug)
+          fallbackPrice:    p.cost || p.amazonPrice || 0,
           fallbackShipping: p.shippingCost || 0,
-          fallbackInStock:  p.inStock !== false && (p.quantity || 1) > 0,
+          fallbackInStock:  p.hasVariations ? true : (p.inStock !== false && (p.quantity || 1) > 0),
+          // FIX: pass combo data so variants are correctly priced/stocked without re-scrape
+          fallbackComboAsin:        p.comboAsin        || null,
+          fallbackComboInStock:     p.comboInStock     || null,
+          fallbackComboPrices:      p.comboPrices      || null,
+          fallbackVariations:       p.variations       || null,
+          fallbackVariationImages:  p.variationImages  || null,
+          fallbackPrimaryDimName:   p._primaryDimName  || null,
+          fallbackSecondaryDimName: p._secondaryDimName || null,
         }),
       });
       const d = await r.json();
@@ -2707,10 +2723,19 @@ async function reviseFromOrder(productId, orderIdSafe, btn) {
         markup: S.markup,
         handlingCost: S.handlingCost,
         sandbox: S.sandboxMode || false,
-        fallbackImages: p.images || [],
-        fallbackTitle: p.title || '',
-        fallbackPrice: p.cost || p.price || 0,
-        fallbackInStock: p.inStock !== false,
+        fallbackImages:  p.images || [],
+        fallbackTitle:   p.ebayTitle || p.title || '',
+        // FIX: use Amazon cost only, not eBay price
+        fallbackPrice:   p.cost || p.amazonPrice || 0,
+        fallbackInStock: p.hasVariations ? true : (p.inStock !== false),
+        // FIX: pass combo data for variation products
+        fallbackComboAsin:        p.comboAsin        || null,
+        fallbackComboInStock:     p.comboInStock     || null,
+        fallbackComboPrices:      p.comboPrices      || null,
+        fallbackVariations:       p.variations       || null,
+        fallbackVariationImages:  p.variationImages  || null,
+        fallbackPrimaryDimName:   p._primaryDimName  || null,
+        fallbackSecondaryDimName: p._secondaryDimName || null,
       })
     });
     const d = await r.json();
@@ -2789,10 +2814,19 @@ async function linkAndResync(productId, itemListingId, itemSku, orderIdSafe, url
         markup: S.markup,
         handlingCost: S.handlingCost,
         sandbox: S.sandboxMode || false,
-        fallbackImages: p.images || [],
-        fallbackTitle: p.title || '',
-        fallbackPrice: p.cost || p.price || 0,
-        fallbackInStock: p.inStock !== false,
+        fallbackImages:  p.images || [],
+        fallbackTitle:   p.ebayTitle || p.title || '',
+        // FIX: use Amazon cost only, not eBay price
+        fallbackPrice:   p.cost || p.amazonPrice || 0,
+        fallbackInStock: p.hasVariations ? true : (p.inStock !== false),
+        // FIX: pass combo data for variation products
+        fallbackComboAsin:        p.comboAsin        || null,
+        fallbackComboInStock:     p.comboInStock     || null,
+        fallbackComboPrices:      p.comboPrices      || null,
+        fallbackVariations:       p.variations       || null,
+        fallbackVariationImages:  p.variationImages  || null,
+        fallbackPrimaryDimName:   p._primaryDimName  || null,
+        fallbackSecondaryDimName: p._secondaryDimName || null,
       })
     });
     const d = await r.json();
