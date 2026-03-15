@@ -3620,6 +3620,8 @@ Return ONLY the optimized title text, nothing else. No quotes, no explanation.` 
       }
 
       console.log(`[replenish/validate] errors=${replenishErrors.length}: ${replenishErrors.join(' | ') || 'none'}`);
+
+      if (replenishErrors.length > 0) {
         // ── ROLLBACK: restore the snapshot we took ───────────────────────
         console.warn('[replenish] validation failed — rolling back:', replenishErrors.join(', '));
         try {
