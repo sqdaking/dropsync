@@ -2977,8 +2977,11 @@ async function replenishFromOrder(productId, orderIdSafe, btn) {
       throw new Error(d.rolledBack ? `${msg} (old listing preserved)` : msg);
     }
     p.lastSynced = new Date().toISOString();
-    if (d.price) { p.myPrice = d.price; }
-    if (d.title) { p.title = d.title; }
+    if (d.price)        { p.myPrice = d.price; }
+    if (d.title)        { p.title = d.title; }
+    if (d.comboInStock) { p.comboInStock = d.comboInStock; }
+    if (d.comboAsin)    { p.comboAsin = d.comboAsin; }
+    if (d.comboPrices)  { p.comboPrices = d.comboPrices; }
     p.lastReviseError = null;
     markDirty(p.id); save();
     btn.textContent = '✅ Replenished!';
