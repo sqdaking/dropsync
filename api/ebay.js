@@ -874,10 +874,13 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null) {
                       || primaryPrices[pv]
                       || sizePrices[sv]
                       || mainPrice;
-      // sortedDimValuesForAllDims is the most reliable OOS signal — use it first
-      if (unavailableAsins.has(asin)) {
-        comboInStock[key] = false;
-      } else if (unavailableColorIdxs.size > 0 && primaryVals.indexOf(pv) > -1 && unavailableColorIdxs.has(primaryVals.indexOf(pv))) {
+      // sortedDimValues is AUTHORITATIVE for color-level OOS only.
+      // If a color is OOS at the color level → ALL its size combos are OOS.
+      // If a color is available at the color level → individual sizes may still be OOS.
+      // Do NOT force true here — fall through to per-ASIN/per-color/per-size checks.
+      const colorIdx = primaryVals.indexOf(pv);
+      const colorIsOos = colorIdx > -1 && unavailableColorIdxs.has(colorIdx);
+      if (colorIsOos) {
         comboInStock[key] = false;
       } else if (asinInStock[asin] !== undefined) {
         comboInStock[key] = asinInStock[asin];
@@ -889,8 +892,6 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null) {
         comboInStock[key] = mainInStock;
       }
     }
-
-    // product.inStock = true if ANY combo is in stock
     product.inStock = Object.keys(comboInStock).length > 0
       ? Object.values(comboInStock).some(v => v !== false)
       : mainInStock;
@@ -2778,15 +2779,16 @@ module.exports = async (req, res) => {
         } catch(e) {}
 
         // Build comboInStock + comboPrices
-        // Stock priority: sortedDimValues UNAVAILABLE → per-ASIN → per-color → per-size → mainInStock
+        // sortedDimValues is AUTHORITATIVE for color-level OOS/in-stock
         const comboInStock = {};
         const comboPrices  = {};
         for (const [key, asin] of Object.entries(comboAsin)) {
           const [pv, sv] = key.split('|');
           comboPrices[key] = asinPrice[asin] || primaryPrices2[pv] || sizePrices[sv] || mainPrice;
-          if (unavailableAsins2.has(asin)) {
-            comboInStock[key] = false;
-          } else if (unavailableColorIdxs2.size > 0 && primaryVals.indexOf(pv) > -1 && unavailableColorIdxs2.has(primaryVals.indexOf(pv))) {
+          // sortedDimValues OOS color → whole color OOS. Available color → check individual ASINs.
+          const colorIdx2 = primaryVals.indexOf(pv);
+          const colorIsOos2 = colorIdx2 > -1 && unavailableColorIdxs2.has(colorIdx2);
+          if (colorIsOos2) {
             comboInStock[key] = false;
           } else if (asinInStock[asin] !== undefined) {
             comboInStock[key] = asinInStock[asin];
