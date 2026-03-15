@@ -454,17 +454,52 @@ function setStatus(msg, type='info') {
   el.innerHTML = `<div class="status-bar ${type}" style="margin-top:10px">${msg}</div>`;
 }
 
+// ── fetchAmazonViaProxy: fetch Amazon page via Railway proxy ─────────────────
+// Railway's IPs are not blocked by Amazon like Vercel's datacenter IPs.
+// This allows the browser to get real Amazon HTML to send to Vercel for processing.
+async function fetchAmazonViaProxy(url) {
+  if (!S.serverUrl || !url) return null;
+  try {
+    // Normalize to clean ASIN URL
+    const asinMatch = url.match(/\/dp\/([A-Z0-9]{10})/i) || url.match(/[?&]asin=([A-Z0-9]{10})/i);
+    const asin = asinMatch?.[1];
+    const cleanUrl = asin ? `https://www.amazon.com/dp/${asin}?th=1` : url;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    const r = await fetch(`${S.serverUrl}/api/amazon?url=${encodeURIComponent(cleanUrl)}`, {
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    if (!r.ok) {
+      console.warn('[amazonProxy] HTTP', r.status);
+      return null;
+    }
+    const html = await r.text();
+    if (!html || html.length < 5000) return null;
+    console.log('[amazonProxy] fetched', html.length, 'bytes for', asin || url);
+    return html;
+  } catch(e) {
+    console.warn('[amazonProxy] failed:', e.message);
+    return null;
+  }
+}
+
 async function doScrape() {
   const url = ($('imp-url')?.value || '').trim();
   if (!url) { toast('Paste an Amazon URL first', 'error'); return; }
   if (!S.backendUrl) { toast('Set Backend URL in Settings first', 'error'); nav('settings'); return; }
   _scraping = true; IMP = null;
   renderImport();
-  setStatus('<div class="spinner" style="width:14px;height:14px;flex-shrink:0"></div> <span>Importing from Amazon… fetching variations & images</span>');
+  setStatus('<div class="spinner" style="width:14px;height:14px;flex-shrink:0"></div> <span>Importing from Amazon… fetching via browser proxy</span>');
   try {
+    // Fetch Amazon page via Railway proxy (bypasses Vercel IP blocking)
+    const pageHtml = await fetchAmazonViaProxy(url);
+    if (!pageHtml) setStatus('<div class="spinner" style="width:14px;height:14px;flex-shrink:0"></div> <span>Proxy unavailable — trying direct import…</span>');
     const r = await fetch(`${S.backendUrl}/api/ebay?action=scrape`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url, pageHtml }),  // pageHtml = browser-fetched, avoids Vercel block
     });
     const d = await r.json();
     if (!d.success || !d.product?.title) {
@@ -1653,10 +1688,12 @@ async function syncOne(pid) {
 
   const btn = document.querySelector(`[onclick="syncOne('${pid}')"]`);
   const origText = btn?.textContent;
-  if (btn) { btn.disabled = true; btn.textContent = '⏳ Revising…'; }
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Fetching…'; }
   toast('Revising listing from Amazon…', 'info');
 
   try {
+    const clientHtml = await fetchAmazonViaProxy(p.sourceUrl);
+    if (btn) btn.textContent = '⏳ Revising…';
     const token = await ensureToken();
     const r = await fetch(`${S.backendUrl}/api/ebay?action=revise`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1664,6 +1701,7 @@ async function syncOne(pid) {
         access_token: token,
         ebaySku: p.ebaySku,
         sourceUrl: p.sourceUrl,
+        clientHtml,
         ebayListingId: p.ebayListingId || '',
         quantity: p.quantity || 1,
         markup: S.markup,
@@ -1891,6 +1929,7 @@ async function syncAll() {
 
   for (const p of syncable) {
     try {
+      const clientHtml = await fetchAmazonViaProxy(p.sourceUrl);
       const token = await ensureToken();
       const r = await fetch(`${S.backendUrl}/api/ebay?action=revise`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1898,6 +1937,7 @@ async function syncAll() {
           access_token: token,
           ebaySku: p.ebaySku,
           sourceUrl: p.sourceUrl,
+          clientHtml,
           ebayListingId: p.ebayListingId || '',
           quantity: p.quantity || 1,
           markup: S.markup,
@@ -2769,9 +2809,13 @@ async function replenishFromOrder(productId, orderIdSafe, btn) {
   if (!S.token) { toast('Connect eBay first', 'error'); return; }
 
   const orig = btn.textContent;
-  btn.textContent = '⏳ Replenishing…';
+  btn.textContent = '⏳ Fetching Amazon…';
   btn.disabled = true;
   try {
+    // Fetch Amazon page via Railway proxy BEFORE calling Vercel
+    const clientHtml = await fetchAmazonViaProxy(p.sourceUrl);
+    btn.textContent = clientHtml ? '⏳ Replenishing…' : '⏳ Replenishing (no proxy)…';
+
     const token = await ensureToken();
     const r = await fetch(`${S.backendUrl}/api/ebay?action=replenish`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -2784,6 +2828,7 @@ async function replenishFromOrder(productId, orderIdSafe, btn) {
         markup:        S.markup,
         handlingCost:  S.handlingCost,
         sandbox:       S.sandboxMode || false,
+        clientHtml,   // browser-fetched Amazon HTML (bypasses Vercel IP blocks)
       })
     });
     const d = await r.json();
@@ -2896,12 +2941,14 @@ async function linkAndReplenish(productId, itemListingId, itemSku, orderIdSafe, 
     return;
   }
 
-  // Run revise inline
+  // Run replenish inline
   const btn = document.querySelector(`#order-card-${orderIdSafe} button[onclick*="linkAndReplenish"]`);
-  if (btn) { btn.textContent = '⏳ Linking & Revising…'; btn.disabled = true; }
+  if (btn) { btn.textContent = '⏳ Fetching Amazon…'; btn.disabled = true; }
   try {
+    const clientHtml = await fetchAmazonViaProxy(cleanUrl);
+    if (btn) btn.textContent = clientHtml ? '⏳ Replenishing…' : '⏳ Replenishing (no proxy)…';
     const token = await ensureToken();
-    const r = await fetch(`${S.backendUrl}/api/ebay?action=revise`, {
+    const r = await fetch(`${S.backendUrl}/api/ebay?action=replenish`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token:  token,
@@ -2912,6 +2959,7 @@ async function linkAndReplenish(productId, itemListingId, itemSku, orderIdSafe, 
         markup:        S.markup,
         handlingCost:  S.handlingCost,
         sandbox:       S.sandboxMode || false,
+        clientHtml,
       })
     });
     const d = await r.json();
