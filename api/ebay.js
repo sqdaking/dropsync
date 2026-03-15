@@ -1462,24 +1462,11 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
   console.log(`[revise] sku=${ebaySku?.slice(0,30)} markup=${markupPct}%`);
 
   // ── STEP 1: Get product data ──────────────────────────────────────────────
-  // Priority: client-provided HTML → fresh Amazon scrape → cached fallback → eBay existing data
+  // Call scrapeAmazonProduct directly — no internal HTTP round-trip needed.
+  // If browser pre-fetched HTML is provided, use it (bypasses Vercel IP blocking).
   const clientHtmlRevise = body.clientHtml || null;
-  let product = null;
-
-  if (clientHtmlRevise) {
-    // Browser-fetched HTML provided — use it directly, bypasses Vercel IP blocking
-    console.log('[revise] using client-provided HTML for scrape');
-    product = await scrapeAmazonProduct(sourceUrl, clientHtmlRevise).catch(() => null);
-  } else {
-    // Server-side scrape fallback
-    const baseUrl = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://dropsync-one.vercel.app';
-    const scrapeR = await fetch(`${baseUrl}/api/ebay?action=scrape`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: sourceUrl }),
-    }).catch(() => null);
-    const scrapeD = scrapeR?.ok ? await scrapeR.json().catch(() => null) : null;
-    product = scrapeD?.product || null;
-  }
+  if (clientHtmlRevise) console.log('[revise] using client-provided HTML for scrape');
+  let product = await scrapeAmazonProduct(sourceUrl, clientHtmlRevise).catch(() => null);
 
   // Apply cached fallback for missing images/data
   const fallbackImages  = (body.fallbackImages || []).filter(u => typeof u === 'string' && u.startsWith('http'));
@@ -2815,20 +2802,8 @@ module.exports = async (req, res) => {
       const clientHtmlSync = body.clientHtml || null;
       let product = null;
 
-      if (clientHtmlSync) {
-        console.log('[sync] using client-provided HTML — skipping server-side fetch');
-        product = await scrapeAmazonProduct(sourceUrl, clientHtmlSync).catch(() => null);
-      } else {
-        const baseUrl = process.env.VERCEL_URL
-          ? `https://${process.env.VERCEL_URL}`
-          : 'https://dropsync-one.vercel.app';
-        const scrapeR = await fetch(`${baseUrl}/api/ebay?action=scrape`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: sourceUrl }),
-        }).catch(e => { console.warn('[sync] scrape failed:', e.message); return null; });
-        const scrapeD = scrapeR?.ok ? await scrapeR.json().catch(() => null) : null;
-        product = scrapeD?.product || null;
-      }
+      if (clientHtmlSync) console.log('[sync] using client-provided HTML — skipping server-side fetch');
+      product = await scrapeAmazonProduct(sourceUrl, clientHtmlSync).catch(e => { console.warn('[sync] scrape failed:', e.message); return null; });
 
       // Fallback to cached frontend data if Amazon blocked
       const fallbackImages  = Array.isArray(body.fallbackImages) ? body.fallbackImages.filter(u => typeof u === 'string' && u.startsWith('http')) : [];
@@ -3546,24 +3521,15 @@ Return ONLY the optimized title text, nothing else. No quotes, no explanation.` 
       } catch(e) { console.warn('[replenish] wipe error:', e.message); }
 
       // ── STEP 3: Fresh Amazon scrape ───────────────────────────────────────
-      // Use browser-provided HTML if available (bypasses Vercel IP blocking)
-      let freshProduct = null;
+      // Call scrapeAmazonProduct directly — no internal HTTP round-trip needed.
+      // If browser pre-fetched HTML is provided, use it (bypasses Vercel IP blocking).
+      // Otherwise falls through to server-side fetch inside scrapeAmazonProduct.
       const clientHtmlReplenish = body.clientHtml || null;
-
-      if (clientHtmlReplenish) {
-        console.log('[replenish] using client-provided HTML — no server-side Amazon fetch needed');
+      if (clientHtmlReplenish) console.log('[replenish] using client-provided HTML');
+      let freshProduct = null;
+      try {
         freshProduct = await scrapeAmazonProduct(sourceUrl, clientHtmlReplenish);
-      } else {
-        try {
-          const baseUrl = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://dropsync-one.vercel.app';
-          const scrapeR = await fetch(`${baseUrl}/api/ebay?action=scrape`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: sourceUrl }),
-          }).catch(() => null);
-          const scrapeD = scrapeR?.ok ? await scrapeR.json().catch(() => null) : null;
-          freshProduct = scrapeD?.product || null;
-        } catch(e) { console.warn('[replenish] scrape error:', e.message); }
-      }
+      } catch(e) { console.warn('[replenish] scrape error:', e.message); }
 
       // ── STEP 4: Validate scraped data — adapted to listing type ─────────────
       // Handles: simple listing, single-dim variation, two-dim variation,
