@@ -1106,6 +1106,40 @@ function buildVariesBy(product, primaryGroup, secondaryGroup) {
 
 // ─── PUSH action ──────────────────────────────────────────────────────────────
 
+// ── enableOutOfStockControl ───────────────────────────────────────────────────
+// Calls eBay Trading API to enable Out-of-Stock Control on a listing.
+// When enabled: qty=0 keeps listing ACTIVE (shows "Currently unavailable")
+//               instead of ending it. Essential for dropshipping OOS handling.
+async function enableOutOfStockControl(access_token, listingId) {
+  if (!listingId) return;
+  try {
+    const xml = `<?xml version="1.0" encoding="utf-8"?>
+<ReviseFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <Item>
+    <ItemID>${listingId}</ItemID>
+    <OutOfStockControl>true</OutOfStockControl>
+  </Item>
+</ReviseFixedPriceItemRequest>`;
+    const r = await fetch('https://api.ebay.com/ws/api.dll', {
+      method: 'POST',
+      headers: {
+        'X-EBAY-API-SITEID': '0',
+        'X-EBAY-API-COMPATIBILITY-LEVEL': '967',
+        'X-EBAY-API-CALL-NAME': 'ReviseFixedPriceItem',
+        'X-EBAY-API-IAF-TOKEN': `Bearer ${access_token}`,
+        'Content-Type': 'text/xml',
+      },
+      body: xml,
+    });
+    const txt = await r.text();
+    const success = txt.includes('<Ack>Success</Ack>') || txt.includes('<Ack>Warning</Ack>');
+    console.log(`[enableOOS] listing ${listingId}: ${success ? 'enabled' : 'failed'} (HTTP ${r.status})`);
+    if (!success) console.warn(`[enableOOS] response:`, txt.slice(0, 300));
+  } catch(e) {
+    console.warn(`[enableOOS] ${listingId}:`, e.message);
+  }
+}
+
 async function handlePush({ body, res, resolvePolicies, getCategories, aiEnrich, sanitizeTitle, ensureLocation, buildOffer, sleep, getEbayUrls }) {
   const EBAY_API = getEbayUrls().EBAY_API;
   const auth     = { Authorization: `Bearer ${body.access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
@@ -1222,7 +1256,11 @@ async function handlePush({ body, res, resolvePolicies, getCategories, aiEnrich,
 
     const pr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${od.offerId}/publish`, { method: 'POST', headers: auth });
     const pd = await pr.json();
-    if (pd.listingId) return res.json({ success: true, sku: groupSku, offerId: od.offerId, listingId: pd.listingId });
+    if (pd.listingId) {
+      // Enable Out-of-Stock Control so qty=0 keeps listing active (not ended)
+      enableOutOfStockControl(body.access_token, pd.listingId).catch(() => {});
+      return res.json({ success: true, sku: groupSku, offerId: od.offerId, listingId: pd.listingId });
+    }
 
     const errId = (pd.errors || [])[0]?.errorId;
     if (errId === 25002) {
@@ -1412,6 +1450,8 @@ async function handlePush({ body, res, resolvePolicies, getCategories, aiEnrich,
     const pd = await pr.json();
     if (pd.listingId) {
       console.log(`[push] published! listingId=${pd.listingId} variants=${variants.length}`);
+      // Enable Out-of-Stock Control so qty=0 keeps listing active (not ended)
+      enableOutOfStockControl(body.access_token, pd.listingId).catch(() => {});
       return res.json({ success: true, sku: groupSku, listingId: pd.listingId, variantsCreated: variants.length });
     }
     const errId = (pd.errors || [])[0]?.errorId;
@@ -1827,31 +1867,61 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
       return { pVal: entries[0]?.[1] || null, sVal: entries[1]?.[1] || null };
     }
 
-    // Stock & price per SKU using comboAsin/comboInStock from scraped data
-    const comboAsin    = product.comboAsin    || {};
-    const comboInStock = product.comboInStock || {};
-    const comboPrices  = product.comboPrices  || {};
-    const sizePrices   = product.sizePrices   || {};
-    const hasComboData = Object.keys(comboAsin).length > 0;
-    const freshStock   = product.inStock !== false;
-    const basePrice    = parseFloat(product.price || 0);
+    // Build a case-insensitive lookup table for comboInStock and comboPrices
+    // so eBay aspect values ("White", "2 Big Kid") match Amazon keys ("White|2 Big Kid")
+    // even with minor capitalisation/spacing differences
+    function normaliseVal(v) {
+      return (v || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    }
+    const comboInStockNorm = {};  // normalisedKey → boolean
+    const comboPricesNorm  = {};  // normalisedKey → price
+    for (const [k, v] of Object.entries(comboInStock)) {
+      const [p, s] = k.split('|');
+      comboInStockNorm[`${normaliseVal(p)}|${normaliseVal(s)}`] = v;
+    }
+    for (const [k, v] of Object.entries(comboPrices)) {
+      const [p, s] = k.split('|');
+      comboPricesNorm[`${normaliseVal(p)}|${normaliseVal(s)}`] = v;
+    }
+    // Also build size-only lookup (secondary dim alone)
+    const sizePricesNorm = {};
+    for (const [k, v] of Object.entries(sizePrices)) {
+      sizePricesNorm[normaliseVal(k)] = v;
+    }
+
+    function lookupComboInStock(pVal, sVal) {
+      // Try exact, then normalised
+      const exact = `${pVal || ''}|${sVal || ''}`;
+      if (comboInStock[exact] !== undefined) return comboInStock[exact];
+      const norm  = `${normaliseVal(pVal)}|${normaliseVal(sVal)}`;
+      if (comboInStockNorm[norm] !== undefined) return comboInStockNorm[norm];
+      return undefined; // unknown — assume in stock
+    }
+
+    function lookupComboPrice(pVal, sVal) {
+      const exact = `${pVal || ''}|${sVal || ''}`;
+      if (comboPrices[exact]) return comboPrices[exact];
+      const norm  = `${normaliseVal(pVal)}|${normaliseVal(sVal)}`;
+      if (comboPricesNorm[norm]) return comboPricesNorm[norm];
+      // Fall back to secondary-only (size-based)
+      return sizePrices[sVal || ''] || sizePrices[pVal || '']
+          || sizePricesNorm[normaliseVal(sVal)] || sizePricesNorm[normaliseVal(pVal)]
+          || basePrice || 0;
+    }
 
     function getQty(pVal, sVal) {
-      // No combo data at all → assume in stock (better safe than ending the listing)
+      // No combo data at all → assume in stock
       if (!hasComboData) return defaultQty;
-      const key = `${pVal || ''}|${sVal || ''}`;
-      // Explicitly marked OOS in per-combo data → OOS
-      if (comboInStock[key] === false) return 0;
-      // Key not found OR comboInStock[key]=true/undefined → in stock
-      // NOTE: We do NOT return 0 when comboAsin[key] is missing because
-      // eBay stored aspect names (e.g. "3 Pack (Black-white-blue)") may differ
-      // slightly from Amazon's current names, causing false OOS on all variants.
+      // Look up OOS status with fuzzy matching
+      const inStock = lookupComboInStock(pVal, sVal);
+      // Explicitly marked OOS → qty 0
+      if (inStock === false) return 0;
+      // Unknown (key not found) or in stock → qty 1
       return defaultQty;
     }
 
     function getPrice(pVal, sVal) {
-      const key = `${pVal || ''}|${sVal || ''}`;
-      const amazonPrice = comboPrices[key] || sizePrices[sVal || ''] || sizePrices[pVal || ''] || basePrice || 0;
+      const amazonPrice = lookupComboPrice(pVal, sVal);
       const p = applyMk(amazonPrice);
       return p > 0 ? p : applyMk(basePrice) || 9.99;
     }
@@ -2008,6 +2078,8 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
     }
 
     console.log(`[revise] done — ${createdSkus.size} updated, ${pricesUpdated} prices, ${failedSkus.length} failed`);
+    // Enable Out-of-Stock Control so qty=0 variants keep listing active (not ended)
+    if (ebayListingId) enableOutOfStockControl(access_token, ebayListingId).catch(() => {});
     return res.json({
       success: true, type: 'variant',
       updatedVariants: createdSkus.size, pricesUpdated,
@@ -2059,6 +2131,8 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
     }
 
     console.log(`[revise/simple] price=$${finalPrice} qty=${newQty} imgs=${product.images.length}`);
+    // Enable Out-of-Stock Control so qty=0 keeps listing active (not ended)
+    if (ebayListingId) enableOutOfStockControl(access_token, ebayListingId).catch(() => {});
     return res.json({
       success: true, type: 'simple',
       updatedVariants: 1, images: product.images.length,
@@ -2879,27 +2953,39 @@ module.exports = async (req, res) => {
       const comboInStock = product.comboInStock || {};
       const basePrice   = parseFloat(product.price || 0);
 
-      // Per-variant price — exact same logic as push/revise
+      // Fuzzy-normalised lookup tables (handles eBay vs Amazon name differences)
+      const _normV = v => (v || '').toLowerCase().replace(/\s+/g,' ').trim();
+      const _ciNorm = {}, _cpNorm = {};
+      for (const [k, v] of Object.entries(comboInStock)) { const [p,s]=k.split('|'); _ciNorm[`${_normV(p)}|${_normV(s)}`]=v; }
+      for (const [k, v] of Object.entries(comboPrices))  { const [p,s]=k.split('|'); _cpNorm[`${_normV(p)}|${_normV(s)}`]=v; }
+
+      const _lookupInStock = (c, s) => {
+        const e=`${c||''}|${s||''}`; if (comboInStock[e]!==undefined) return comboInStock[e];
+        const n=`${_normV(c)}|${_normV(s)}`; return _ciNorm[n];
+      };
+      const _lookupPrice = (c, s) => {
+        const e=`${c||''}|${s||''}`; if (comboPrices[e]) return comboPrices[e];
+        const n=`${_normV(c)}|${_normV(s)}`; if (_cpNorm[n]) return _cpNorm[n];
+        return sizePrices[s||''] || sizePrices[c||''] || basePrice || 0;
+      };
+
+      // Per-variant price — fuzzy combo lookup
       const getPriceForVariant = (color, size) => {
-        const key = `${color||''}|${size||''}`;
         const cv  = colorGroup?.values?.find(v => v.value === color);
         const sv  = sizeGroup?.values?.find(v => v.value === size);
-        const amazonPrice = comboPrices[key]
-                         || sizePrices[size || '']
+        const amazonPrice = _lookupPrice(color, size)
                          || parseFloat(cv?.price || sv?.price || basePrice || 0);
         const p = applyMk(amazonPrice);
         return p > 0 ? p : applyMk(basePrice) || 9.99;
       };
 
-      // Per-variant qty — only go OOS if explicitly marked false in comboInStock
+      // Per-variant qty — fuzzy OOS matching (only 0 if explicitly OOS on Amazon)
       const getQtyForVariant = (color, size) => {
         if (!freshStock) return 0;
-        if (Object.keys(comboAsin).length) {
-          const key = `${color||''}|${size||''}`;
-          // Only return 0 if explicitly marked OOS — NOT if key is missing
-          // (eBay stored aspect names may differ slightly from Amazon scraped names)
-          if (comboInStock[key] === false) return 0;
-          return defaultQty;
+        if (Object.keys(comboInStock).length) {
+          const inStock = _lookupInStock(color, size);
+          if (inStock === false) return 0; // explicitly OOS
+          return defaultQty; // in stock or unknown → keep available
         }
         return defaultQty;
       };
@@ -3612,18 +3698,8 @@ Return ONLY the optimized title text, nothing else. No quotes, no explanation.` 
               console.warn(`[replenish/validate] _pricesFailed but base price $${freshProduct.price} available — allowing with warning`);
           }
 
-          // Quantity validation for variations:
-          // At least ONE combo must be in-stock. All-OOS = Amazon pulled the listing.
-          const comboInStockR = freshProduct.comboInStock || {};
-          const hasComboStock = Object.keys(comboInStockR).length > 0;
-          if (hasComboStock) {
-            const anyInStock = Object.values(comboInStockR).some(v => v !== false);
-            if (!anyInStock)
-              replenishErrors.push('All variants are out of stock on Amazon — replenish blocked to avoid dead listing');
-          } else if (!freshProduct.inStock) {
-            // No per-combo data but product-level says OOS
-            replenishErrors.push('Product is out of stock on Amazon (no stock data for any variant)');
-          }
+          // NOTE: OOS variants are ALLOWED — handleRevise sets qty=0 for each OOS
+          // variant via getQty() so they go to 0 on eBay, not blocked/rolled back.
 
         } else {
           // ── Simple listing or child ASIN (single item) ────────────────────
@@ -3633,10 +3709,7 @@ Return ONLY the optimized title text, nothing else. No quotes, no explanation.` 
           if (!freshProduct.price || freshProduct.price <= 0)
             replenishErrors.push('No price found — product may be unavailable or a bundle without a buy box');
 
-          // Quantity check: product must be in stock
-          // inStock=false means buy-box explicitly says "Currently unavailable"
-          if (freshProduct.inStock === false)
-            replenishErrors.push('Product is out of stock on Amazon — replenish blocked to avoid dead listing');
+          // NOTE: OOS simple listings ARE allowed — qty will be set to 0 by handleRevise.
 
           // Extra: if it looks like a parent ASIN that returned no variations
           // (title exists, price=0, no variations) — this is a blocked/redirect scrape
@@ -3699,7 +3772,18 @@ Return ONLY the optimized title text, nothing else. No quotes, no explanation.` 
         fallbackSecondaryDimName: freshProduct._secondaryDimName || null,
       };
       // Delegate to handleRevise with the fresh product injected
-      return handleRevise({ body: revisedBody, res, getCategories, aiEnrich, sanitizeTitle, sleep, getEbayUrls });
+      // Intercept the response to also enable Out-of-Stock Control on the listing
+      const fakeRes = {
+        _data: null, _status: 200,
+        status(code) { this._status = code; return this; },
+        json(data)   { this._data = data; return this; },
+      };
+      await handleRevise({ body: revisedBody, res: fakeRes, getCategories, aiEnrich, sanitizeTitle, sleep, getEbayUrls });
+      // Enable OOS control so qty=0 keeps listing active (not ended by eBay)
+      if (fakeRes._data?.success && body.ebayListingId) {
+        enableOutOfStockControl(access_token, body.ebayListingId).catch(() => {});
+      }
+      return res.status(fakeRes._status).json(fakeRes._data);
     }
 
     // ── RECOVER SKUS — maps all eBay listing IDs → real SKUs ────────────────
