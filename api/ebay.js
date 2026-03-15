@@ -389,9 +389,9 @@ async function resolvePolicies(token, supplied) {
   const EBAY_API = getEbayUrls().EBAY_API;
   const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
   const p = {
-    fulfillmentPolicyId: (supplied.fulfillmentPolicyId || '').trim(),
-    paymentPolicyId:     (supplied.paymentPolicyId     || '').trim(),
-    returnPolicyId:      (supplied.returnPolicyId       || '').trim(),
+    fulfillmentPolicyId: (String(supplied.fulfillmentPolicyId || '')).trim(),
+    paymentPolicyId:     (String(supplied.paymentPolicyId     || '')).trim(),
+    returnPolicyId:      (String(supplied.returnPolicyId       || '')).trim(),
   };
 
   if (!p.fulfillmentPolicyId || !p.paymentPolicyId || !p.returnPolicyId) {
