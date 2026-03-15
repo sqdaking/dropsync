@@ -649,7 +649,7 @@ function renderPreview() {
           <button class="btn btn-outline" onclick="saveAsDraft()">💾 Save Draft</button>
           ${S.token
             ? IMP._pricesFailed
-              ? `<button class="btn" style="background:var(--border);color:var(--text3);cursor:not-allowed" disabled title="Cannot push — per-variant prices could not be fetched from Amazon. Try re-importing in a few minutes.">⛔ Prices Failed — Cannot Push</button>`
+              ? `<button class="btn" onclick="doPush()" style="background:#f59e0b;color:#000" title="Per-variant prices unavailable — will use base price for all variants">⚠️ Push with Base Price</button>`
               : `<button class="btn btn-success" onclick="doPush()" id="push-btn">🚀 Push to eBay (${countVariants()} variants)</button>`
             : `<button class="btn btn-outline" onclick="nav('settings')">⚡ Connect eBay</button>`}
         </div>
@@ -739,8 +739,9 @@ async function doPush() {
   if (!S.token) { toast('Connect eBay first in Settings', 'error'); return; }
   // Block push if per-variant prices couldn't be fetched (Amazon blocked server requests)
   if (IMP._pricesFailed) {
-    setStatus('⛔ Cannot push — per-variant prices are unavailable (Amazon blocked server-side price fetches). Try re-importing the product in a few minutes.', 'error');
-    return;
+    // Warn but allow — will use base Amazon price for all variants
+    console.warn('[doPush] _pricesFailed — pushing with base price for all variants');
+    toast('⚠️ Pushing with base price — per-variant prices unavailable', 'warn', 4000);
   }
   const btn = $('push-btn');
   if (btn) { btn.disabled = true; btn.innerHTML = '<div class="spinner" style="width:14px;height:14px"></div> Pushing…'; }
