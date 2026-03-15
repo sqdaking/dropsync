@@ -2210,9 +2210,9 @@ module.exports = async (req, res) => {
       // Use ?th=1 to force variant page and avoid redirects
       if (asin) url = `https://www.amazon.com/dp/${asin}?th=1`;
 
+      const ua = randUA();
       let html = clientHtml || null;
       if (!html) {
-        const ua = randUA();
         // If first attempt blocked, try alternate URL formats
         html = await fetchPage(url, ua);
         if (!html && asin) {
