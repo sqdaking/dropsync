@@ -1254,10 +1254,27 @@ async function handlePush({ body, res, resolvePolicies, getCategories, aiEnrich,
       if (!name || aspects[name]) continue;
       const vals = (asp.aspectValues || []).map(v => v.localizedValue);
       if (!vals.length) continue;
-      const match = vals.find(v => (product.title || '').toLowerCase().includes(v.toLowerCase())) || vals[0];
+      // Filter out values that exceed eBay's 65-char limit per aspect value
+      const validVals = vals.filter(v => v.length <= 65);
+      if (!validVals.length) continue;
+      const titleLower = (product.title || '').toLowerCase();
+      const match = validVals.find(v => titleLower.includes(v.toLowerCase()))
+                 || validVals.find(v => v.toLowerCase() === 'unisex adults')
+                 || validVals.find(v => v.toLowerCase() === 'everyday')
+                 || validVals.find(v => /everyday|casual|regular/i.test(v))
+                 || validVals.sort((a,b) => a.length - b.length)[0]; // shortest valid value
       aspects[name] = [match];
     }
   } catch(e) { console.warn('[push] aspects fetch failed:', e.message); }
+
+  // Sanitize: remove any aspect value that exceeds eBay's 65-char limit
+  for (const [k, vals] of Object.entries(aspects)) {
+    if (Array.isArray(vals)) {
+      const cleaned = vals.filter(v => typeof v === 'string' && v.length <= 65);
+      if (cleaned.length) aspects[k] = cleaned;
+      else delete aspects[k];
+    }
+  }
 
   const locationKey = await ensureLocation(auth, false);
   const groupSku    = `DS-${Date.now()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`;
@@ -1514,33 +1531,60 @@ async function handlePush({ body, res, resolvePolicies, getCategories, aiEnrich,
       enableOutOfStockControl(body.access_token, pd.listingId).catch(() => {});
       return res.json({ success: true, sku: groupSku, listingId: pd.listingId, variantsCreated: variants.length });
     }
-    const errId = (pd.errors || [])[0]?.errorId;
+    const errId  = (pd.errors || [])[0]?.errorId;
+    const errMsg = (pd.errors || [])[0]?.message || '';
     console.warn(`[push] publish attempt ${attempt}: ${JSON.stringify(pd).slice(0, 300)}`);
+
+    // Handle validation errors (too long, missing value, etc.) by patching aspects
+    if (pd.errors?.length) {
+      let patched = false;
+      for (const err of pd.errors) {
+        // Aspect value too long — remove that aspect so eBay ignores it
+        const tooLongMatch = err.message?.match(/([^']+)'s value of "([^"]+)" is too long/);
+        if (tooLongMatch) {
+          const aspectName = tooLongMatch[1].trim();
+          console.log(`[push] removing too-long aspect: "${aspectName}" = "${tooLongMatch[2].slice(0,40)}"`);
+          delete aspects[aspectName];
+          // Also remove from group aspects
+          patched = true;
+          continue;
+        }
+        // Generic aspect fill from error params
+        for (const param of (err.parameters || [])) {
+          if (param.name === 'fieldName' || param.name === 'text1') {
+            const aName = param.value;
+            if (aName && !aspects[aName]) { aspects[aName] = ['Unbranded']; patched = true; }
+          }
+        }
+      }
+      if (patched && attempt < 3) {
+        await sleep(600);
+        continue; // retry publish with patched aspects
+      }
+    }
+
     if (errId === 25002) {
+      // Check if this is a real duplicate (has listingId param) or just a validation error misclassified
       const existing = (pd.errors[0]?.parameters || []).find(p => p.name === 'listingId')?.value || null;
-      console.log(`[push] 25002 duplicate (listing ${existing}) — cleaning up all orphaned items on attempt ${attempt}`);
-      // Only clean up on first 25002 hit — delete orphaned inventory + offers from previous failed push
-      if (attempt === 1) {
-        await cleanupVariation(allOfferIds);
-        await sleep(1500);
-        // Rebuild inventory items fresh and try again
-        attempt++;
-        continue;
+      if (existing) {
+        // Real duplicate — clean up orphaned inventory
+        console.log(`[push] 25002 real duplicate (listing ${existing}) — cleaning up on attempt ${attempt}`);
+        if (attempt === 1) {
+          await cleanupVariation(allOfferIds);
+          await sleep(1500);
+          attempt++;
+          continue;
+        }
+        return res.status(400).json({ error: `Duplicate listing (${existing}) — orphaned inventory cleared. Please try pushing again.`, errorId: 25002, existingListingId: existing, cleaned: true });
       }
-      // Second hit — return error with cleaned flag so UI knows to retry
-      return res.status(400).json({ error: `Duplicate listing${existing ? ` (${existing})` : ''} — orphaned inventory cleared. Please try pushing again.`, errorId: 25002, existingListingId: existing, cleaned: true });
+      // 25002 without listingId = validation error misclassified — already handled above
     }
-    // Auto-fill any missing required aspects and retry
-    for (const err of (pd.errors || [])) {
-      for (const param of (err.parameters || [])) {
-        if (!aspects[param.value]) aspects[param.value] = ['Unbranded'];
-      }
-    }
+
     if (attempt < 3) await sleep(800);
   }
   // FIX: publish failed after 3 attempts — clean up everything so it doesn't block future pushes
   await cleanupVariation(allOfferIds);
-  return res.status(400).json({ error: 'Publish failed after 3 attempts' });
+  return res.status(400).json({ error: 'Publish failed after 3 attempts', details: JSON.stringify(pd).slice(0, 600) });
 }
 
 // ─── REVISE action ─────────────────────────────────────────────────────────────
@@ -1735,10 +1779,26 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
       if (!name || aspects[name]) continue;
       const vals = (asp.aspectValues || []).map(v => v.localizedValue);
       if (!vals.length) continue;
-      const match = vals.find(v => (product.title || '').toLowerCase().includes(v.toLowerCase())) || vals[0];
+      // Filter out values that exceed eBay's 65-char limit per aspect value
+      const validVals = vals.filter(v => v.length <= 65);
+      if (!validVals.length) continue;
+      const titleLower = (product.title || '').toLowerCase();
+      const match = validVals.find(v => titleLower.includes(v.toLowerCase()))
+                 || validVals.find(v => v.toLowerCase() === 'unisex adults')
+                 || validVals.find(v => v.toLowerCase() === 'everyday')
+                 || validVals.find(v => /everyday|casual|regular/i.test(v))
+                 || validVals.sort((a,b) => a.length - b.length)[0]; // shortest valid value
       aspects[name] = [match];
     }
   } catch(e) { console.warn('[revise] aspects failed:', e.message); }
+
+  // Sanitize aspects: remove any value > 65 chars (eBay hard limit per value)
+  for (const [k, vals] of Object.entries(aspects)) {
+    if (Array.isArray(vals)) {
+      const cleaned = vals.filter(v => typeof v === 'string' && v.length <= 65);
+      if (cleaned.length) aspects[k] = cleaned; else delete aspects[k];
+    }
+  }
 
   // ── STEP 3: Get existing variant SKUs from eBay ───────────────────────────
   const grpRes = await fetch(
