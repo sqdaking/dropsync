@@ -2029,6 +2029,14 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
       return { pVal: entries[0]?.[1] || null, sVal: entries[1]?.[1] || null };
     }
 
+    // Extract combo data from product into local vars (product may have been updated by fallback merges above)
+    const comboInStock = product.comboInStock || {};
+    const comboPrices  = product.comboPrices  || {};
+    const comboAsin    = product.comboAsin    || {};
+    const sizePrices   = product.sizePrices   || {};
+    const hasComboData = Object.keys(comboAsin).length > 0;
+    const basePrice    = parseFloat(product.price || product.myPrice || 0);
+
     // Build a case-insensitive lookup table for comboInStock and comboPrices
     // so eBay aspect values ("White", "2 Big Kid") match Amazon keys ("White|2 Big Kid")
     // even with minor capitalisation/spacing differences
