@@ -1265,7 +1265,18 @@ async function handlePush({ body, res, resolvePolicies, getCategories, aiEnrich,
     const errId = (pd.errors || [])[0]?.errorId;
     if (errId === 25002) {
       const existing = (pd.errors[0]?.parameters || []).find(p => p.name === 'listingId')?.value || null;
-      return res.status(400).json({ error: `Duplicate — already listed as eBay item ${existing || '(check eBay)'}. Delete it first or use Revise.`, errorId: 25002, existingListingId: existing });
+      console.log(`[push/simple] 25002 duplicate (listing ${existing}) — cleaning up orphan inventory + offer then retrying`);
+      // Clean up orphaned inventory item and offer left over from a previous failed/ended push
+      await cleanupSimple(od.offerId);
+      await sleep(1200);
+      // One retry after cleanup
+      const pr2 = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${od.offerId}/publish`, { method: 'POST', headers: auth }).catch(() => null);
+      const pd2 = pr2 ? await pr2.json().catch(() => ({})) : {};
+      if (pd2.listingId) {
+        enableOutOfStockControl(body.access_token, pd2.listingId).catch(() => {});
+        return res.json({ success: true, sku: groupSku, offerId: od.offerId, listingId: pd2.listingId });
+      }
+      return res.status(400).json({ error: `Duplicate listing${existing ? ` (${existing})` : ''} — orphaned inventory cleared. Please try pushing again.`, errorId: 25002, existingListingId: existing, cleaned: true });
     }
     // FIX: publish failed — clean up inventory item + offer so it doesn't block future pushes
     await cleanupSimple(od.offerId);
@@ -1458,7 +1469,17 @@ async function handlePush({ body, res, resolvePolicies, getCategories, aiEnrich,
     console.warn(`[push] publish attempt ${attempt}: ${JSON.stringify(pd).slice(0, 300)}`);
     if (errId === 25002) {
       const existing = (pd.errors[0]?.parameters || []).find(p => p.name === 'listingId')?.value || null;
-      return res.status(400).json({ error: `Duplicate — already listed as eBay item ${existing || '(check eBay)'}. Delete it first or use Revise.`, errorId: 25002, existingListingId: existing });
+      console.log(`[push] 25002 duplicate (listing ${existing}) — cleaning up all orphaned items on attempt ${attempt}`);
+      // Only clean up on first 25002 hit — delete orphaned inventory + offers from previous failed push
+      if (attempt === 1) {
+        await cleanupVariation(allOfferIds);
+        await sleep(1500);
+        // Rebuild inventory items fresh and try again
+        attempt++;
+        continue;
+      }
+      // Second hit — return error with cleaned flag so UI knows to retry
+      return res.status(400).json({ error: `Duplicate listing${existing ? ` (${existing})` : ''} — orphaned inventory cleared. Please try pushing again.`, errorId: 25002, existingListingId: existing, cleaned: true });
     }
     // Auto-fill any missing required aspects and retry
     for (const err of (pd.errors || [])) {
