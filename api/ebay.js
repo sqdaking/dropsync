@@ -2036,6 +2036,7 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
     const sizePrices   = product.sizePrices   || {};
     const hasComboData = Object.keys(comboAsin).length > 0;
     const basePrice    = parseFloat(product.price || product.myPrice || 0);
+    const freshStock   = product.inStock !== false;
 
     // Build a case-insensitive lookup table for comboInStock and comboPrices
     // so eBay aspect values ("White", "2 Big Kid") match Amazon keys ("White|2 Big Kid")
@@ -2120,7 +2121,7 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
       });
       if (r0.status === 401) return res.status(401).json({ error: 'eBay token missing inventory permission. Go to Settings → Force Reconnect.', code: 'INVENTORY_401' });
       if (r0.ok || r0.status === 204) createdSkus.add(sku0);
-      else { const t = await r0.text(); console.warn(`[revise] first item fail: ${r0.status} ${t.slice(0,100)}`); failedSkus.push(sku0); }
+      else { const t = await r0.text(); console.warn(`[revise] first item fail: ${r0.status} ${t.slice(0,600)}`); failedSkus.push(sku0); }
     }
 
     // Rest in batches of 15
@@ -2142,7 +2143,7 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
           }),
         });
         if (r.ok || r.status === 204) createdSkus.add(sku);
-        else { const t = await r.text(); console.warn(`[revise] PUT fail ${sku.slice(-20)}: ${r.status} ${t.slice(0,80)}`); failedSkus.push(sku); }
+        else { const t = await r.text(); console.warn(`[revise] PUT fail ${sku.slice(-20)}: ${r.status} ${t.slice(0,300)}`); failedSkus.push(sku); }
       }));
       if (i + 15 < variantSkus.length) await sleep(100);
     }
@@ -2275,7 +2276,6 @@ async function handleRevise({ body, res, getCategories, aiEnrich, sanitizeTitle,
         suggestion: 'Click Re-push in the Listed tab to end this listing and push a fresh one.',
       });
     }
-    const freshStock = product.inStock !== false;
     const newPrice   = applyMk(parseFloat(product.price || 0));
     const finalPrice = newPrice > 0 ? newPrice : (applyMk(fallbackPrice) || 9.99);
     const newQty     = freshStock ? defaultQty : 0;
