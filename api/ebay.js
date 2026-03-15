@@ -723,60 +723,93 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null) {
     const fullPrimary = Object.entries(primaryToAsins)
       .sort((a,b) => b[1].length - a[1].length)[0]?.[0] || primaryVals[0];
 
-    // Build what to fetch for price+stock:
-    // - If 2 dimensions: fetch each secondary value's ASIN via fullPrimary (e.g. one color × all sizes)
-    // - If 1 dimension only (Style, Size, Flavor etc.): fetch EACH primary value's ASIN
-    const secToFetchAsin = {};  // key → asin  (key = secondaryVal or primaryVal for 1-dim)
+    // Build per-SECONDARY fetch: one ASIN per size (gives per-size price+stock)
+    const secToFetchAsin = {};
     if (secondaryDim) {
-      // 2 dimensions: fetch via fullPrimary's secondary ASINs
       for (const [key, asin] of Object.entries(comboAsin)) {
         const [pv, sv] = key.split('|');
         if (pv === fullPrimary) secToFetchAsin[sv] = asin;
       }
-      // Fallback: if fullPrimary has no combos mapped, use any
       if (!Object.keys(secToFetchAsin).length && Object.keys(comboAsin).length) {
         secToFetchAsin[''] = Object.values(comboAsin)[0];
       }
     } else {
-      // 1 dimension only: fetch EACH primary value's ASIN for individual price+stock
       for (const [key, asin] of Object.entries(comboAsin)) {
         const pv = key.split('|')[0];
-        secToFetchAsin[pv] = asin;  // key = primaryVal (not secondary)
+        secToFetchAsin[pv] = asin;
+      }
+    }
+
+    // Build per-PRIMARY fetch: one ASIN per color (gives per-color price+stock)
+    // This is the key fix for products like SHESHOW where each color has a different price.
+    // Uses a consistent secondary value (e.g. "Small") for all colors for comparability.
+    const primaryToFetchAsin = {};
+    if (secondaryDim) {
+      const preferredSv = secondaryVals[1] || secondaryVals[0];
+      for (const pv of primaryVals) {
+        const asin = comboAsin[`${pv}|${preferredSv}`]
+                  || comboAsin[Object.keys(comboAsin).find(k => k.startsWith(pv + '|')) || ''];
+        if (asin) primaryToFetchAsin[pv] = asin;
       }
     }
 
     const asinInStock = {};  // ASIN → true/false/undefined
     const asinPrice   = {};  // ASIN → price
 
-    // Fetch per-secondary-value pages for price + stock
+    // Fetch per-secondary pages (serial for stock, sizes only = few pages)
     await Promise.all(Object.entries(secToFetchAsin).map(async ([sVal, asin]) => {
       if (!asin) return;
       const h = await fetchPage(`https://www.amazon.com/dp/${asin}`, ua);
-      if (!h) return; // blocked → leave undefined (will use mainInStock)
+      if (!h) return;
       const price = extractPriceFromBuyBox(h);
       if (price) asinPrice[asin] = price;
       const bb = (h.match(/id="availability"[\s\S]{0,3000}/)?.[0] || '')
                + (h.match(/id="addToCart_feature_div"[\s\S]{0,1000}/)?.[0] || '');
-      if (bb.length > 30) {
-        asinInStock[asin] = !bb.toLowerCase().includes('currently unavailable');
-      }
-      // If bb is short/empty: leave undefined → will use mainInStock fallback
+      if (bb.length > 30) asinInStock[asin] = !bb.toLowerCase().includes('currently unavailable');
     }));
 
     // Build per-secondary stock + price maps
-    const secInStock = {};  // secondaryVal → true/false
-    const sizePrices = {};  // secondaryVal → price
+    const secInStock = {};
+    const sizePrices = {};
     for (const [sVal, asin] of Object.entries(secToFetchAsin)) {
       if (asinInStock[asin] !== undefined) secInStock[sVal] = asinInStock[asin];
       if (asinPrice[asin]) sizePrices[sVal] = asinPrice[asin];
     }
 
-    // Fetch remaining unique ASINs for per-combo pricing (up to 15 total)
-    // This handles products where prices vary by BOTH dimensions (e.g. Size × Style)
-    const fetchedAsins = new Set(Object.values(secToFetchAsin));
+    // Fetch per-primary (per-color) pages — cap at 20 to stay within Vercel timeout
+    // Skip ASINs already fetched above. This gives per-color prices + stock.
+    if (secondaryDim && Object.keys(primaryToFetchAsin).length) {
+      const toFetch = Object.entries(primaryToFetchAsin)
+        .filter(([, a]) => a && !asinPrice[a])
+        .slice(0, 20);
+      console.log(`[scraper] fetching ${toFetch.length} per-color ASINs for primary-dim pricing`);
+      for (let i = 0; i < toFetch.length; i += 5) {
+        await Promise.all(toFetch.slice(i, i+5).map(async ([pv, asin]) => {
+          const h = await fetchPage(`https://www.amazon.com/dp/${asin}`, ua);
+          if (!h) return;
+          const price = extractPriceFromBuyBox(h);
+          if (price) asinPrice[asin] = price;
+          const bb = (h.match(/id="availability"[\s\S]{0,3000}/)?.[0] || '')
+                   + (h.match(/id="addToCart_feature_div"[\s\S]{0,1000}/)?.[0] || '');
+          if (bb.length > 30) asinInStock[asin] = !bb.toLowerCase().includes('currently unavailable');
+        }));
+        if (i + 5 < toFetch.length) await sleep(200);
+      }
+    }
+
+    // Build per-primary price+stock maps (color → price)
+    const primaryPrices  = {};  // colorName → price
+    const primaryInStock = {};  // colorName → bool
+    for (const [pv, asin] of Object.entries(primaryToFetchAsin)) {
+      if (asinPrice[asin])              primaryPrices[pv]  = asinPrice[asin];
+      if (asinInStock[asin] !== undefined) primaryInStock[pv] = asinInStock[asin];
+    }
+
+    // Fetch remaining unique ASINs for per-combo pricing (up to 10 total)
+    const fetchedAsins = new Set([...Object.values(secToFetchAsin), ...Object.values(primaryToFetchAsin)]);
     const remainingAsins = [...new Set(Object.values(comboAsin))]
       .filter(a => a && !fetchedAsins.has(a) && !asinPrice[a])
-      .slice(0, 15); // cap to avoid Vercel timeout
+      .slice(0, 10);
     if (remainingAsins.length) {
       console.log(`[scraper] fetching ${remainingAsins.length} additional ASINs for per-combo pricing`);
       for (let i = 0; i < remainingAsins.length; i += 5) {
@@ -804,19 +837,23 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null) {
     }
 
     // Build comboInStock + comboPrices
+    // Price priority: per-exact-ASIN → per-color (primary) → per-size (secondary) → mainPrice
+    // Stock priority: per-exact-ASIN → per-color → per-size → mainInStock
     const comboInStock = {};
     const comboPrices  = {};
     for (const [key, asin] of Object.entries(comboAsin)) {
-      const [, sv] = key.split('|');
-      // Price: per-ASIN → per-secondary → main page
-      comboPrices[key] = asinPrice[asin] || sizePrices[sv] || mainPrice;
-      // Stock: explicit per-ASIN → per-secondary level → mainInStock fallback
+      const [pv, sv] = key.split('|');
+      comboPrices[key] = asinPrice[asin]
+                      || primaryPrices[pv]
+                      || sizePrices[sv]
+                      || mainPrice;
       if (asinInStock[asin] !== undefined) {
         comboInStock[key] = asinInStock[asin];
+      } else if (primaryInStock[pv] !== undefined) {
+        comboInStock[key] = primaryInStock[pv];
       } else if (secInStock[sv] !== undefined) {
         comboInStock[key] = secInStock[sv];
       } else {
-        // Unknown — default to whatever the main page shows
         comboInStock[key] = mainInStock;
       }
     }
@@ -834,15 +871,21 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null) {
     if (inStockPrices.length) product.price = Math.min(...inStockPrices);
     else { const allPrices = Object.values(comboPrices).filter(p=>p>0); if (allPrices.length) product.price = Math.min(...allPrices); }
 
-    // Detect if per-variant price fetches were blocked (all prices identical)
-    // This happens when Amazon redirects all per-ASIN server requests to the same page
+    // Detect if per-variant price fetches were genuinely blocked.
+    // Many products legitimately have identical prices across variants (common for apparel).
+    // Only flag _pricesFailed when ALL combo prices equal the main-page price AND
+    // each combo has a different ASIN (meaning real per-ASIN data should exist but didn't load).
     const allComboPrices = Object.values(comboPrices).filter(p => p > 0);
     const uniquePrices = [...new Set(allComboPrices)];
-    if (allComboPrices.length > 1 && uniquePrices.length === 1) {
-      // All variants returned same price — server-side fetches were blocked/redirected
+    const uniqueAsins = [...new Set(Object.values(comboAsin))];
+    const allEqualMainPrice = allComboPrices.length > 0 && uniquePrices.length === 1
+                           && Math.abs(uniquePrices[0] - mainPrice) < 0.01;
+    if (allComboPrices.length >= 3 && allEqualMainPrice && uniqueAsins.length > 1) {
+      // All variants fell back to main-page price AND each has a different ASIN
+      // → per-ASIN price fetches were blocked (Amazon bot-protection)
       product._pricesFailed = true;
-      product._pricesFailedReason = 'All variant prices identical — Amazon blocked per-ASIN server fetches. Cannot verify individual prices.';
-      console.warn(`[scraper] price fetch failed — all ${allComboPrices.length} combos returned $${uniquePrices[0]}`);
+      product._pricesFailedReason = 'All variant prices match main page — Amazon may have blocked per-ASIN price fetches.';
+      console.warn(`[scraper] price fetch possibly blocked — ${allComboPrices.length} combos all $${uniquePrices[0]} == mainPrice`);
     } else {
       product._pricesFailed = false;
     }
@@ -1034,11 +1077,13 @@ function buildVariants({ product, groupSku, applyMk, defaultQty, body }) {
   }
 
   function isInStock(pVal, sVal) {
-    if (!hasComboData) return true; // no combo data → assume in stock (safer than OOS)
+    if (!hasComboData) return true; // no combo data → assume in stock
     const key = `${pVal || ''}|${sVal || ''}`;
-    if (!comboAsin[key]) return false;           // combo doesn't exist on Amazon
-    if (comboInStock[key] === false) return false; // explicitly OOS
-    return true; // comboInStock = true or undefined → in stock
+    // Only mark OOS if explicitly tagged false — do NOT return false for missing keys.
+    // Missing combos happen when: Style products have partial comboAsin maps,
+    // or eBay aspect names differ slightly from Amazon scraped names.
+    if (comboInStock[key] === false) return false;
+    return true; // unknown or in stock → keep available
   }
 
   function getImage(pVal) {
@@ -1097,9 +1142,13 @@ function buildVariesBy(product, primaryGroup, secondaryGroup) {
   }
   // aspectsImageVariesBy: the dimension that has per-variant images
   // Use primary if it's color-like, otherwise empty (all variants share same images)
-  const isColorPrimary = primaryGroup && /color|colour/i.test(primaryGroup.name);
+  // aspectsImageVariesBy: set to primary dimension if each primary value has distinct images
+  // This covers Color, Style, Pattern, and any other primary dim with per-value images
+  const hasPerVariantImages = primaryGroup && Object.values(
+    product.variationImages?.[primaryGroup.name] || {}
+  ).filter(Boolean).length > 1;
   return {
-    aspectsImageVariesBy: isColorPrimary ? [primaryGroup.name] : [],
+    aspectsImageVariesBy: hasPerVariantImages ? [primaryGroup.name] : [],
     specifications: specs,
   };
 }
@@ -2524,42 +2573,75 @@ module.exports = async (req, res) => {
         const fullPrimary = Object.entries(primaryToAsins)
           .sort((a,b) => b[1].length - a[1].length)[0]?.[0] || primaryVals[0];
 
-        // Build secondary→ASIN map for the fullPrimary
+        // Build per-SECONDARY fetch (one ASIN per size via fullPrimary color)
         const secToFetchAsin = {};
         for (const [key, asin] of Object.entries(comboAsin)) {
           const [pv, sv] = key.split('|');
           if (pv === fullPrimary) secToFetchAsin[sv] = asin;
         }
         if (!Object.keys(secToFetchAsin).length && Object.keys(comboAsin).length) {
-          // Color-only or can't find fullPrimary combos — use any asin
-          const firstAsin = Object.values(comboAsin)[0];
-          secToFetchAsin[''] = firstAsin;
+          secToFetchAsin[''] = Object.values(comboAsin)[0];
+        }
+
+        // Build per-PRIMARY fetch (one ASIN per color at a consistent size)
+        const primaryToFetchAsin2 = {};
+        if (secondaryVals.length) {
+          const preferredSv = secondaryVals[1] || secondaryVals[0];
+          for (const pv of primaryVals) {
+            const asin = comboAsin[`${pv}|${preferredSv}`]
+                      || comboAsin[Object.keys(comboAsin).find(k => k.startsWith(pv + '|')) || ''];
+            if (asin) primaryToFetchAsin2[pv] = asin;
+          }
         }
 
         const asinInStock = {};  // ASIN → true/false/undefined
         const asinPrice   = {};  // ASIN → price
 
-        // Fetch per-secondary-value pages for price + stock
+        // Fetch per-secondary pages
         await Promise.all(Object.entries(secToFetchAsin).map(async ([sVal, asin]) => {
           if (!asin) return;
           const h = await fetchPage(`https://www.amazon.com/dp/${asin}`, ua);
-          if (!h) return; // blocked → leave undefined (will use mainInStock)
+          if (!h) return;
           const price = extractPriceFromBuyBox(h);
           if (price) asinPrice[asin] = price;
           const bb = (h.match(/id="availability"[\s\S]{0,3000}/)?.[0] || '')
                    + (h.match(/id="addToCart_feature_div"[\s\S]{0,1000}/)?.[0] || '');
-          if (bb.length > 30) {
-            asinInStock[asin] = !bb.toLowerCase().includes('currently unavailable');
-          }
-          // If bb is short/empty: leave undefined → will use mainInStock fallback
+          if (bb.length > 30) asinInStock[asin] = !bb.toLowerCase().includes('currently unavailable');
         }));
 
-        // Build per-secondary stock + price maps
-        const secInStock = {};  // secondaryVal → true/false
-        const sizePrices = {};  // secondaryVal → price
+        // Build per-secondary maps
+        const secInStock = {};
+        const sizePrices = {};
         for (const [sVal, asin] of Object.entries(secToFetchAsin)) {
           if (asinInStock[asin] !== undefined) secInStock[sVal] = asinInStock[asin];
           if (asinPrice[asin]) sizePrices[sVal] = asinPrice[asin];
+        }
+
+        // Fetch per-primary (per-color) pages — up to 20 colors
+        if (Object.keys(primaryToFetchAsin2).length) {
+          const toFetch2 = Object.entries(primaryToFetchAsin2)
+            .filter(([, a]) => a && !asinPrice[a]).slice(0, 20);
+          console.log(`[scrape/inline] fetching ${toFetch2.length} per-color ASINs`);
+          for (let i = 0; i < toFetch2.length; i += 5) {
+            await Promise.all(toFetch2.slice(i, i+5).map(async ([pv, asin]) => {
+              const h = await fetchPage(`https://www.amazon.com/dp/${asin}`, ua);
+              if (!h) return;
+              const price = extractPriceFromBuyBox(h);
+              if (price) asinPrice[asin] = price;
+              const bb = (h.match(/id="availability"[\s\S]{0,3000}/)?.[0] || '')
+                       + (h.match(/id="addToCart_feature_div"[\s\S]{0,1000}/)?.[0] || '');
+              if (bb.length > 30) asinInStock[asin] = !bb.toLowerCase().includes('currently unavailable');
+            }));
+            if (i + 5 < toFetch2.length) await sleep(200);
+          }
+        }
+
+        // Build per-primary maps
+        const primaryPrices2  = {};
+        const primaryInStock2 = {};
+        for (const [pv, asin] of Object.entries(primaryToFetchAsin2)) {
+          if (asinPrice[asin])               primaryPrices2[pv]  = asinPrice[asin];
+          if (asinInStock[asin] !== undefined) primaryInStock2[pv] = asinInStock[asin];
         }
 
         // Fill missing prices with main page price
@@ -2568,19 +2650,19 @@ module.exports = async (req, res) => {
         if (!secondaryVals.length && !sizePrices['']) sizePrices[''] = mainPrice;
 
         // Build comboInStock + comboPrices
+        // Price priority: per-ASIN → per-color → per-size → mainPrice
         const comboInStock = {};
         const comboPrices  = {};
         for (const [key, asin] of Object.entries(comboAsin)) {
-          const [, sv] = key.split('|');
-          // Price: per-ASIN → per-secondary → main page
-          comboPrices[key] = asinPrice[asin] || sizePrices[sv] || mainPrice;
-          // Stock: explicit per-ASIN → per-secondary level → mainInStock fallback
+          const [pv, sv] = key.split('|');
+          comboPrices[key] = asinPrice[asin] || primaryPrices2[pv] || sizePrices[sv] || mainPrice;
           if (asinInStock[asin] !== undefined) {
             comboInStock[key] = asinInStock[asin];
+          } else if (primaryInStock2[pv] !== undefined) {
+            comboInStock[key] = primaryInStock2[pv];
           } else if (secInStock[sv] !== undefined) {
             comboInStock[key] = secInStock[sv];
           } else {
-            // Unknown — default to whatever the main page shows
             comboInStock[key] = mainInStock;
           }
         }
