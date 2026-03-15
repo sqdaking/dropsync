@@ -320,7 +320,6 @@ async function serverUpdateProduct(id, updates) {
 
 let S = { ...DEFAULT_STATE };
 try { const saved = JSON.parse(localStorage.getItem(KEY)||'{}'); S = { ...S, ...saved }; } catch {}
-S.sandboxMode = false; // always production — sandbox removed
 
 // ── Price Calc ────────────────────────────────────────
 function calcPrice(cost, markup) {
@@ -745,10 +744,10 @@ async function doPush() {
     const r = await fetch(`${S.backendUrl}/api/ebay?action=push`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        access_token: token, product: prod, sandbox: S.sandboxMode || false,
-        fulfillmentPolicyId: S.sandboxMode ? '' : S.fulfillmentPolicyId,
-        paymentPolicyId:     S.sandboxMode ? '' : S.paymentPolicyId,
-        returnPolicyId:      S.sandboxMode ? '' : S.returnPolicyId,
+        access_token: token, product: prod,
+        fulfillmentPolicyId: S.fulfillmentPolicyId,
+        paymentPolicyId:     S.paymentPolicyId,
+        returnPolicyId:      S.returnPolicyId,
         markup: S.markup, handlingCost: S.handlingCost,
       }),
     });
@@ -1085,10 +1084,10 @@ async function bulkPushAll() {
       const r = await fetch(`${S.backendUrl}/api/ebay?action=push`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({
-          access_token: token, product: p, sandbox: S.sandboxMode||false,
-          fulfillmentPolicyId: S.sandboxMode?'':S.fulfillmentPolicyId,
-          paymentPolicyId:     S.sandboxMode?'':S.paymentPolicyId,
-          returnPolicyId:      S.sandboxMode?'':S.returnPolicyId,
+          access_token: token, product: p,
+          fulfillmentPolicyId: S.fulfillmentPolicyId,
+          paymentPolicyId:     S.paymentPolicyId,
+          returnPolicyId:      S.returnPolicyId,
           markup: S.markup, handlingCost: S.handlingCost,
         })
       });
@@ -1556,10 +1555,9 @@ async function pushExisting(pid) {
       body: JSON.stringify({
         access_token: token,
         product: productToPost,
-        sandbox: S.sandboxMode || false,
-        fulfillmentPolicyId: S.sandboxMode ? '' : S.fulfillmentPolicyId,
-        paymentPolicyId:     S.sandboxMode ? '' : S.paymentPolicyId,
-        returnPolicyId:      S.sandboxMode ? '' : S.returnPolicyId,
+        fulfillmentPolicyId: S.fulfillmentPolicyId,
+        paymentPolicyId:     S.paymentPolicyId,
+        returnPolicyId:      S.returnPolicyId,
         markup: S.markup,
         handlingCost: S.handlingCost,
       }),
@@ -1623,10 +1621,9 @@ async function pushAll() {
         body: JSON.stringify({
           access_token: token,
           product: productToPost,
-          sandbox: S.sandboxMode || false,
-          fulfillmentPolicyId: S.sandboxMode ? '' : S.fulfillmentPolicyId,
-          paymentPolicyId:     S.sandboxMode ? '' : S.paymentPolicyId,
-          returnPolicyId:      S.sandboxMode ? '' : S.returnPolicyId,
+          fulfillmentPolicyId: S.fulfillmentPolicyId,
+          paymentPolicyId:     S.paymentPolicyId,
+          returnPolicyId:      S.returnPolicyId,
           markup:       S.markup,
           handlingCost: S.handlingCost,
         }),
@@ -1683,7 +1680,6 @@ async function syncOne(pid) {
         quantity: p.quantity || 1,
         markup: S.markup,
         handlingCost: S.handlingCost,
-        sandbox: S.sandboxMode || false,
         fallbackImages:   p.images || [],
         fallbackTitle:    p.ebayTitle || p.title || '',
         // FIX: pass Amazon cost only — handleRevise applies markup via applyMk()
@@ -1768,7 +1764,7 @@ async function doRepush(pid) {
         const token = await ensureToken();
         await fetch(`${S.backendUrl}/api/ebay?action=endListing`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId, sandbox: S.sandboxMode || false }),
+          body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId }),
         });
       } catch(e) { console.warn('[doRepush] end listing failed (continuing):', e.message); }
     }
@@ -1822,7 +1818,7 @@ async function repushListing(pid) {
         const token = await ensureToken();
         await fetch(`${S.backendUrl}/api/ebay?action=endListing`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId, sandbox: S.sandboxMode || false }),
+          body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId }),
         });
       } catch(e) { console.warn('[repush] end listing failed (continuing):', e.message); }
     }
@@ -1919,7 +1915,6 @@ async function syncAll() {
           quantity: p.quantity || 1,
           markup: S.markup,
           handlingCost: S.handlingCost,
-          sandbox: S.sandboxMode || false,
           fallbackImages:   p.images || [],
           fallbackTitle:    p.ebayTitle || p.title || '',
           // FIX: pass Amazon cost only, not eBay myPrice (double markup bug)
@@ -2014,10 +2009,9 @@ async function endListing(pid, deleteAfter = false) {
   if (!p) return;
   try {
     const token = await ensureToken();
-    const sandbox = S.sandboxMode || false;
     const r = await fetch(`${S.backendUrl}/api/ebay?action=endListing`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId, sandbox }),
+      body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId }),
     });
     const d = await r.json();
     if (!d.success) throw new Error(d.error || 'End listing failed');
@@ -2342,11 +2336,10 @@ function renderSettings() {
         <div class="card-body">
           <div style="margin-bottom:14px;display:flex;align-items:center;gap:12px">
             <span style="font-size:13px;font-weight:600;color:var(--green)">🟢 Production</span>
-            ${S.sandboxMode ? `<span style="background:#f59e0b;color:#000;font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px">SANDBOX</span>` : ''}
           </div>
           <div id="ebay-conn-status" style="margin-bottom:16px">
             ${S.token
-              ? `<div class="status-bar success">✅ Connected to eBay${S.sandboxMode?' (Sandbox)':''} · token expires ${new Date(S.tokenExpiry).toLocaleTimeString()}</div>`
+              ? `<div class="status-bar success">✅ Connected to eBay · token expires ${new Date(S.tokenExpiry).toLocaleTimeString()}</div>`
               : `<div class="status-bar info">Not connected. Click below to authorize eBay.</div>`}
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -2666,15 +2659,11 @@ async function savePricingDefaults() {
   }
 }
 
-function setSandboxMode(val) {
-  // Sandbox mode removed — always use production
-  S.sandboxMode = false; save();
-}
 
 async function connectEbay() {
   if (!S.backendUrl) { toast('Set Backend URL first in Settings', 'error'); return; }
   try {
-    const r = await fetch(`${S.backendUrl}/api/ebay?action=auth&sandbox=${S.sandboxMode?'true':'false'}`);
+    const r = await fetch(`${S.backendUrl}/api/ebay?action=auth`);
     const d = await r.json();
     if (!d.url) throw new Error('No auth URL returned from backend');
     
@@ -2700,7 +2689,6 @@ async function connectEbay() {
             access_token:  data.token,
             refresh_token: data.refresh,
             token_expiry:  data.expiry,
-            sandbox:       '0',
           }),
         }).catch(()=>{});
       }
@@ -2751,7 +2739,7 @@ async function refreshToken() {
     if (S.serverUrl && S.refreshToken) {
       fetch(S.serverUrl + '/api/settings/bulk', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ access_token: S.token, refresh_token: S.refreshToken, token_expiry: S.tokenExpiry, sandbox: '0' }),
+        body: JSON.stringify({ access_token: S.token, refresh_token: S.refreshToken, token_expiry: S.tokenExpiry }),
       }).catch(()=>{});
     }
   } catch (e) { toast(e.message, 'error'); }
@@ -2804,7 +2792,6 @@ async function replenishFromOrder(productId, orderIdSafe, btn) {
         quantity:      p.quantity || 1,
         markup:        S.markup,
         handlingCost:  S.handlingCost,
-        sandbox:       S.sandboxMode || false,
         clientHtml,   // browser-fetched Amazon HTML (bypasses Vercel IP blocks)
       })
     });
@@ -2850,7 +2837,7 @@ async function repushFromOrder(productId, orderIdSafe, btn) {
       const token = await ensureToken();
       await fetch(`${S.backendUrl}/api/ebay?action=endListing`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId, sandbox: S.sandboxMode || false }),
+        body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId }),
       }).catch(e => console.warn('[repushFromOrder] end failed:', e.message));
     }
 
@@ -2935,7 +2922,6 @@ async function linkAndReplenish(productId, itemListingId, itemSku, orderIdSafe, 
         quantity:      p.quantity || 1,
         markup:        S.markup,
         handlingCost:  S.handlingCost,
-        sandbox:       S.sandboxMode || false,
         clientHtml,
       })
     });
@@ -2991,7 +2977,7 @@ async function loadPolicies() {
     const token = await ensureToken();
     const r = await fetch(`${S.backendUrl}/api/ebay?action=policies`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ access_token: token, sandbox: S.sandboxMode || false }),
+      body: JSON.stringify({ access_token: token }),
     });
     const d = await r.json();
     const populate = (selId, items, savedId, idKey, nameKey) => {
