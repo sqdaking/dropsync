@@ -2168,6 +2168,12 @@ function renderOrderRows() {
               onmouseover="this.style.background='rgba(245,158,11,.2)'" onmouseout="this.style.background='rgba(245,158,11,.1)'">
              <img src="https://www.amazon.com/favicon.ico" style="width:12px;height:12px"> Amazon Source
            </a>
+           <button onclick="updateSourceUrl('${productId}','${orderId_safe}')"
+             title="Change or remove Amazon source URL"
+             style="display:inline-flex;align-items:center;font-size:11px;color:var(--text3);background:transparent;border:none;padding:2px 5px;border-radius:5px;cursor:pointer;line-height:1"
+             onmouseover="this.style.color='var(--text2)'" onmouseout="this.style.color='var(--text3)'">
+             ✏️
+           </button>
            ${ebaySku ? `
              <button onclick="replenishFromOrder('${productId}','${orderId_safe}',this)"
                style="display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:600;color:#10b981;background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);padding:3px 9px;border-radius:6px;cursor:pointer"
@@ -2179,7 +2185,14 @@ function renderOrderRows() {
                onmouseover="this.style.opacity='.85'" onmouseout="this.style.opacity='1'">
                ♻️ Re-push
              </button>
+             <button onclick="updateEbayListingId('${productId}','${orderId_safe}')"
+               title="Update eBay listing ID if listing ended or was re-created"
+               style="display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:600;color:var(--text3);background:transparent;border:1px solid var(--border);padding:3px 8px;border-radius:6px;cursor:pointer"
+               onmouseover="this.style.borderColor='var(--accent2)';this.style.color='var(--text2)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text3)'">
+               ✏️ ID
+             </button>
            ` : ''}
+           <div data-update-anchor></div>
          </div>`
       : `<div style="display:flex;align-items:center;gap:6px;margin-top:7px;flex-wrap:wrap">
            <div style="position:relative;flex:1;min-width:180px;max-width:320px">
@@ -2771,6 +2784,137 @@ function forceReconnect() {
 // ── REPLENISH from order card ─────────────────────────────────────────────────
 // Wipes all eBay listing content, re-scrapes Amazon fresh, rewrites in-place.
 // Same listing ID kept. Rolls back to old data if scrape/validation fails.
+// ── updateEbayListingId: let user paste a new eBay listing ID ─────────────
+// Used when listing ended or was re-created and needs to be relinked in catalog
+function updateEbayListingId(productId, orderIdSafe) {
+  const p = S.products?.find(x => x.id === productId);
+  if (!p) { toast('Product not found', 'error'); return; }
+
+  const containerId = `update-id-box-${orderIdSafe}`;
+  // Toggle: if already showing, hide it
+  const existing = document.getElementById(containerId);
+  if (existing) { existing.remove(); return; }
+
+  const anchor = document.querySelector(`#order-card-${orderIdSafe} [data-update-anchor]`);
+  if (!anchor) return;
+
+  const box = document.createElement('div');
+  box.id = containerId;
+  box.style.cssText = 'display:flex;align-items:center;gap:6px;margin-top:7px;flex-wrap:wrap;animation:fadeIn .15s';
+  box.innerHTML = `
+    <input id="new-ebay-id-${orderIdSafe}" type="text"
+      placeholder="Paste new eBay listing ID (e.g. 198180204989)"
+      style="flex:1;min-width:200px;font-size:11px;background:var(--bg);border:1px solid var(--accent2);border-radius:6px;padding:4px 9px;color:var(--text);outline:none"
+      onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--accent2)'"
+      onkeydown="if(event.key==='Enter')saveNewEbayListingId('${productId}','${orderIdSafe}')">
+    <button onclick="saveNewEbayListingId('${productId}','${orderIdSafe}')"
+      style="flex-shrink:0;font-size:11px;font-weight:600;color:#fff;background:#6366f1;border:none;padding:4px 11px;border-radius:6px;cursor:pointer">
+      Save ID
+    </button>
+    <button onclick="document.getElementById('${containerId}')?.remove()"
+      style="flex-shrink:0;font-size:11px;color:var(--text3);background:transparent;border:1px solid var(--border);padding:4px 8px;border-radius:6px;cursor:pointer">
+      Cancel
+    </button>`;
+  anchor.after(box);
+  document.getElementById(`new-ebay-id-${orderIdSafe}`)?.focus();
+}
+
+async function saveNewEbayListingId(productId, orderIdSafe) {
+  const p = S.products?.find(x => x.id === productId);
+  if (!p) return;
+
+  const input = document.getElementById(`new-ebay-id-${orderIdSafe}`);
+  const raw   = (input?.value || '').trim();
+  // Accept full URL or bare ID
+  const idMatch = raw.match(/(\d{12,})/);
+  const newId   = idMatch?.[1] || '';
+
+  if (!newId) { toast('Enter a valid eBay listing ID', 'error'); return; }
+  if (newId === p.ebayListingId) { toast('That is already the current listing ID', 'warn'); return; }
+
+  const oldId = p.ebayListingId;
+  p.ebayListingId = newId;
+  markDirty(p.id); save();
+
+  // Remove the input box
+  document.getElementById(`update-id-box-${orderIdSafe}`)?.remove();
+
+  toast(`✅ Listing ID updated: ${oldId || '(none)'} → ${newId}`, 'success', 5000);
+  addLog('sync', `eBay listing ID updated for: ${p.title?.slice(0,50)}`, `${oldId || 'none'} → ${newId}`, { productId: p.id });
+  renderOrderRows();
+}
+
+
+// ── updateSourceUrl: let user change or clear the Amazon source URL ───────────
+function updateSourceUrl(productId, orderIdSafe) {
+  const p = S.products?.find(x => x.id === productId);
+  if (!p) { toast('Product not found', 'error'); return; }
+
+  const containerId = `update-url-box-${orderIdSafe}`;
+  const existing = document.getElementById(containerId);
+  if (existing) { existing.remove(); return; }
+
+  const anchor = document.querySelector(`#order-card-${orderIdSafe} [data-update-anchor]`);
+  if (!anchor) return;
+
+  const box = document.createElement('div');
+  box.id = containerId;
+  box.style.cssText = 'display:flex;align-items:center;gap:6px;margin-top:7px;flex-wrap:wrap;animation:fadeIn .15s';
+  box.innerHTML = `
+    <input id="new-url-${orderIdSafe}" type="url"
+      value="${(p.sourceUrl||'').replace(/"/g,'&quot;')}"
+      placeholder="Paste new Amazon URL (or clear to remove)"
+      style="flex:1;min-width:220px;font-size:11px;background:var(--bg);border:1px solid var(--accent2);border-radius:6px;padding:4px 9px;color:var(--text);outline:none"
+      onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--accent2)'"
+      onkeydown="if(event.key==='Enter')saveNewSourceUrl('${productId}','${orderIdSafe}')">
+    <button onclick="saveNewSourceUrl('${productId}','${orderIdSafe}')"
+      style="flex-shrink:0;font-size:11px;font-weight:600;color:#fff;background:#f59e0b;border:none;padding:4px 11px;border-radius:6px;cursor:pointer">
+      Save URL
+    </button>
+    <button onclick="saveNewSourceUrl('${productId}','${orderIdSafe}',true)"
+      title="Remove Amazon link from this order"
+      style="flex-shrink:0;font-size:11px;font-weight:600;color:var(--red,#ef4444);background:transparent;border:1px solid rgba(239,68,68,.4);padding:4px 9px;border-radius:6px;cursor:pointer">
+      🗑️ Remove
+    </button>
+    <button onclick="document.getElementById('${containerId}')?.remove()"
+      style="flex-shrink:0;font-size:11px;color:var(--text3);background:transparent;border:1px solid var(--border);padding:4px 8px;border-radius:6px;cursor:pointer">
+      Cancel
+    </button>`;
+  anchor.after(box);
+  const inp = document.getElementById(`new-url-${orderIdSafe}`);
+  inp?.focus();
+  inp?.select();
+}
+
+async function saveNewSourceUrl(productId, orderIdSafe, remove = false) {
+  const p = S.products?.find(x => x.id === productId);
+  if (!p) return;
+
+  let newUrl = '';
+  if (!remove) {
+    const raw = (document.getElementById(`new-url-${orderIdSafe}`)?.value || '').trim();
+    // Normalise to clean dp/ASIN URL if possible
+    const asinMatch = raw.match(/\/dp\/([A-Z0-9]{10})/i) || raw.match(/[?&]asin=([A-Z0-9]{10})/i);
+    newUrl = asinMatch ? `https://www.amazon.com/dp/${asinMatch[1]}` : raw;
+    if (!newUrl && !remove) { toast('Enter a valid Amazon URL', 'error'); return; }
+  }
+
+  const oldUrl = p.sourceUrl;
+  p.sourceUrl = newUrl || null;
+  markDirty(p.id); save();
+
+  document.getElementById(`update-url-box-${orderIdSafe}`)?.remove();
+
+  if (remove || !newUrl) {
+    toast('🗑️ Amazon link removed — paste a new URL to relink', 'warn', 5000);
+    addLog('sync', `Amazon URL removed for: ${p.title?.slice(0,50)}`, oldUrl?.slice(0,80), { productId: p.id });
+  } else {
+    toast(`✅ Amazon URL updated`, 'success', 4000);
+    addLog('sync', `Amazon URL updated for: ${p.title?.slice(0,50)}`, `${(oldUrl||'none').slice(0,60)} → ${newUrl.slice(0,60)}`, { productId: p.id });
+  }
+  renderOrderRows();
+}
+
 async function replenishFromOrder(productId, orderIdSafe, btn) {
   const p = S.products?.find(x => x.id === productId);
   if (!p) { toast('Product not found in catalog', 'error'); return; }
@@ -2804,6 +2948,15 @@ async function replenishFromOrder(productId, orderIdSafe, btn) {
     });
     const d = await r.json();
     if (!d.success) {
+      if (d.multiAsinMismatch) {
+        // Multi-ASIN product — show dedicated message with Re-push suggestion
+        btn.textContent = '⚠️ Multi-ASIN';
+        btn.style.color = '#f59e0b';
+        setTimeout(() => { btn.textContent = orig; btn.disabled = false; btn.style.color = ''; }, 6000);
+        toast('⚠️ Multi-ASIN listing — use Re-push instead. Each color is a separate Amazon ASIN; replenish can only handle true variation parents.', 'warn', 10000);
+        addLog('warn', `Replenish blocked (multi-ASIN): ${p.title?.slice(0,50)}`, d.message?.slice(0,120), { productId: p.id });
+        return;
+      }
       // rolledBack = true means eBay listing was restored to old state
       const msg = d.message || d.errors?.[0] || d.error || 'Replenish failed';
       throw new Error(d.rolledBack ? `${msg} (old listing preserved)` : msg);
@@ -2934,6 +3087,11 @@ async function linkAndReplenish(productId, itemListingId, itemSku, orderIdSafe, 
     });
     const d = await r.json();
     if (!d.success) {
+      if (d.multiAsinMismatch) {
+        if (btn) { btn.textContent = '⚠️ Multi-ASIN — use Re-push'; btn.disabled = false; }
+        toast('⚠️ Multi-ASIN listing — each color is a separate Amazon ASIN. Use Re-push instead.', 'warn', 10000);
+        return;
+      }
       const msg = d.message || d.errors?.[0] || d.error || 'Replenish failed';
       throw new Error(d.rolledBack ? `${msg} (old listing preserved)` : msg);
     }
