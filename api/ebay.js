@@ -2018,9 +2018,26 @@ module.exports = async (req, res) => {
     if (action === 'scrape') {
       const url = body.url || req.query?.url;
       if (!url) return res.status(400).json({ error: 'Missing url' });
-      const product = await scrapeAmazonProduct(url, body.html || null).catch(e => null);
-      if (!product) return res.status(503).json({ error: 'Scrape failed', skippable: true });
-      return res.json({ product });
+      // Accept pageHtml (import flow) or html (other callers)
+      const clientHtml = body.pageHtml || body.html || body.clientHtml || null;
+      const product = await scrapeAmazonProduct(url, clientHtml).catch(e => {
+        console.warn('[scrape] error:', e.message);
+        return null;
+      });
+      if (!product) return res.status(503).json({ error: 'Scrape failed — Amazon may be blocking. Try again or use a different URL.', skippable: true });
+      // Return success:true so import flow doesn't break (checks d.success)
+      const colors = product.variations?.find(v => /color/i.test(v.name))?.values?.length || 0;
+      return res.json({
+        success: true,
+        product,
+        _debug: {
+          hasVariations: product.hasVariations,
+          comboCount: Object.keys(product.comboAsin || {}).length,
+          totalColors: colors,
+          pricesFound: Object.values(product.comboPrices || {}).filter(p => p > 0).length,
+          pricesFailed: product._pricesFailed || false,
+        },
+      });
     }
 
     // ── FETCH MY EBAY LISTINGS ────────────────────────────────────────────────
